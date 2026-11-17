@@ -1,0 +1,628 @@
+<?php
+/**
+ * WooCommerce integration abilities - sales reports and entity counts (sub-slice W4-WC7).
+ *
+ * Registers ONLY when WooCommerce is active (aafm_integration_active('woocommerce')); a host-inactive
+ * site contributes zero entries to the registry. Every ability gates on the flat, object-independent
+ * manage_woocommerce capability and falls through to its real permission_callback at discovery (no
+ * server.php case). Shared helpers live in _shared.php, loaded before this file.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter( 'aafm_abilities_registry', 'aafm_register_wc_reports_definitions' );
+add_filter( 'aafm_abilities_registry_integrations', 'aafm_register_wc_reports_full_definitions' );
+
+/**
+ * Contribute the WooCommerce reports definitions to the registry, but only when WooCommerce is
+ * active. Host inactive: the registry is returned unchanged.
+ *
+ * @param array<string,array<string,mixed>> $registry Registry.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_wc_reports_definitions( array $registry ): array {
+	if ( ! aafm_integration_active( 'woocommerce' ) ) {
+		return $registry; // Host inactive: contribute nothing.
+	}
+
+	return array_merge( $registry, aafm_wc_reports_registry_definitions() );
+}
+
+/**
+ * Contribute the WooCommerce reports definitions to the guard-independent full registry view.
+ *
+ * Unguarded by design: the full view (aafm_get_abilities_registry_full()) enumerates every
+ * WooCommerce ability even when WooCommerce is inactive, for the Integrations tab and the manifest.
+ * The live registration path never reads this filter, so an inactive host still exposes zero tools.
+ *
+ * @param array<string,array<string,mixed>> $registry Integration rows accumulator.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_wc_reports_full_definitions( array $registry ): array {
+	return array_merge( $registry, aafm_wc_reports_registry_definitions() );
+}
+
+/**
+ * The WooCommerce reports registry rows, keyed by ability name. The single source of truth for
+ * these abilities' label, description, group, risk, and args builder - consumed by both the
+ * host-guarded live registration callback and the unguarded full-view callback.
+ *
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_wc_reports_registry_definitions(): array {
+	return array(
+		// Reports, counts, and payment gateways (sub-slice W4-WC7).
+		'aafm/wc-get-sales-report'       => array(
+			'label'        => __( 'Get WooCommerce sales report', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Returns a sales summary for a date range: total sales, order count, net sales, and average order value. Defaults to the current calendar month. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_get_sales_report',
+		),
+
+		'aafm/wc-get-top-sellers-report' => array(
+			'label'        => __( 'Get WooCommerce top sellers report', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Returns the best-selling products for a period (week, month, or year) ordered by quantity sold. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_get_top_sellers_report',
+		),
+
+		'aafm/wc-count-orders'           => array(
+			'label'        => __( 'Count WooCommerce orders', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Returns order counts broken down by the built-in WooCommerce statuses (pending, processing, on-hold, completed, cancelled, refunded, failed) plus a total of active (non-trashed) orders across every registered status, including custom ones plugins add. HPOS-aware. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_count_orders',
+		),
+
+		'aafm/wc-count-products'         => array(
+			'label'        => __( 'Count WooCommerce products', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Returns product counts broken down by post status (publish, draft, private, pending, trash) plus a total of active (non-trash) products. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_count_products',
+		),
+
+	);
+}
+
+// =============================================================================
+// wc-get-sales-report
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-get-sales-report.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_get_sales_report(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-get-sales-report' ),
+		'description'         => aafm_ability_description( 'aafm/wc-get-sales-report' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'properties'           => array(
+				'start_date' => array(
+					'type'        => 'string',
+					'description' => 'Start date in Y-m-d format. Defaults to the first day of the current month.',
+				),
+				'end_date'   => array(
+					'type'        => 'string',
+					'description' => 'End date in Y-m-d format. Defaults to today.',
+				),
+			),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'total_sales'   => array( 'type' => 'string' ),
+				'order_count'   => array( 'type' => 'integer' ),
+				'net_sales'     => array( 'type' => 'string' ),
+				'average_sales' => array( 'type' => 'string' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_wc_get_sales_report',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-get-sales-report.
+ *
+ * Queries shop_order posts with completed/processing statuses in the given date window and
+ * sums the _order_total post-meta value. Uses $wpdb->prepare() with positional placeholders
+ * to stay PHPCS-clean.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_get_sales_report( array $input ) {
+	if ( ! aafm_integration_active( 'woocommerce' ) || ! function_exists( 'wc_get_orders' ) ) {
+		return aafm_generic_error();
+	}
+	$start = sanitize_text_field( (string) ( $input['start_date'] ?? gmdate( 'Y-m-01' ) ) );
+	$end   = sanitize_text_field( (string) ( $input['end_date'] ?? gmdate( 'Y-m-d' ) ) );
+
+	// HPOS-aware: aggregate through wc_get_orders() so the totals come from WooCommerce's own
+	// order storage (custom order tables OR legacy posts) instead of a raw shop_order/postmeta
+	// join that only ever sees the legacy tables. The date window is pushed into the query
+	// and results are paged so a large order history never loads in one unbounded fetch (mirrors
+	// the top-sellers path).
+	// strtotime() returns false for an unparseable date, which cast to 0 would silently widen the
+	// window to all-time (bad start) or empty it (bad end) and return a confidently wrong money
+	// figure as success. Reject an unparseable date instead.
+	$start_ts = strtotime( $start . ' 00:00:00' );
+	$end_ts   = strtotime( $end . ' 23:59:59' );
+	if ( false === $start_ts || false === $end_ts ) {
+		return new \WP_Error(
+			'aafm_invalid_date',
+			__( 'start_date or end_date is not a valid date.', 'agent-abilities-for-mcp' )
+		);
+	}
+	$start_ts = (int) $start_ts;
+	$end_ts   = (int) $end_ts;
+
+	$page        = 1;
+	$per_page    = 200;
+	$total_sales = 0.0;
+	$net_sales   = 0.0;
+	$order_count = 0;
+
+	do {
+		$result = wc_get_orders(
+			array(
+				// Refunds share the wc_orders table under HPOS and carry their own status, so an
+				// untyped query pulls them in. The WC_Order instanceof guard below already keeps
+				// them out of the money, but they would still consume page slots and skew paging.
+				'type'         => 'shop_order',
+				'status'       => array( 'completed', 'processing' ),
+				'date_created' => $start_ts . '...' . $end_ts,
+				'limit'        => $per_page,
+				'page'         => $page,
+				'paginate'     => true,
+				'orderby'      => 'date',
+				'order'        => 'DESC',
+			)
+		);
+
+		$orders = is_object( $result ) && isset( $result->orders ) && is_array( $result->orders )
+			? $result->orders
+			: ( is_array( $result ) ? $result : array() );
+
+		$page_count = count( $orders );
+
+		foreach ( $orders as $order ) {
+			if ( ! $order instanceof \WC_Order ) {
+				continue;
+			}
+			$total_sales += (float) $order->get_total();
+
+			// True net sales: strip tax and shipping out of the gross order total, then back
+			// out the product-only portion of any refunds (the total refund minus its tax and
+			// shipping components). This leaves after-discount product revenue actually kept --
+			// not the gross figure that net_sales used to (incorrectly) echo.
+			$net_sales += (float) $order->get_total()
+				- (float) $order->get_total_tax()
+				- (float) $order->get_shipping_total()
+				- ( (float) $order->get_total_refunded()
+					- (float) $order->get_total_tax_refunded()
+					- (float) $order->get_total_shipping_refunded() );
+
+			++$order_count;
+		}
+
+		++$page;
+		// Stop once a short (or empty) page is returned: that is the last page of the window.
+	} while ( $page_count === $per_page );
+
+	$total_sales = round( $total_sales, 2 );
+	$net_sales   = round( $net_sales, 2 );
+	$avg         = $order_count > 0 ? round( $total_sales / $order_count, 2 ) : 0.0;
+
+	return array(
+		'total_sales'   => number_format( $total_sales, 2, '.', '' ),
+		'order_count'   => $order_count,
+		'net_sales'     => number_format( $net_sales, 2, '.', '' ),
+		'average_sales' => number_format( $avg, 2, '.', '' ),
+	);
+}
+
+// =============================================================================
+// wc-get-top-sellers-report
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-get-top-sellers-report.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_get_top_sellers_report(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-get-top-sellers-report' ),
+		'description'         => aafm_ability_description( 'aafm/wc-get-top-sellers-report' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'properties'           => array(
+				'period' => array(
+					'type'        => 'string',
+					'enum'        => array( 'week', 'month', 'year' ),
+					'default'     => 'month',
+					'description' => __( 'Lookback window for aggregating sales: "week" (the last 7 days), "month" (since the 1st of the current month), or "year" (since January 1st of the current year).', 'agent-abilities-for-mcp' ),
+				),
+				'limit'  => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'maximum'     => 100,
+					'default'     => 10,
+					'description' => __( 'Maximum number of top-selling products to return, from 1 to 100.', 'agent-abilities-for-mcp' ),
+				),
+			),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'items' => array(
+					'type'  => 'array',
+					'items' => array(
+						'type'       => 'object',
+						'properties' => array(
+							'product_id' => array( 'type' => 'integer' ),
+							'name'       => array( 'type' => 'string' ),
+							'quantity'   => array( 'type' => 'integer' ),
+						),
+					),
+				),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_wc_get_top_sellers_report',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-get-top-sellers-report.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_get_top_sellers_report( array $input ) {
+	if ( ! aafm_integration_active( 'woocommerce' ) ) {
+		return aafm_generic_error();
+	}
+	$period = sanitize_text_field( (string) ( $input['period'] ?? 'month' ) );
+	$limit  = max( 1, min( 100, (int) ( $input['limit'] ?? 10 ) ) );
+
+	if ( 'week' === $period ) {
+		$start = gmdate( 'Y-m-d', strtotime( '-1 week' ) );
+	} elseif ( 'year' === $period ) {
+		$start = gmdate( 'Y-01-01' );
+	} else {
+		$start = gmdate( 'Y-m-01' );
+	}
+
+	if ( ! function_exists( 'wc_get_orders' ) ) {
+		return aafm_generic_error();
+	}
+
+	// Product ids live in ORDER ITEM meta, not shop_order post meta, so aggregate quantities
+	// from each order's line items via the WC CRUD layer (HPOS-aware). The previous postmeta
+	// join keyed on _product_id, which never exists on the order post, so it returned nothing.
+	$start_ts = (int) strtotime( $start . ' 00:00:00' );
+
+	// Push the date window into the query (date_created lower bound) and page through results
+	// instead of pulling every order with limit => -1, which can time out or exhaust memory on a
+	// large order history. wc_get_orders() applies the window in storage (HPOS or legacy), so only
+	// in-window orders are loaded.
+	$page           = 1;
+	$per_page       = 200;
+	$qty_by_product = array();
+
+	do {
+		$result = wc_get_orders(
+			array(
+				// Same reason as the sales report: refunds are order records too under HPOS.
+				'type'         => 'shop_order',
+				'status'       => array( 'completed', 'processing' ),
+				'date_created' => '>=' . $start_ts,
+				'limit'        => $per_page,
+				'page'         => $page,
+				'paginate'     => true,
+				'orderby'      => 'date',
+				'order'        => 'DESC',
+			)
+		);
+
+		$orders = is_object( $result ) && isset( $result->orders ) && is_array( $result->orders )
+			? $result->orders
+			: ( is_array( $result ) ? $result : array() );
+
+		$page_count = count( $orders );
+
+		foreach ( $orders as $order ) {
+			if ( ! $order instanceof \WC_Order ) {
+				continue;
+			}
+
+			foreach ( $order->get_items() as $item ) {
+				if ( is_array( $item ) ) {
+					$product_id = (int) ( $item['product_id'] ?? 0 );
+					$quantity   = (int) ( $item['quantity'] ?? 0 );
+				} elseif ( is_object( $item ) && method_exists( $item, 'get_product_id' ) ) {
+					$product_id = (int) $item->get_product_id();
+					$quantity   = method_exists( $item, 'get_quantity' ) ? (int) $item->get_quantity() : 0;
+				} else {
+					continue;
+				}
+
+				if ( $product_id < 1 ) {
+					continue;
+				}
+				$qty_by_product[ $product_id ] = ( $qty_by_product[ $product_id ] ?? 0 ) + max( 0, $quantity );
+			}
+		}
+
+		++$page;
+		// Stop once a short (or empty) page is returned: that is the last page of the window.
+	} while ( $page_count === $per_page );
+
+	// On this plugin's PHP 7.4 floor, two products tied on quantity sold can come back in a
+	// different order, and because the slice below cuts through the tie, that could return a
+	// genuinely different SET of top sellers, not merely a different order - so this needs a
+	// stable sort to reproduce PHP 8's current output byte-for-byte.
+	$decorated = array();
+	foreach ( $qty_by_product as $product_id => $quantity ) {
+		$decorated[] = array(
+			'product_id' => $product_id,
+			'quantity'   => $quantity,
+		);
+	}
+	$decorated = aafm_stable_sort(
+		$decorated,
+		static function ( array $a, array $b ): int {
+			return $b['quantity'] <=> $a['quantity'];
+		}
+	);
+	$decorated = array_slice( $decorated, 0, $limit );
+
+	$qty_by_product = array();
+	foreach ( $decorated as $row ) {
+		$qty_by_product[ $row['product_id'] ] = $row['quantity'];
+	}
+
+	$items = array();
+	foreach ( $qty_by_product as $product_id => $quantity ) {
+		$product = aafm_wc_get_product( (int) $product_id );
+		$items[] = array(
+			'product_id' => (int) $product_id,
+			'name'       => null !== $product ? (string) $product->get_name() : '',
+			'quantity'   => (int) $quantity,
+		);
+	}
+
+	return array( 'items' => $items );
+}
+
+// =============================================================================
+// wc-count-orders
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-count-orders.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_count_orders(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-count-orders' ),
+		'description'         => aafm_ability_description( 'aafm/wc-count-orders' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'properties'           => array(),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'pending'    => array( 'type' => 'integer' ),
+				'processing' => array( 'type' => 'integer' ),
+				'on_hold'    => array( 'type' => 'integer' ),
+				'completed'  => array( 'type' => 'integer' ),
+				'cancelled'  => array( 'type' => 'integer' ),
+				'refunded'   => array( 'type' => 'integer' ),
+				'failed'     => array( 'type' => 'integer' ),
+				'total'      => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_wc_count_orders',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-count-orders.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_count_orders( array $input ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found -- no input params used; signature required by abilities API.
+	if ( ! aafm_integration_active( 'woocommerce' ) || ! function_exists( 'wc_get_orders' ) || ! function_exists( 'wc_get_order_statuses' ) ) {
+		return aafm_generic_error();
+	}
+
+	// HPOS-aware: count per status through wc_get_orders() (which targets the custom order tables
+	// when HPOS is on, and the legacy posts otherwise) rather than wp_count_posts('shop_order'),
+	// which never sees the HPOS tables and would under-report on an HPOS site. Each status is
+	// a paginated 1-row probe so only the storage-side total is read, not the order rows.
+	//
+	// The status list comes from wc_get_order_statuses() - whose map plugins extend through
+	// the wc_order_statuses filter - not a hardcoded seven-status list. The old hardcoded sum
+	// excluded every custom status from `total` while the shape claimed completeness. The named
+	// breakdown below still reports the built-in seven; anything beyond them is counted into
+	// `total` only. Trashed orders stay excluded either way, matching the non-trash "active"
+	// total convention shared by count-products and count-coupons.
+	$statuses = array();
+	foreach ( array_keys( wc_get_order_statuses() ) as $status_key ) {
+		$status_key = (string) $status_key;
+		$statuses[] = str_starts_with( $status_key, 'wc-' ) ? substr( $status_key, 3 ) : $status_key;
+	}
+
+	$by_status = array();
+	foreach ( $statuses as $status ) {
+		$by_status[ $status ] = aafm_wc_count_orders_by_status( $status );
+	}
+
+	$total = array_sum( $by_status );
+
+	return array(
+		'pending'    => (int) ( $by_status['pending'] ?? 0 ),
+		'processing' => (int) ( $by_status['processing'] ?? 0 ),
+		'on_hold'    => (int) ( $by_status['on-hold'] ?? 0 ),
+		'completed'  => (int) ( $by_status['completed'] ?? 0 ),
+		'cancelled'  => (int) ( $by_status['cancelled'] ?? 0 ),
+		'refunded'   => (int) ( $by_status['refunded'] ?? 0 ),
+		'failed'     => (int) ( $by_status['failed'] ?? 0 ),
+		'total'      => $total,
+	);
+}
+
+/**
+ * HPOS-aware count of orders in a single WooCommerce status.
+ *
+ * Runs a paginated wc_get_orders() probe (limit 1, ids only) and reads the storage-reported
+ * total, so the count is correct under both High-Performance Order Storage and the legacy
+ * post-based storage. Returns 0 when the query shape is unexpected.
+ *
+ * @param string $status WooCommerce order status slug, without the wc- prefix (e.g. 'completed').
+ * @return int
+ */
+function aafm_wc_count_orders_by_status( string $status ): int {
+	// This used to hand-roll a per-status count via a
+	// wc_get_orders() pagination probe. WooCommerce ships the exact public helper for this job,
+	// wc_orders_count() (wc-order-functions.php:392), which is HPOS/legacy-abstracted and reads
+	// through a cache layer (OrderCountCache -> OrderUtil::get_count_for_type(), which for HPOS
+	// routes to OrdersTableDataStore::get_order_count()) instead of a hand-rolled, uncached probe.
+	//
+	// 'type' is not optional: under HPOS refunds live in the same wc_orders table with type
+	// shop_order_refund, and a refund against a completed order carries status wc-completed itself.
+	// An untyped count therefore counts refunds as orders - a store with no completed orders and
+	// three refunds reported three completed orders. wc_orders_count() takes the identical
+	// $type parameter for the identical reason, so the pin carries over unchanged.
+	return wc_orders_count( $status, 'shop_order' );
+}
+
+// =============================================================================
+// wc-count-products
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-count-products.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_count_products(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-count-products' ),
+		'description'         => aafm_ability_description( 'aafm/wc-count-products' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'properties'           => aafm_lang_schema_fragment(),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'publish'  => array( 'type' => 'integer' ),
+				'draft'    => array( 'type' => 'integer' ),
+				'private'  => array( 'type' => 'integer' ),
+				'pending'  => array( 'type' => 'integer' ),
+				'trash'    => array( 'type' => 'integer' ),
+				'total'    => array( 'type' => 'integer' ),
+				'language' => array(
+					'type'        => array( 'string', 'null' ),
+					'description' => __( 'The WPML language the list was scoped to ("all" for every language), or null when WPML is inactive.', 'agent-abilities-for-mcp' ),
+				),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_wc_count_products',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-count-products.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_count_products( array $input ) {
+	if ( ! aafm_integration_active( 'woocommerce' ) ) {
+		return aafm_generic_error();
+	}
+	$lang = aafm_resolve_lang( $input );
+	if ( is_wp_error( $lang ) ) {
+		return $lang;
+	}
+	// Pass an empty perm so the WPML-off branch delegates to wp_count_posts('product') with NO
+	// perm argument, matching this ability's original (pre-WPML) behavior byte-for-byte - unlike
+	// aafm/count-posts, wc-count-products never applied the 'readable' capability gate to its counts.
+	$counts  = aafm_wpml_count_posts_by_status( 'product', $lang, '' );
+	$publish = (int) ( $counts['publish'] ?? 0 );
+	$draft   = (int) ( $counts['draft'] ?? 0 );
+	$private = (int) ( $counts['private'] ?? 0 );
+	$pending = (int) ( $counts['pending'] ?? 0 );
+	$trash   = (int) ( $counts['trash'] ?? 0 );
+	// total counts ACTIVE (non-trashed) products only - trash is reported as its own line but is
+	// deliberately excluded from total, the shared count convention across the count siblings.
+	return array(
+		'publish'  => $publish,
+		'draft'    => $draft,
+		'private'  => $private,
+		'pending'  => $pending,
+		'trash'    => $trash,
+		'total'    => $publish + $draft + $private + $pending,
+		'language' => $lang,
+	);
+}

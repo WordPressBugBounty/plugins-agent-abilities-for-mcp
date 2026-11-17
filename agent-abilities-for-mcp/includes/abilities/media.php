@@ -1,0 +1,1876 @@
+<?php
+/**
+ * Media abilities: the get-media read (Phase 3) plus the guarded writes
+ * set-featured-image and the hardened base64 upload-media (Phase 4).
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter( 'aafm_abilities_registry', 'aafm_register_media_definitions' );
+
+/**
+ * Contribute media ability definitions to the registry (reads).
+ *
+ * @param array<string,array<string,mixed>> $registry Registry.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_media_definitions( array $registry ): array {
+	$registry['aafm/get-media']             = array(
+		'label'        => __( 'Get media', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'List media library items (URL, alt, mime, dimensions). Response includes total (the full match count).', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'media',
+		'args_builder' => 'aafm_args_get_media',
+	);
+	$registry['aafm/get-media-item']        = array(
+		'label'        => __( 'Get media item', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Read one media item by id: caption, description, date, filesize, parent, and all image sizes.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'media',
+		'args_builder' => 'aafm_args_get_media_item',
+	);
+	$registry['aafm/count-media']           = array(
+		'label'        => __( 'Count media', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Count media library items, total and broken down by mime type.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'media',
+		'args_builder' => 'aafm_args_count_media',
+	);
+	$registry['aafm/set-featured-image']    = array(
+		'label'        => __( 'Set featured image', 'agent-abilities-for-mcp' ),
+		'description'  => __( "Set a post's featured image to an existing image attachment ID.", 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'media',
+		'args_builder' => 'aafm_args_set_featured_image',
+	);
+	$registry['aafm/upload-media']          = array(
+		'label'        => __( 'Upload media', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Upload an image from base64 data (jpg, png, gif, webp; SVG rejected). For anything larger than a small icon, aafm-upload-media-from-url is more reliable. Requires the upload-files capability.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'media',
+		'args_builder' => 'aafm_args_upload_media',
+	);
+	$registry['aafm/upload-media-from-url'] = array(
+		'label'        => __( 'Upload media from URL', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Fetch an image over HTTPS and upload it (jpg, png, gif, webp; SVG rejected). The URL must resolve to a public host; private/loopback/link-local addresses and redirects are refused. Requires the upload-files capability.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'media',
+		'args_builder' => 'aafm_args_upload_media_from_url',
+	);
+	$registry['aafm/update-media']          = array(
+		'label'        => __( 'Update media', 'agent-abilities-for-mcp' ),
+		'description'  => __( "Update an attachment's title, alt text, caption, or description.", 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'media',
+		'args_builder' => 'aafm_args_update_media',
+	);
+	$registry['aafm/delete-media']          = array(
+		'label'        => __( 'Delete media', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Permanently delete an attachment: the file and library entry are removed and cannot be recovered.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'destructive',
+		'subject'      => 'media',
+		'args_builder' => 'aafm_args_delete_media',
+	);
+	return $registry;
+}
+
+/**
+ * Args for aafm/get-media.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_media(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-media' ),
+		'description'         => aafm_ability_description( 'aafm/get-media' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				array(
+					'search' => array(
+						'type'        => 'string',
+						'description' => __( 'Free-text search term matched against the media item\'s title, content, caption, filename, and alt text.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_pagination_schema_props(
+					AAFM_LIST_PER_PAGE_MAX,
+					__( 'Number of items per page, clamped to the 1-50 range regardless of the value requested. Defaults to 10 when omitted.', 'agent-abilities-for-mcp' ),
+					__( '1-based page number for pagination. Defaults to 1.', 'agent-abilities-for-mcp' ),
+					true
+				),
+				aafm_lang_schema_fragment()
+			),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'media'    => array(
+					'type'  => 'array',
+					'items' => array( 'type' => 'object' ),
+				),
+				'total'    => array( 'type' => 'integer' ),
+				'language' => array(
+					'type'        => array( 'string', 'null' ),
+					'description' => __( 'The WPML language the list was scoped to ("all" for every language), or null when WPML is inactive.', 'agent-abilities-for-mcp' ),
+				),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_media',
+		'permission_callback' => 'aafm_perm_get_media',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for the media inventory read: upload_files or edit_posts.
+ *
+ * A bare subscriber (no upload/edit capability) is denied, and the denial is
+ * audited by the registration wrapper before any media metadata is read.
+ *
+ * @return bool
+ */
+function aafm_perm_get_media(): bool {
+	return current_user_can( 'upload_files' ) || current_user_can( 'edit_posts' );
+}
+
+/**
+ * The author id media reads should scope to, or null for the unscoped full library.
+ *
+ * A caller holding edit_others_posts sees the whole library, unchanged from before.
+ * Anyone else who cleared the aafm_perm_get_media() floor (upload_files or
+ * edit_posts) sees only the attachments they uploaded themselves. Applies to the
+ * list read, the single-object read, and the count read alike - scoping the list
+ * without the count would recreate the count-versus-list contradiction 1.3.2 was
+ * built to remove.
+ *
+ * @return int|null
+ */
+function aafm_media_scope_author_id(): ?int {
+	return current_user_can( 'edit_others_posts' ) ? null : get_current_user_id();
+}
+
+/**
+ * Execute aafm/get-media.
+ *
+ * Lists attachments in the media library, redacted to a safe inventory shape:
+ * id, title, mime type, the public URL, alt text, and dimensions. The absolute
+ * server file path (get_attached_file / _wp_attached_file) and any uploader PII
+ * are never returned. Scoped to the caller's own uploads per
+ * aafm_media_scope_author_id().
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_get_media( array $input ) {
+	$paging    = aafm_paginate_args( $input, AAFM_LIST_PER_PAGE_MAX );
+	$author_id = aafm_media_scope_author_id();
+	$search    = isset( $input['search'] ) ? trim( sanitize_text_field( (string) $input['search'] ) ) : '';
+
+	$lang = aafm_resolve_lang( $input );
+	if ( is_wp_error( $lang ) ) {
+		return $lang;
+	}
+	$build_query = static function () use ( $paging, $author_id, $search ): WP_Query {
+		$args = array(
+			'post_type'        => 'attachment',
+			'post_status'      => 'inherit',
+			'posts_per_page'   => $paging['per_page'],
+			'paged'            => $paging['page'],
+			'no_found_rows'    => false,
+			'suppress_filters' => false,
+		);
+		if ( null !== $author_id ) {
+			$args['author'] = $author_id;
+		}
+
+		if ( '' === $search ) {
+			$args['s'] = '';
+			return new WP_Query( $args );
+		}
+
+		// Core 's' search and meta_query combine with implicit AND, so an OR across title,
+		// content, excerpt, filename, and alt text needs a scoped posts_where filter instead of
+		// 's'/meta_query. Dropping core 's' entirely would also drop the content/excerpt match
+		// it used to provide, so both are folded into the same OR group here. Added immediately
+		// before the query and removed in a finally block, so a throw inside WP_Query can never
+		// leave the filter attached to a later, unrelated query in the same request.
+		//
+		// An unscoped 'posts_where' filter runs against EVERY WP_Query built
+		// while it's attached, not only this function's own - a nested WP_Query fired from any
+		// hook during this query (e.g. a 'pre_get_posts'/'the_posts' callback) would silently
+		// receive this same OR clause too. A private, per-call marker in the query args
+		// (harmless to core - an unrecognized key is simply ignored when building SQL, but still
+		// readable via $query->get()) scopes the filter to this function's own query only, the
+		// same pattern already used by aafm_exec_geodirectory_get_listing() and
+		// aafm_exec_replace_in_site() for the identical shape.
+		$query_marker              = 'aafm_get_media_' . wp_generate_password( 12, false, false );
+		$args['aafm_query_marker'] = $query_marker;
+		$where_filter              = static function ( string $where, WP_Query $query ) use ( $search, $query_marker ): string {
+			if ( $query_marker !== $query->get( 'aafm_query_marker' ) ) {
+				return $where;
+			}
+			global $wpdb;
+			$like = '%' . $wpdb->esc_like( $search ) . '%';
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table names are internal constants ($wpdb->posts, $wpdb->postmeta).
+			return $where . $wpdb->prepare(
+				" AND ( {$wpdb->posts}.post_title LIKE %s
+					OR {$wpdb->posts}.post_content LIKE %s
+					OR {$wpdb->posts}.post_excerpt LIKE %s
+					OR EXISTS (
+						SELECT 1 FROM {$wpdb->postmeta} pm
+						WHERE pm.post_id = {$wpdb->posts}.ID
+						AND pm.meta_key IN ( '_wp_attached_file', '_wp_attachment_image_alt' )
+						AND pm.meta_value LIKE %s
+					) )",
+				$like,
+				$like,
+				$like,
+				$like
+			);
+		};
+
+		add_filter( 'posts_where', $where_filter, 10, 2 );
+		try {
+			return new WP_Query( $args );
+		} finally {
+			remove_filter( 'posts_where', $where_filter, 10 );
+		}
+	};
+
+	// aafm_redact_media() must run
+	// INSIDE the query's own aafm_with_language() scope, not after it restores to ambient - on
+	// both branches. aafm_redact_media() calls filterable, language-sensitive accessors
+	// (get_the_title(), wp_get_attachment_url()) that a theme or plugin can key off ambient
+	// language, same defect class as aafm_exec_get_posts() in posts.php.
+	$shape_language = static function ( ?string $code ) use ( $build_query ): array {
+		return aafm_with_language(
+			$code,
+			static function () use ( $build_query ): array {
+				$query = $build_query();
+				return array(
+					'rows'  => array_values(
+						array_map(
+							'aafm_redact_media',
+							array_values( array_filter( $query->posts, static fn( $post ): bool => $post instanceof WP_Post ) )
+						)
+					),
+					'found' => (int) $query->found_posts,
+				);
+			}
+		);
+	};
+
+	list( $attachments, $total ) = aafm_collect_by_language( $lang, $shape_language );
+
+	return array(
+		'media'    => $attachments,
+		// Full match count for the search filter so an agent can page through the library.
+		'total'    => $total,
+		'language' => $lang,
+	);
+}
+
+/**
+ * Args for aafm/get-media-item - one attachment by id, rich shape.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_media_item(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-media-item' ),
+		'description'         => aafm_ability_description( 'aafm/get-media-item' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				array(
+					'attachment_id' => array(
+						'type'        => 'integer',
+						'minimum'     => 1,
+						'description' => __( 'ID of the attachment to read. An unknown ID, or one that is not an attachment, returns a generic error.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_lang_schema_fragment()
+			),
+			'required'             => array( 'attachment_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'media' => array( 'type' => 'object' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_media_item',
+		'permission_callback' => 'aafm_perm_get_media',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/get-media-item - rich shape by attachment id.
+ *
+ * The id must resolve to a real attachment; anything else returns a generic error.
+ * The absolute server file path and uploader PII are never returned.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_get_media_item( array $input ) {
+	$lang   = null;
+	$att_id = isset( $input['attachment_id'] ) ? absint( $input['attachment_id'] ) : 0;
+	if ( $att_id ) {
+		$lang = aafm_resolve_lang( $input );
+		if ( is_wp_error( $lang ) ) {
+			return $lang;
+		}
+		$att_id = ( is_string( $lang ) && 'all' !== $lang )
+			? aafm_wpml_translated_id( $att_id, 'attachment', $lang )
+			: $att_id;
+	}
+	$attachment = $att_id ? aafm_exact_object( 'post', $att_id ) : null;
+	if ( ! $attachment instanceof WP_Post || 'attachment' !== $attachment->post_type ) {
+		return aafm_generic_error();
+	}
+
+	// Scoped to the caller's own uploads, same as the list read. The SAME generic
+	// error as an unknown id, deliberately: a distinct message here would make the
+	// scoping an existence oracle telling the caller which attachment ids exist.
+	$author_id = aafm_media_scope_author_id();
+	if ( null !== $author_id && (int) $attachment->post_author !== $author_id ) {
+		return aafm_generic_error();
+	}
+
+	// Same reasoning as
+	// aafm_exec_get_post() in posts.php - shape under the requested language when one was
+	// resolved, or the attachment's own language for "all"/no lang, never ambient.
+	$shape_lang = ( is_string( $lang ) && 'all' !== $lang ) ? $lang : aafm_wpml_post_language( $attachment->ID );
+	return array(
+		'media' => aafm_with_language(
+			$shape_lang,
+			static fn(): array => aafm_media_item_payload( $attachment )
+		),
+	);
+}
+
+/**
+ * Args for aafm/count-media - total plus per-mime breakdown, optional mime filter.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_count_media(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/count-media' ),
+		'description'         => aafm_ability_description( 'aafm/count-media' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				array(
+					'mime_type' => array(
+						'type'        => 'string',
+						'description' => __( 'Exact MIME type to filter the breakdown to, for example image/jpeg. Omit to return the total and breakdown across every MIME type.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_lang_schema_fragment()
+			),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'total'    => array( 'type' => 'integer' ),
+				'by_mime'  => array( 'type' => 'object' ),
+				'language' => array(
+					'type'        => array( 'string', 'null' ),
+					'description' => __( 'The WPML language the list was scoped to ("all" for every language), or null when WPML is inactive.', 'agent-abilities-for-mcp' ),
+				),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_count_media',
+		'permission_callback' => 'aafm_perm_get_media',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/count-media - wp_count_attachments() returns counts keyed by mime
+ * type; sum for the total. An optional mime_type narrows the breakdown to one type.
+ *
+ * That single language-blind SQL GROUP BY disagreed with the language-scoped
+ * aafm/get-media list whenever WPML Media Translation is active. When WPML is on,
+ * the same mime-keyed counts are instead built from an attachment WP_Query run
+ * inside the resolved language scope; when WPML is off this delegates to
+ * wp_count_attachments() exactly as before, so non-multilingual sites are
+ * byte-for-byte unchanged.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_count_media( array $input ) {
+	$filter = isset( $input['mime_type'] ) ? sanitize_text_field( (string) $input['mime_type'] ) : '';
+	$lang   = aafm_resolve_lang( $input );
+	if ( is_wp_error( $lang ) ) {
+		return $lang;
+	}
+	$author_id = aafm_media_scope_author_id();
+
+	if ( aafm_wpml_active() ) {
+		$build_counts = static function () use ( $author_id ) {
+			return aafm_query_attachment_counts_by_mime( $author_id );
+		};
+		if ( 'all' === $lang ) {
+			$counts = array();
+			foreach ( aafm_wpml_all_language_codes_for_iteration() as $code ) {
+				$by_language = aafm_with_language( $code, $build_counts );
+				if ( is_wp_error( $by_language ) ) {
+					return $by_language;
+				}
+				foreach ( $by_language as $mime => $n ) {
+					$counts[ $mime ] = ( $counts[ $mime ] ?? 0 ) + (int) $n;
+				}
+			}
+		} else {
+			$counts = aafm_with_language( $lang, $build_counts );
+		}
+	} elseif ( null !== $author_id ) {
+		// wp_count_attachments() cannot be author-scoped, so a scoped caller goes
+		// through the same query-based counter the WPML branch uses.
+		$counts = aafm_query_attachment_counts_by_mime( $author_id );
+	} else {
+		$counts = (array) wp_count_attachments();
+	}
+	if ( is_wp_error( $counts ) ) {
+		return $counts;
+	}
+
+	$by_mime = array();
+	$total   = 0;
+	foreach ( $counts as $mime => $n ) {
+		// wp_count_attachments() adds a 'trash' key alongside the mime-type rows -
+		// it is a status bucket (how many attachments are trashed), not a mime
+		// type, so it must not be reported as one or summed into the total. The
+		// WPML-scoped query never includes trashed attachments in the first place
+		// (post_status => 'inherit'), so this guard only matters for the
+		// wp_count_attachments() branch.
+		if ( 'trash' === $mime ) {
+			continue;
+		}
+		$n = (int) $n;
+		if ( '' !== $filter && $filter !== $mime ) {
+			continue;
+		}
+		$by_mime[ (string) $mime ] = $n;
+		$total                    += $n;
+	}
+
+	return array(
+		'total'    => $total,
+		// Cast so an empty breakdown JSON-encodes to "{}" (object) per the schema,
+		// instead of "[]" (a JSON array). A populated assoc array is unaffected.
+		'by_mime'  => (object) $by_mime,
+		'language' => $lang,
+	);
+}
+
+/**
+ * Count non-trashed attachments grouped by their exact post_mime_type, mirroring
+ * wp_count_attachments()'s key shape but via WP_Query so WPML's language filters
+ * apply. Called from inside aafm_with_language() and directly - see aafm_exec_count_media().
+ *
+ * No attachment row is loaded. The WP_Query fetches ids only, 500 at a time, with suppress_filters
+ * false and the author argument, so WPML's language filter and the own-uploads scope apply exactly
+ * as they do to the media list. Each batch of ids is then counted by its stored post_mime_type in
+ * one grouped query, so every type is counted as stored. Two queries per 500 attachments.
+ *
+ * Batches page by id (each one starts after the last id the previous one returned), so a large
+ * library is not rescanned from the start for every batch, and the loop ends only on an empty
+ * batch, so a filter that caps posts_per_page cannot cut the count short. The id order is forced
+ * last on posts_orderby, because a plugin that sorts attachments by menu_order (Post Types Order)
+ * would otherwise make the next batch skip lower ids. A batch whose ids do not all rise past the
+ * last one seen (a hook dropped the id clause or the order) is refused rather than looped on.
+ *
+ * @param int|null $author_id Restrict to this author's attachments, or null for the
+ *                            unscoped full library (aafm_media_scope_author_id()).
+ * @return array<string,int>|WP_Error Mime type => count, or an error when a count query fails.
+ */
+function aafm_query_attachment_counts_by_mime( ?int $author_id = null ) {
+	global $wpdb;
+
+	$batch   = 500;
+	$counts  = array();
+	$last_id = 0;
+	$after   = static function ( string $where, WP_Query $query ) use ( $wpdb ): string {
+		$from = (int) $query->get( 'aafm_after_id' );
+		return $from > 0 ? $where . $wpdb->prepare( " AND {$wpdb->posts}.ID > %d", $from ) : $where;
+	};
+	$by_id   = static function ( string $orderby, WP_Query $query ) use ( $wpdb ): string {
+		return null === $query->get( 'aafm_after_id', null ) ? $orderby : "{$wpdb->posts}.ID ASC";
+	};
+	$done    = static function () use ( $after, $by_id ): void {
+		remove_filter( 'posts_where', $after, 10 );
+		remove_filter( 'posts_orderby', $by_id, PHP_INT_MAX );
+	};
+	add_filter( 'posts_where', $after, 10, 2 );
+	add_filter( 'posts_orderby', $by_id, PHP_INT_MAX, 2 );
+	while ( true ) {
+		$args = array(
+			'post_type'              => 'attachment',
+			'post_status'            => 'inherit',
+			'fields'                 => 'ids',
+			'posts_per_page'         => $batch,
+			'aafm_after_id'          => $last_id,
+			'orderby'                => 'ID',
+			'order'                  => 'ASC',
+			'no_found_rows'          => true,
+			'suppress_filters'       => false,
+			'update_post_meta_cache' => false,
+			'update_post_term_cache' => false,
+		);
+		if ( null !== $author_id ) {
+			$args['author'] = $author_id;
+		}
+		$ids = array();
+		foreach ( ( new WP_Query( $args ) )->posts as $id ) {
+			$ids[] = $id instanceof WP_Post ? (int) $id->ID : (int) $id;
+		}
+		if ( array() === $ids ) {
+			break;
+		}
+		foreach ( $ids as $id ) {
+			if ( $id <= $last_id ) {
+				$done();
+				return aafm_generic_error();
+			}
+			$last_id = $id;
+		}
+		$sql = 'SELECT post_mime_type, COUNT(*) AS n FROM %i WHERE ID IN (' . implode( ', ', array_fill( 0, count( $ids ), '%d' ) ) . ') GROUP BY post_mime_type';
+		// phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- placeholders are generated from the id list.
+		$rows = aafm_wpdb_results( $wpdb->prepare( $sql, array_merge( array( $wpdb->posts ), $ids ) ) );
+		if ( ! $rows['ok'] ) {
+			$done();
+			return aafm_generic_error();
+		}
+		foreach ( (array) $rows['value'] as $row ) {
+			$mime            = (string) ( $row['post_mime_type'] ?? '' );
+			$counts[ $mime ] = ( $counts[ $mime ] ?? 0 ) + (int) ( $row['n'] ?? 0 );
+		}
+	}
+	$done();
+
+	return $counts;
+}
+
+/**
+ * Args for aafm/set-featured-image.
+ *
+ * Sets a post's thumbnail to an EXISTING attachment id only - never a URL, so
+ * there is no fetch path and no SSRF surface. The closed input schema rejects
+ * any field other than the two ids.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_set_featured_image(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/set-featured-image' ),
+		'description'         => aafm_ability_description( 'aafm/set-featured-image' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id'       => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the post whose featured image will be set. The caller must be able to edit this post.', 'agent-abilities-for-mcp' ),
+				),
+				'attachment_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of an existing image attachment to use as the featured image. Must already exist and genuinely be an image; a non-image or missing attachment is rejected.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id', 'attachment_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'set' => array( 'type' => 'boolean' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_set_featured_image',
+		'permission_callback' => 'aafm_perm_set_featured_image',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/set-featured-image: routes the TARGET post through the shared
+ * write chokepoint.
+ *
+ * Setting a thumbnail is a `_thumbnail_id` write that fires save_post and bumps
+ * modified_gmt, so it is gated exactly like update-post/trash-post: the target type
+ * must clear the eligibility floor AND the default-deny allowlist AND be
+ * map_meta_cap===true, then the per-object edit cap is checked. A bare
+ * current_user_can('edit_post') is NOT enough - on a non-mapped type it degrades to a
+ * singular primitive that can fail open. The denial is audited by the registration
+ * wrapper before any change is attempted.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_set_featured_image( array $input ): bool {
+	$post_id = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$post    = $post_id ? aafm_exact_object( 'post', $post_id ) : null;
+	return $post instanceof WP_Post && aafm_can_edit_post_object( $post );
+}
+
+/**
+ * Execute aafm/set-featured-image - by existing IMAGE attachment id only.
+ *
+ * The attachment id must resolve to an attachment that is genuinely an image
+ * (wp_attachment_is_image), so a PDF/zip/other attachment id can't be smuggled
+ * in as a thumbnail. Never fetches a URL.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_set_featured_image( array $input ) {
+	$post_id = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$att_id  = isset( $input['attachment_id'] ) ? absint( $input['attachment_id'] ) : 0;
+
+	// Defense-in-depth: re-confirm the target exists AND its type is writable through the
+	// chokepoint, so a non-allowlisted / non-mapped type is refused even if the permission
+	// callback were ever bypassed.
+	$target = $post_id ? aafm_exact_object( 'post', $post_id ) : null;
+	if ( ! $target instanceof WP_Post || ! aafm_can_edit_post_object( $target ) ) {
+		return aafm_generic_error();
+	}
+
+	// The id must be a real attachment AND a real image - not a PDF or a plain post.
+	$att = aafm_exact_object( 'post', $att_id );
+	if ( $att_id <= 0 || 'attachment' !== ( $att instanceof WP_Post ? $att->post_type : false ) || ! wp_attachment_is_image( $att_id ) ) {
+		return aafm_generic_error();
+	}
+
+	if ( ! set_post_thumbnail( $post_id, $att_id ) ) {
+		return aafm_generic_error();
+	}
+	// set_post_thumbnail() also returns true for a write a filter vetoed and for the delete it
+	// makes when the image cannot render, so the _thumbnail_id row read after the call decides.
+	$row = aafm_meta_row( 'post', $post_id, '_thumbnail_id' );
+	if ( ! $row['ok'] || ! $row['exists'] || ! aafm_stored_id_matches( $row['value'], $att_id ) ) {
+		return aafm_generic_error();
+	}
+
+	return array( 'set' => true );
+}
+
+/**
+ * Args for aafm/upload-media.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_upload_media(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/upload-media' ),
+		'description'         => aafm_ability_description( 'aafm/upload-media' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'filename'    => array(
+					'type'        => 'string',
+					'minLength'   => 1,
+					'description' => __( 'Filename to base the stored file\'s name on. Only the basename is kept and sanitized, and the extension is replaced with the one matching the file\'s actual detected type, not the extension supplied here.', 'agent-abilities-for-mcp' ),
+				),
+				'data_base64' => array(
+					'type'        => 'string',
+					'minLength'   => 1,
+					'description' => __( 'Base64-encoded file bytes. The decoded content must be a real jpg, png, gif, or webp image, verified from its bytes rather than the filename or a claimed MIME type; SVG and any other type is rejected, and the decoded size must fit within the site\'s maximum upload size.', 'agent-abilities-for-mcp' ),
+				),
+				'alt'         => array(
+					'type'        => 'string',
+					'description' => __( 'Alt text to set on the uploaded image.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'filename', 'data_base64' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'attachment_id' => array( 'type' => 'integer' ),
+				'media'         => array( 'type' => 'object' ),
+				'alt_status'    => array(
+					'type' => 'string',
+					'enum' => array( 'written', 'unchanged' ),
+				),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_upload_media',
+		'permission_callback' => 'aafm_perm_upload_media',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/upload-media: upload_files.
+ *
+ * A caller without upload_files is denied (and audited by the wrapper) before
+ * any bytes are decoded or written.
+ *
+ * @return bool
+ */
+function aafm_perm_upload_media(): bool {
+	return current_user_can( 'upload_files' );
+}
+
+/**
+ * The allow-list of safe upload MIME types mapped to canonical extensions.
+ *
+ * Intentionally narrow: raster images only. SVG (script-capable XML), HTML, PHP,
+ * and every other type are absent and therefore rejected.
+ *
+ * @return array<string,string>
+ */
+function aafm_upload_allowlist(): array {
+	return array(
+		'image/jpeg' => 'jpg',
+		'image/png'  => 'png',
+		'image/gif'  => 'gif',
+		'image/webp' => 'webp',
+	);
+}
+
+/**
+ * Whether the PHP fileinfo extension is available to byte-sniff an upload.
+ * Filterable so the missing-extension path can be exercised in tests without
+ * actually removing the extension from the runtime.
+ *
+ * @return bool
+ */
+function aafm_fileinfo_available(): bool {
+	return (bool) apply_filters( 'aafm_fileinfo_available', extension_loaded( 'fileinfo' ) );
+}
+
+/**
+ * Execute aafm/upload-media - base64 only, byte-sniffed, allow-listed, SVG
+ * rejected, size-capped, filename sanitized, delegated to core for the write.
+ *
+ * Hardening (§6.2), and what changed under the delegation audit (Rule 1: delegate mechanics, own
+ * policy):
+ * - NO URL fetch path exists, so the SSRF class is eliminated outright; the only
+ *   input is inline base64 bytes the caller supplies.
+ * - The real MIME is derived from the DECODED BYTES (finfo), never the supplied
+ *   filename, extension, or any client mime - and must be on the raster-image
+ *   allow-list. SVG and executable payloads fail this gate and no file is written.
+ *   Kept: this is genuinely stronger than reject-on-mismatch, and core's own path has nothing
+ *   equivalent.
+ * - fileinfo availability is guarded (aafm_fileinfo_available) before finfo is
+ *   ever instantiated, so a host without the extension errors instead of
+ *   fataling on a missing class.
+ * - The filename is sanitized (sanitize_file_name, then aafm_sanitize_plain_text for
+ *   the control and bidi characters core keeps) and rebuilt with the canonical
+ *   extension for the real type; traversal segments cannot survive. Kept: WordPress's own
+ *   sanitize_file_name() keeps the whole Trojan Source bidi set, so this strip has no core
+ *   equivalent either.
+ * - The decoded bytes are written to a real temp file and handed to media_handle_sideload(),
+ *   which calls wp_handle_sideload() internally - firing wp_handle_sideload_prefilter and
+ *   wp_handle_sideload_overrides, and re-checking wp_max_upload_size() - the mechanics the
+ *   previous wp_upload_bits()-based path bypassed entirely. media_handle_sideload() also owns
+ *   attachment insertion and metadata generation (wp_generate_attachment_metadata()), so this
+ *   function no longer calls either directly.
+ * - The pixel cap that used to sit here (a decompression-bomb guard core's own media uploader
+ *   does not have) was deleted outright: media_handle_sideload() decodes through the exact same
+ *   wp_generate_attachment_metadata() path, so the OOM exposure is now identical to wp-admin's
+ *   own uploader, matching the audit's own rule - a plugin exposing core's capabilities should
+ *   MATCH core's behaviour, not be safer than the admin UI.
+ *
+ *   ACCEPTED RISK, operator decision. A review raised that matching a real
+ *   authenticated OOM path in wp-admin is not the same as closing it, since GD's own image editor
+ *   raises the memory limit and starts decoding before any dimension check runs, so this ability
+ *   again has no pre-decode ceiling on a GD host. The operator chose parity with core over
+ *   restoring a plugin-only ceiling for this release. Do not re-open this as a new finding without
+ *   a fresh operator decision, and do not silently restore a cap: if this is revisited, size it
+ *   deliberately (see the deleted aafm_derive_max_pixels() history in this file's git log) rather
+ *   than guessing a constant.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_upload_media( array $input ) {
+	$payload = isset( $input['data_base64'] ) ? (string) $input['data_base64'] : '';
+	// Decoding the caller-supplied upload payload - the bytes are sniffed against a
+	// strict image allow-list below, never executed; the strict flag rejects junk.
+	// phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_decode
+	$decoded = base64_decode( $payload, true );
+	if ( false === $decoded || '' === $decoded ) {
+		return new WP_Error( 'aafm_bad_base64', __( 'Invalid base64 payload.', 'agent-abilities-for-mcp' ) );
+	}
+
+	return aafm_finish_media_upload(
+		$decoded,
+		(string) ( $input['filename'] ?? '' ),
+		isset( $input['alt'] ) ? (string) $input['alt'] : null
+	);
+}
+
+/**
+ * Shared post-decode upload tail: byte-sniff, allow-list, filename sanitize, sideload, kses
+ * re-check, alt text, redacted return shape. Both aafm/upload-media (base64) and
+ * aafm/upload-media-from-url (fetched bytes) call this so the two entry points share one
+ * single-audited pipeline instead of drifting apart (228-url-upload-ssrf-design.md §4).
+ *
+ * ACCEPTED RISK, operator decision. There is no
+ * pre-decode pixel/dimension cap: media_handle_sideload() decodes through the exact same
+ * wp_generate_attachment_metadata() path wp-admin's own uploader uses, so the OOM exposure here
+ * matches core's authenticated upload UI rather than being safer than it. Do not re-open this as
+ * a new finding without a fresh operator decision (228-url-upload-ssrf-design.md §4 explicitly
+ * says not to silently reintroduce one for the URL path either).
+ *
+ * @param string      $decoded            Already-fetched/decoded raw file bytes.
+ * @param string      $requested_filename Caller-supplied filename hint; only the sanitized basename is kept.
+ * @param string|null $alt                Alt text to set on the attachment, or null to leave it untouched.
+ * @return array<string,mixed>|WP_Error
+ * @throws \Throwable Anything thrown after the attachment exists, rethrown once it is deleted.
+ */
+function aafm_finish_media_upload( string $decoded, string $requested_filename, ?string $alt ) {
+	// Size cap from WordPress, enforced before anything is written. wp_handle_sideload() re-checks
+	// this too once media_handle_sideload() runs below (it is the same check a site owner's own
+	// wp_handle_sideload_overrides filter can tighten), so this early check is purely a cheap
+	// short-circuit before any temp file is written.
+	if ( strlen( $decoded ) > (int) wp_max_upload_size() ) {
+		return new WP_Error( 'aafm_too_large', __( 'File exceeds the maximum upload size.', 'agent-abilities-for-mcp' ) );
+	}
+
+	if ( ! aafm_fileinfo_available() ) {
+		return new WP_Error( 'aafm_fileinfo_missing', __( 'The server is missing the PHP fileinfo extension, required to verify upload contents.', 'agent-abilities-for-mcp' ) );
+	}
+
+	// Derive the true MIME from the decoded BYTES, never the supplied name/extension.
+	$finfo     = new finfo( FILEINFO_MIME_TYPE );
+	$real_mime = $finfo->buffer( $decoded );
+
+	$allow = aafm_upload_allowlist();
+	if ( ! is_string( $real_mime ) || ! isset( $allow[ $real_mime ] ) ) {
+		return new WP_Error( 'aafm_disallowed_type', __( 'Unsupported or unsafe file type.', 'agent-abilities-for-mcp' ) );
+	}
+
+	// Build a safe filename with the canonical extension for the real type. The
+	// supplied name is reduced to its basename and sanitized, so '../' segments
+	// and the client-declared extension cannot influence where the file lands.
+	//
+	// sanitize_file_name() alone is not enough for what gets STORED. It handles the
+	// path- and shell-hostile punctuation, but it keeps every C0 control except tab,
+	// LF and CR, and it keeps the whole Trojan Source bidi set - so a name carrying
+	// U+202E lands intact. aafm_sanitize_plain_text() runs on top and has the last
+	// word, which is the same rule aafm-update-media already applies to a title on
+	// this very object. Ordering is deliberate: the plain-text strip runs last so
+	// nothing can reintroduce a bidi override after it, and the path guarantee does
+	// not weaken, because wp_handle_sideload() -> wp_unique_filename() re-applies
+	// sanitize_file_name() to the name that actually reaches disk.
+	$base      = aafm_sanitize_plain_text( sanitize_file_name( wp_basename( $requested_filename, '.' . pathinfo( $requested_filename, PATHINFO_EXTENSION ) ) ) );
+	$base      = '' !== $base ? $base : 'upload';
+	$safe_name = $base . '.' . $allow[ $real_mime ];
+
+	require_once ABSPATH . 'wp-admin/includes/file.php';
+	require_once ABSPATH . 'wp-admin/includes/media.php';
+	require_once ABSPATH . 'wp-admin/includes/image.php';
+
+	// Write the decoded bytes to a real temp file so media_handle_sideload() can hand it to
+	// wp_handle_sideload(), which is what makes a site owner's own wp_handle_sideload_prefilter /
+	// wp_handle_sideload_overrides hooks and wp_max_upload_size() fire again - the mechanics
+	// wp_upload_bits() bypassed entirely. wp_tempnam() confines the file to WordPress's own temp
+	// directory.
+	$tmp_file = wp_tempnam( $safe_name );
+	// phpcs:ignore WordPress.WP.AlternativeFunctions.file_system_operations_file_put_contents -- writing our own already-decoded, already-sniffed bytes to a path wp_tempnam() itself issued; there is no remote or caller-chosen path here for WP_Filesystem to mediate.
+	if ( false === file_put_contents( $tmp_file, $decoded ) ) {
+		wp_delete_file( $tmp_file );
+		return aafm_generic_error();
+	}
+
+	$attachment_id = media_handle_sideload(
+		array(
+			'name'     => $safe_name,
+			'tmp_name' => $tmp_file,
+		),
+		0,
+		$base
+	);
+
+	// wp_handle_sideload() copies then unlinks tmp_name once it reaches the move step (copy+unlink,
+	// never rename, since rename() breaks stream wrappers) - so on a SUCCESSFUL sideload the temp
+	// file is already gone. Every earlier failure (a site owner's own mime override, a writable-
+	// uploads check) leaves it behind, so clean up defensively rather than assume which branch ran.
+	if ( file_exists( $tmp_file ) ) {
+		wp_delete_file( $tmp_file );
+	}
+
+	if ( is_wp_error( $attachment_id ) ) {
+		return aafm_generic_error();
+	}
+
+	// From here the attachment exists, so every way out that is not a success deletes it: a
+	// returned error, and a throw, which is rethrown unchanged once the attachment is gone. Only
+	// the attachment this call created is ever deleted.
+	//
+	// The sideload can fill post_content from the image's own IPTC/EXIF caption, so that column is
+	// run through wp_kses_post(), the policy update-media applies to a description, and the
+	// sanitized value must be confirmed as stored. The caller's alt text then wins over any alt the
+	// sideload set from the image metadata. The response is built inside a checked-read scope, so a
+	// failed metadata read is an error, never an empty or null field.
+	$attachment_id = (int) $attachment_id;
+	try {
+		$response = ( static function () use ( $attachment_id, $alt ) {
+			// aafm_exact_object() loads the attachment's own row, so the comparison and the rewrite act
+			// on the stored post_content, unaffected by any display filter.
+			$sideloaded_post = aafm_exact_object( 'post', $attachment_id );
+			if ( ! $sideloaded_post instanceof WP_Post ) {
+				return aafm_generic_error();
+			}
+			$sideloaded_field   = $sideloaded_post->post_content;
+			$sideloaded_content = is_string( $sideloaded_field ) ? $sideloaded_field : '';
+			$sanitized_content  = wp_kses_post( $sideloaded_content );
+			if ( $sanitized_content !== $sideloaded_content ) {
+				$updated = wp_update_post(
+					wp_slash(
+						array(
+							'ID'           => $attachment_id,
+							'post_content' => $sanitized_content,
+						)
+					),
+					true
+				);
+				if ( is_wp_error( $updated ) || ! aafm_post_field_confirm_logged( $attachment_id, 'post_content', $sanitized_content, $sideloaded_content ) ) {
+					return aafm_generic_error();
+				}
+			}
+
+			$alt_status = null;
+			if ( null !== $alt ) {
+				$alt_result = aafm_meta_set( 'post', $attachment_id, '_wp_attachment_image_alt', aafm_sanitize_plain_text( $alt ), (string) get_object_subtype( 'post', $attachment_id ) );
+				if ( is_wp_error( $alt_result ) || ! in_array( $alt_result['status'], array( AAFM_WRITE_WRITTEN, AAFM_WRITE_UNCHANGED ), true ) ) {
+					// An alt that did not land gets the generic error upload-media has always
+					// returned for it.
+					return aafm_generic_error();
+				}
+				$alt_status = $alt_result['status'];
+			}
+
+			$attachment = aafm_exact_object( 'post', $attachment_id );
+			if ( ! $attachment instanceof WP_Post ) {
+				return aafm_generic_error();
+			}
+
+			// The redacted media shape: public URL only, never an absolute path.
+			$response = aafm_with_checked_reads(
+				static function () use ( $attachment_id, $attachment ): array {
+					return array(
+						'attachment_id' => $attachment_id,
+						'media'         => aafm_redact_media( $attachment ),
+					);
+				},
+				aafm_media_write_unconfirmed_error()
+			);
+			if ( ! is_wp_error( $response ) && null !== $alt_status ) {
+				$response['alt_status'] = $alt_status;
+			}
+			return $response;
+		} )();
+	} catch ( \Throwable $e ) {
+		// A throw from the cleanup is dropped, so the caller gets the original.
+		try {
+			wp_delete_attachment( $attachment_id, true );
+		} catch ( \Throwable $cleanup_error ) {
+			unset( $cleanup_error );
+		}
+		throw $e;
+	}
+	if ( is_wp_error( $response ) ) {
+		wp_delete_attachment( $attachment_id, true );
+	}
+	return $response;
+}
+
+/**
+ * Args for aafm/upload-media-from-url.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_upload_media_from_url(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/upload-media-from-url' ),
+		'description'         => aafm_ability_description( 'aafm/upload-media-from-url' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'url'      => array(
+					'type'        => 'string',
+					'format'      => 'uri',
+					'description' => __( 'HTTPS URL of an image to fetch and upload. Must resolve to a public IP address; private, loopback, and link-local ranges are refused, and redirects are not followed into them either.', 'agent-abilities-for-mcp' ),
+				),
+				'filename' => array(
+					'type'        => 'string',
+					'minLength'   => 1,
+					'description' => __( 'Filename to base the stored file\'s name on. Only the basename is kept and sanitized, and the extension is replaced with the one matching the file\'s actual detected type, not the extension supplied here.', 'agent-abilities-for-mcp' ),
+				),
+				'alt'      => array(
+					'type'        => 'string',
+					'description' => __( 'Alt text to set on the uploaded image.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'url', 'filename' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'attachment_id' => array( 'type' => 'integer' ),
+				'media'         => array( 'type' => 'object' ),
+				'alt_status'    => array(
+					'type' => 'string',
+					'enum' => array( 'written', 'unchanged' ),
+				),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_upload_media_from_url',
+		'permission_callback' => 'aafm_perm_upload_media',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/upload-media-from-url: SSRF-hardened fetch, then the same post-decode pipeline
+ * aafm/upload-media already uses.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_upload_media_from_url( array $input ) {
+	$fetched = aafm_ssrf_safe_fetch_url( (string) $input['url'] );
+	if ( is_wp_error( $fetched ) ) {
+		return $fetched;
+	}
+
+	return aafm_finish_media_upload(
+		$fetched,
+		(string) ( $input['filename'] ?? '' ),
+		isset( $input['alt'] ) ? (string) $input['alt'] : null
+	);
+}
+
+/**
+ * Resolve a hostname to an IPv4 address, behind a filter so a test can inject a resolver double
+ * and count invocations (proving the real fetch path resolves exactly once
+ * rather than re-resolving between validation and connection).
+ *
+ * IPv4 only (ponytail: gethostbyname() is a one-line stdlib resolver; a dual-stack resolver adds
+ * real complexity for a feature whose only public exposure is fetching a caller-given image URL,
+ * and 228-url-upload-ssrf-design.md's own "what was not independently re-verified" section leaves
+ * this as an open, explicitly-stated restriction rather than a silent gap - add IPv6 support if a
+ * real need for it turns up).
+ *
+ * @param string $host Hostname to resolve.
+ * @return string|false Dotted-quad IPv4 address, or false on failure.
+ */
+function aafm_resolve_hostname_to_ip( string $host ) {
+	// phpcs:ignore WordPress.WP.AlternativeFunctions.network_functions -- deliberate: this is the pre-flight resolve-and-validate step Task 20's SSRF design pins via CURLOPT_RESOLVE, not a substitute for the fetch itself.
+	return apply_filters( 'aafm_resolve_hostname_to_ip', gethostbyname( $host ), $host );
+}
+
+/**
+ * Whether an IP address falls in a private or reserved range (RFC 1918, loopback, link-local,
+ * and the other IANA special-use ranges, IPv4 and IPv6 alike) - the denylist
+ * 228-url-upload-ssrf-design.md §2 requires on top of wp_http_validate_url()'s own separate check.
+ *
+ * Ponytail: PHP's own filter_var() flags already encode this range list; no hand-rolled CIDR
+ * table to keep in sync. If a specific gap is ever found unguarded, add it as a follow-up filter
+ * rather than replacing this with a hand-rolled list.
+ *
+ * @param string $ip IP address (already confirmed valid by the caller).
+ * @return bool
+ */
+function aafm_ip_is_private_or_reserved( string $ip ): bool {
+	return false === filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE );
+}
+
+/**
+ * Whether the cURL transport is available for an HTTPS fetch - and therefore, per WordPress's
+ * own transport priority (WpOrg\Requests\Requests::DEFAULT_TRANSPORTS lists Curl before
+ * Fsockopen), whether a real fetch will actually go through the transport this ability's
+ * CURLOPT_RESOLVE pinning depends on. Filterable so a test can force the "no cURL" refusal path
+ * without uninstalling the extension.
+ *
+ * Checking only function_exists('curl_init') is not the same test
+ * Requests itself runs before picking Curl over Fsockopen. \WpOrg\Requests\Transport\Curl::test()
+ * additionally requires curl_exec() to exist and, for an HTTPS request specifically, that the
+ * installed libcurl was built with SSL support (Requests::request() passes
+ * [Capability::SSL => true] for every https:// URL). A server with curl_init() present but
+ * curl_exec() disabled via disable_functions, or a non-SSL libcurl build, fails Requests' own
+ * test, falls through to Fsockopen, and Fsockopen does its OWN unpinned DNS resolution - the
+ * exact DNS-rebinding gap CURLOPT_RESOLVE exists to close. Mirror Requests' real test instead of
+ * a weaker approximation of it.
+ *
+ * @return bool
+ */
+function aafm_curl_available(): bool {
+	$has_curl = function_exists( 'curl_init' ) && function_exists( 'curl_exec' ) && function_exists( 'curl_version' );
+	if ( $has_curl ) {
+		$version  = curl_version();
+		$has_curl = is_array( $version ) && ( CURL_VERSION_SSL & (int) ( $version['features'] ?? 0 ) );
+	}
+	return (bool) apply_filters( 'aafm_curl_available', $has_curl );
+}
+
+/**
+ * Whether WordPress would send a request to this URL through an outbound HTTP proxy.
+ *
+ * CURLOPT_RESOLVE only pins a DIRECT connection. When an outbound proxy
+ * is configured (WP_PROXY_HOST/WP_PROXY_PORT), libcurl hands the hostname to the proxy and the
+ * proxy resolves it independently - the pin never applies, so a hostname that resolves publicly
+ * here and privately at the proxy would bypass every check in aafm_ssrf_safe_fetch_url(). Uses
+ * WP_HTTP_Proxy's own decision (it exempts localhost and the site's own host) rather than a
+ * blanket "a proxy is configured" refusal. Filterable, matching aafm_curl_available()'s own
+ * pattern, since the real decision depends on PHP constants a test cannot safely define without
+ * leaking into every other test in the process.
+ *
+ * This is a plugin-defined filter, unlike http_allowed_safe_ports below, so
+ * nothing requires it to carry the URL. Passing $url as an extra arg exposed the full fetch
+ * target - including any signed query string - to every 'all' hook observer before any control
+ * had a chance to run. The filtered value already answers the only question a caller needs
+ * ("would this go through a proxy"), so the URL is dropped rather than redacted.
+ *
+ * @param string $url The URL that would be fetched.
+ * @return bool
+ */
+function aafm_url_would_use_proxy( string $url ): bool {
+	$proxy = new WP_HTTP_Proxy();
+	return (bool) apply_filters(
+		'aafm_url_would_use_proxy',
+		$proxy->is_enabled() && $proxy->send_through_proxy( $url )
+	);
+}
+
+/**
+ * Validate a caller-supplied URL against every control decided in
+ * 228-url-upload-ssrf-design.md before any network fetch is attempted: https-only, no bare
+ * IP-literal host, no outbound-proxy routing, resolve-once (so the transport cannot re-resolve
+ * the hostname on its own between this check and the actual connection), the resolved IP refused
+ * if private/reserved, and the port checked against the same safe-port allowlist
+ * wp_http_validate_url() itself uses.
+ *
+ * Split out of aafm_ssrf_safe_fetch_url() so the validation step is directly
+ * testable on its own - a test can assert a URL passes or fails this gate without ever reaching
+ * the network, which the combined function could not offer once it stopped routing through WP's
+ * mockable 'pre_http_request' hook.
+ *
+ * @param string $url Caller-supplied URL.
+ * @return array{host:string,port:int,ip:string,max_bytes:int}|WP_Error The connection target on
+ *              success, or a WP_Error naming which control refused the request.
+ */
+function aafm_ssrf_validate_fetch_target( string $url ) {
+	if ( ! aafm_curl_available() ) {
+		return new WP_Error( 'aafm_curl_unavailable', __( 'This server cannot safely fetch a remote URL for upload.', 'agent-abilities-for-mcp' ) );
+	}
+
+	if ( aafm_url_would_use_proxy( $url ) ) {
+		return new WP_Error( 'aafm_proxy_unsupported', __( 'This server routes outbound requests through a proxy, which this ability cannot safely pin to a validated address. Refusing.', 'agent-abilities-for-mcp' ) );
+	}
+
+	$parts = wp_parse_url( $url );
+	if ( ! is_array( $parts ) || empty( $parts['host'] ) ) {
+		return new WP_Error( 'aafm_bad_url', __( 'That is not a valid URL.', 'agent-abilities-for-mcp' ) );
+	}
+	if ( 'https' !== ( $parts['scheme'] ?? '' ) ) {
+		return new WP_Error( 'aafm_bad_scheme', __( 'Only https:// URLs may be fetched.', 'agent-abilities-for-mcp' ) );
+	}
+
+	$host = (string) $parts['host'];
+	if ( false !== filter_var( $host, FILTER_VALIDATE_IP ) ) {
+		return new WP_Error( 'aafm_ip_literal_refused', __( 'A bare IP address may not be used as the upload URL host.', 'agent-abilities-for-mcp' ) );
+	}
+
+	// Resolve ONCE, validate the resolved IP, then pin the connection to it below - never let the
+	// transport re-resolve the hostname on its own between this check and the actual connection.
+	$ip = aafm_resolve_hostname_to_ip( $host );
+	if ( ! is_string( $ip ) || '' === $ip || false === filter_var( $ip, FILTER_VALIDATE_IP ) ) {
+		return new WP_Error( 'aafm_resolve_failed', __( 'The host could not be resolved.', 'agent-abilities-for-mcp' ) );
+	}
+	if ( aafm_ip_is_private_or_reserved( $ip ) ) {
+		return new WP_Error( 'aafm_private_range_refused', __( 'The host resolves to a private or reserved IP address.', 'agent-abilities-for-mcp' ) );
+	}
+
+	$port = isset( $parts['port'] ) ? (int) $parts['port'] : 443;
+
+	// wp_http_validate_url()'s own default allowlist (80/443/8080), re-derived rather than
+	// calling that function directly - it would perform its own unmocked gethostbyname() lookup
+	// on top of aafm_resolve_hostname_to_ip() above. Still filterable via 'http_allowed_safe_ports'
+	// so a site customizing that filter for its other HTTP calls gets the same behaviour here.
+	//
+	// This call also exposes $url to any 'all' hook observer. Accepted rather
+	// than redacted: this is core's own hook with core's own signature (wp-includes/http.php
+	// passes the same $url to it on every ordinary wp_http_validate_url() call a site already
+	// makes), so a site's existing filter callback already expects this exact shape. Diverging
+	// from it here would break that expectation without closing anything - the same URL already
+	// reaches this same hook through core's normal HTTP calls.
+	$allowed_ports = apply_filters( 'http_allowed_safe_ports', array( 80, 443, 8080 ), $host, $url ); // phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- mirroring core's own hook (wp-includes/http.php), not a hook this plugin defines.
+	if ( ! is_array( $allowed_ports ) || ! in_array( $port, $allowed_ports, true ) ) {
+		return new WP_Error( 'aafm_unsafe_port', __( 'That port is not allowed for a remote fetch.', 'agent-abilities-for-mcp' ) );
+	}
+
+	return array(
+		'host'      => $host,
+		'port'      => $port,
+		'ip'        => $ip,
+		'max_bytes' => (int) wp_max_upload_size(),
+	);
+}
+
+/**
+ * Turn aafm_ssrf_owned_curl_fetch()'s raw result into fetched bytes or a WP_Error, independent of
+ * how the fetch was performed. Split out of aafm_ssrf_safe_fetch_url() so this
+ * logic is directly testable with a synthetic response array, with no network and no fetch
+ * mechanism involved at all.
+ *
+ * @param array{headers:array<string,string>,body:string,response:array{code:int,message:string}}|WP_Error $response  Raw fetch result.
+ * @param int                                                                                              $max_bytes wp_max_upload_size() at fetch time.
+ * @return string|WP_Error Fetched bytes, or a WP_Error naming which control refused the response.
+ */
+function aafm_ssrf_process_fetch_response( $response, int $max_bytes ) {
+	if ( is_wp_error( $response ) ) {
+		return new WP_Error( 'aafm_fetch_failed', __( 'The URL could not be fetched.', 'agent-abilities-for-mcp' ) );
+	}
+
+	$status = (int) wp_remote_retrieve_response_code( $response );
+	if ( $status < 200 || $status >= 300 ) {
+		// Covers redirects too: redirection => 0 means a 3xx is returned as-is rather than
+		// followed, so it lands here as a plain failure instead of a fetched file.
+		return new WP_Error( 'aafm_fetch_failed', __( 'The URL could not be fetched.', 'agent-abilities-for-mcp' ) );
+	}
+
+	// The REAL abort already happened inside aafm_ssrf_owned_curl_fetch() - before any body bytes
+	// for an honest oversized Content-Length, mid-transfer otherwise - which reports itself back
+	// here as this same shape (an oversized 'content-length' header with an empty body, or a body
+	// already over the cap). This is the defense-in-depth re-check for a hostile server that
+	// claims any Content-Length it likes, and for a synthetic response in a test.
+	$content_length = wp_remote_retrieve_header( $response, 'content-length' );
+	if ( is_numeric( $content_length ) && (int) $content_length > $max_bytes ) {
+		return new WP_Error( 'aafm_too_large', __( 'File exceeds the maximum upload size.', 'agent-abilities-for-mcp' ) );
+	}
+
+	$body = (string) wp_remote_retrieve_body( $response );
+	if ( strlen( $body ) > $max_bytes ) {
+		return new WP_Error( 'aafm_too_large', __( 'File exceeds the maximum upload size.', 'agent-abilities-for-mcp' ) );
+	}
+	if ( '' === $body ) {
+		return new WP_Error( 'aafm_fetch_failed', __( 'The URL returned no data.', 'agent-abilities-for-mcp' ) );
+	}
+
+	return $body;
+}
+
+/**
+ * SSRF-hardened fetch for aafm/upload-media-from-url: validate the target
+ * (aafm_ssrf_validate_fetch_target()), fetch it on a cURL handle this plugin owns outright
+ * (aafm_ssrf_owned_curl_fetch()), then turn the raw result into bytes or an error
+ * (aafm_ssrf_process_fetch_response()).
+ *
+ * WordPress's HTTP API can fall back from cURL to the Fsockopen
+ * transport (that fallback does its OWN, unpinned DNS resolution), and CURLOPT_RESOLVE pinning
+ * only applies inside the http_api_curl action, which never fires for that fallback - a silent
+ * TOCTOU reopening. Since Requests checks cURL's availability before Fsockopen's and picks cURL
+ * whenever it can, refusing outright when cURL is unavailable removes the fallback path entirely
+ * rather than trying to detect after the fact whether the pin actually applied.
+ *
+ * Live-network finding, full gate (2026-09-05): an earlier version of this function set
+ * CURLOPT_HEADERFUNCTION/CURLOPT_WRITEFUNCTION on the SAME handle WP_Http_Curl uses, inside the
+ * http_api_curl action. WP_Http_Curl::request() (wp-includes/class-wp-http-curl.php) sets its OWN
+ * header/write callbacks on that handle BEFORE firing http_api_curl, and curl_setopt() for the
+ * same option simply replaces the previous callback - so those callbacks silently starved
+ * WP_Http_Curl's internal body/header buffers, which it then read as "no response" and reported
+ * as a curl error regardless of the real transfer having succeeded. Every real fetch broke.
+ *
+ * The interim workaround above - bounding the transfer via WP's own
+ * 'limit_response_size' request arg instead of aborting it - correctly REJECTS an oversized
+ * result, but only after the (bounded) download completes, and remains vulnerable to a LATER
+ * http_api_curl callback (from another plugin, at a higher priority) overriding this function's
+ * proxy/resolve pin. Both gaps share one root cause: sharing WP_Http_Curl's handle at all. Fixed
+ * by NOT sharing it - a cURL handle this function owns OUTRIGHT via aafm_ssrf_owned_curl_fetch()
+ * below. Nothing else in the process ever touches that handle, so its own
+ * HEADERFUNCTION/WRITEFUNCTION callbacks can safely abort the transfer.
+ *
+ * This function used to reach
+ * aafm_ssrf_owned_curl_fetch() through a `pre_http_request` short-circuit registered around a
+ * `wp_safe_remote_get()` call, so the fetch still nominally went through WP's HTTP stack. That
+ * still left a global hook in play - any OTHER 'pre_http_request' callback, from another plugin,
+ * could in principle run before this one and pre-empt it first, and 'reject_unsafe_urls' passed
+ * to wp_safe_remote_get() never actually applied, since WP_Http::request() only acts on it AFTER
+ * firing 'pre_http_request'. Round 9 closed the override by registering at PHP_INT_MAX and
+ * re-deriving the safe-port check independently (now in aafm_ssrf_validate_fetch_target()).
+ *
+ * Removes the `pre_http_request`
+ * plumbing entirely. There is no window for a pre-emption question to arise when nothing is
+ * registered on a shared hook in the first place: aafm_ssrf_owned_curl_fetch() is called
+ * directly, and wp_safe_remote_get()/WP's HTTP stack are no longer part of this path at all. The
+ * validation and response-processing halves are their own functions above so they stay testable
+ * without a network mock; aafm_ssrf_owned_curl_fetch() itself is directly callable and already has
+ * real local-server tests (tests/abilities/SsrfOwnedCurlFetchTest.php).
+ *
+ * @param string $url Caller-supplied URL.
+ * @return string|WP_Error Fetched bytes, or a WP_Error naming which control refused the request.
+ */
+function aafm_ssrf_safe_fetch_url( string $url ) {
+	$target = aafm_ssrf_validate_fetch_target( $url );
+	if ( is_wp_error( $target ) ) {
+		return $target;
+	}
+
+	/**
+	 * Test-only short-circuit for the owned-curl fetch itself, applied AFTER target validation
+	 * (so a test still exercises the real https/proxy/IP-literal/resolve/private-range/port
+	 * checks above) and BEFORE the real network call. Returning an array here, in the same shape
+	 * aafm_ssrf_owned_curl_fetch() returns, skips curl_init()/curl_exec() entirely and feeds that
+	 * array straight to aafm_ssrf_process_fetch_response() - the same seam
+	 * tests/abilities/UploadMediaFromUrlSsrfTest.php uses by calling that function directly, but
+	 * reachable here for a test that needs the full ability round trip (permission check,
+	 * sideload, caption re-save) rather than the response-processing logic in isolation.
+	 * Read-only in production: nothing in this codebase adds a callback to it.
+	 *
+	 * This used to also pass the full caller-supplied $url, recreating the
+	 * class of URL leak already fixed on the aafm_media_fetch_before_exec seam - a signed query string or
+	 * embedded credentials in the source URL would reach any logger attached to WordPress's own
+	 * 'all' hook. No fixture in this codebase's own tests reads the second argument, so it is
+	 * dropped rather than reconstructed into a redacted URL.
+	 *
+	 * @param array{headers:array<string,string>,body:string,response:array{code:int,message:string}}|WP_Error|null $pre_fetch_result Null to perform the real fetch.
+	 */
+	$response = apply_filters( 'aafm_media_fetch_pre_fetch_result', null );
+	if ( null === $response ) {
+		$response = aafm_ssrf_owned_curl_fetch( $url, $target['host'], $target['port'], $target['ip'], $target['max_bytes'] );
+	}
+
+	return aafm_ssrf_process_fetch_response( $response, $target['max_bytes'] );
+}
+
+/**
+ * Perform the actual network fetch for aafm_ssrf_safe_fetch_url() on a cURL handle this function
+ * owns outright - never WP_Http_Curl's handle, and never touched by anything else in the process
+ * (see aafm_ssrf_safe_fetch_url()'s docblock for why the earlier shared-handle approach could not
+ * abort mid-transfer). Two independent abort mechanisms, both real, not post-hoc:
+ *
+ * - CURLOPT_HEADERFUNCTION: the instant a Content-Length header exceeds $max_bytes, returns a
+ *   value other than the header line's own length - libcurl's documented signal to abort the
+ *   transfer right there, before a single body byte is read. An honest-but-oversized declaration
+ *   costs zero body bytes and returns almost immediately, not after a bounded download completes.
+ * - CURLOPT_WRITEFUNCTION: covers a Content-Length header that is absent, chunked, or lied about -
+ *   the one residual this design has always accepted, still bounded, but now by an actual abort
+ *   the instant the running byte count exceeds $max_bytes, not by requesting a truncated buffer
+ *   and letting the real network transfer run to completion or the timeout regardless.
+ *
+ * Builds and returns a plain array in the same shape WP's own HTTP transport returns
+ * (wp_remote_retrieve_*()'s documented input shape - see wp-includes/class-wp-http.php), so
+ * aafm_ssrf_process_fetch_response() keeps working on it unchanged, and the SAME 'aafm_too_large'
+ * error code still surfaces from the SAME downstream checks whichever abort mechanism fired -
+ * this function reports the abort as data (an oversized 'content-length' header, or a body
+ * already over the cap), never as a WP_Error, so it cannot be flattened into the generic
+ * 'aafm_fetch_failed' the caller gives every genuine transport failure.
+ *
+ * @param string $url       Already-validated https:// URL.
+ * @param string $host      Hostname - used only for the TLS SNI/cert check, never for connecting.
+ * @param int    $port      Port to connect to.
+ * @param string $ip        Pre-resolved, denylist-checked IP to connect to instead of $host.
+ * @param int    $max_bytes wp_max_upload_size() at call time.
+ * @return array{headers:array<string,string>,body:string,response:array{code:int,message:string}}|WP_Error
+ */
+function aafm_ssrf_owned_curl_fetch( string $url, string $host, int $port, string $ip, int $max_bytes ) {
+	$ch = curl_init( $url ); // phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_init -- SSRF design's option (b): a fetch on a handle this plugin owns outright, never shared with WP_Http_Curl's; see aafm_ssrf_safe_fetch_url()'s docblock.
+	if ( false === $ch ) {
+		return new WP_Error( 'aafm_fetch_failed', __( 'The URL could not be fetched.', 'agent-abilities-for-mcp' ) );
+	}
+
+	$body                  = '';
+	$header_content_length = '';
+	$aborted_on_header     = false;
+	$aborted_on_body       = false;
+
+	$options = array(
+		CURLOPT_HEADER         => false,
+		// §3: no redirect-following, matches this design's original 'redirection' => 0 request arg.
+		CURLOPT_FOLLOWLOCATION => false,
+		// Deliberately no CURLOPT_PROTOCOLS restriction here (unlike CURLOPT_PROXY/CURLOPT_NOPROXY
+		// below, which guard a DIFFERENT bypass vector - environment proxy config - the caller's
+		// own scheme check cannot see): the only caller, aafm_ssrf_safe_fetch_url(), already
+		// refuses a non-https $url before this function ever runs, and CURLOPT_FOLLOWLOCATION is
+		// false, so nothing mid-request can switch scheme either. Restricting it here anyway would
+		// only block this function's own direct-call test fixture (a bare `php -S` cannot speak
+		// TLS at all) for a check the caller has already made redundant.
+		CURLOPT_SSL_VERIFYPEER => true,
+		CURLOPT_SSL_VERIFYHOST => 2,
+		// Disables any environment-configured proxy for this one handle.
+		CURLOPT_PROXY          => '',
+		CURLOPT_NOPROXY        => '*', // Belt-and-suspenders alongside CURLOPT_PROXY above.
+		// Pins the connection to the pre-validated IP; SNI/cert still use $host.
+		CURLOPT_RESOLVE        => array( "{$host}:{$port}:{$ip}" ),
+		CURLOPT_TIMEOUT        => 10,
+		CURLOPT_CONNECTTIMEOUT => 10,
+		// A neutral, non-identifying User-Agent - WP core's default
+		// discloses this site's own URL to whatever host the caller supplied.
+		CURLOPT_USERAGENT      => 'Agent Abilities for MCP (media fetch)',
+		CURLOPT_HEADERFUNCTION => static function ( $handle, string $header_line ) use ( $max_bytes, &$header_content_length, &$aborted_on_header ): int {
+			$len = strlen( $header_line );
+			if ( preg_match( '/^content-length:\s*(\d+)/i', $header_line, $matches ) && (int) $matches[1] > $max_bytes ) {
+				$header_content_length = $matches[1];
+				$aborted_on_header     = true;
+				return 0; // Any return other than $len tells libcurl to abort - before any body byte.
+			}
+			return $len;
+		},
+		CURLOPT_WRITEFUNCTION  => static function ( $handle, string $chunk ) use ( &$body, &$aborted_on_body, $max_bytes ): int {
+			$body .= $chunk;
+			if ( strlen( $body ) > $max_bytes ) {
+				$aborted_on_body = true;
+				return 0; // Abort: the real, accumulated byte count exceeded the cap.
+			}
+			return strlen( $chunk );
+		},
+	);
+
+	/**
+	 * The exact cURL options this fetch is about to apply, immediately before it does.
+	 *
+	 * A test can hook this to assert the real, final CURLOPT_RESOLVE/
+	 * CURLOPT_PROXY/CURLOPT_FOLLOWLOCATION values a live fetch would actually use, rather than
+	 * only proving aafm_resolve_hostname_to_ip() was called once (what the pre_http_request-based
+	 * mock this replaced could prove) with no way to see whether the pin it produced was ever
+	 * really applied to a cURL handle. Read-only in production: nothing in this codebase adds a
+	 * callback to it, and the returned array is used exactly as filtered.
+	 *
+	 * This used to also pass the full caller-supplied $url - a signed query
+	 * string or embedded credentials in the source URL would reach any logger attached to
+	 * WordPress's own 'all' hook, recreating the class of URL leak already fixed on the sibling
+	 * aafm_media_fetch_before_exec seam. The URL was already set on the handle by curl_init( $url )
+	 * before this filter runs, so nothing about the fetch itself depended on receiving it again
+	 * here; only the extra, logger-visible argument is dropped. No fixture in this codebase's own
+	 * tests reads a second argument here.
+	 *
+	 * @param array<int,mixed> $options The cURL options this fetch is about to set.
+	 */
+	$options = apply_filters( 'aafm_media_fetch_curl_options', $options );
+	// The curl_setopt_array() fail-closed check below only catches an option
+	// that FAILS to apply; it cannot notice one a hooked callback removed from the array outright,
+	// since curl_setopt_array() only ever sees what is still present. Nothing in this codebase
+	// hooks this filter, but assert the DNS pin, proxy neutralization, TLS verification, redirect
+	// refusal, transfer timeouts, and byte-cap enforcement are all still keys in $options before
+	// trusting it, the same fail-closed instinct as the check below.
+	//
+	// F8 (1.7.5 deferred): CURLOPT_TIMEOUT/CURLOPT_CONNECTTIMEOUT were missing from this list, so
+	// a hooked callback removing either one passed the guard, and a public HTTPS server could
+	// then stall the transfer past the intended ten-second bound. This still only catches the
+	// option being removed outright, not a callback that raises the value; no callback exists in
+	// this codebase's own source.
+	$required_options = array(
+		CURLOPT_FOLLOWLOCATION,
+		CURLOPT_SSL_VERIFYPEER,
+		CURLOPT_SSL_VERIFYHOST,
+		CURLOPT_PROXY,
+		CURLOPT_NOPROXY,
+		CURLOPT_RESOLVE,
+		CURLOPT_HEADERFUNCTION,
+		CURLOPT_WRITEFUNCTION,
+		CURLOPT_TIMEOUT,
+		CURLOPT_CONNECTTIMEOUT,
+	);
+	foreach ( $required_options as $required_option ) {
+		if ( ! array_key_exists( $required_option, $options ) ) {
+			curl_close( $ch ); // phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_close
+			return new WP_Error( 'aafm_fetch_failed', __( 'The URL could not be fetched.', 'agent-abilities-for-mcp' ) );
+		}
+	}
+	// curl_setopt_array()'s return was ignored, so a single option this
+	// array cannot apply (it stops applying at the first failure) still let curl_exec() run with
+	// whichever security options DID make it through - possibly none of the DNS pin, proxy
+	// neutralization, timeout, or byte-cap options above. Fail closed instead: never call
+	// curl_exec() unless every option in the array was confirmed applied.
+	if ( true !== curl_setopt_array( $ch, $options ) ) { // phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_setopt_array
+		curl_close( $ch ); // phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_close
+		return new WP_Error( 'aafm_fetch_failed', __( 'The URL could not be fetched.', 'agent-abilities-for-mcp' ) );
+	}
+
+	/**
+	 * Fires immediately before curl_exec(), once every option has been confirmed applied.
+	 *
+	 * Test observation point only: nothing in this codebase hooks it in production. It lets a
+	 * test prove the fail-closed guard above actually prevented curl_exec() from running, rather
+	 * than inferring that from a WP_Error return alone.
+	 */
+	do_action( 'aafm_media_fetch_before_exec' );
+
+	$ok    = curl_exec( $ch ); // phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_exec
+	$errno = curl_errno( $ch ); // phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_errno
+	$code  = (int) curl_getinfo( $ch, CURLINFO_RESPONSE_CODE ); // phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_getinfo -- @phpstan-ignore-line argument.type (this file's phpVersion: 70400 target keeps curl_init()'s stub return type as a plain resource, but PHPStan's bundled curl_getinfo() stub still distinguishes it from the exact resource subtype it expects on PHP 8.3, the real runtime version)
+	curl_close( $ch ); // phpcs:ignore WordPress.WP.AlternativeFunctions.curl_curl_close
+
+	if ( $aborted_on_header ) {
+		return array(
+			'headers'  => array( 'content-length' => $header_content_length ),
+			'body'     => '',
+			'response' => array(
+				'code'    => 200,
+				'message' => '',
+			),
+		);
+	}
+	if ( $aborted_on_body ) {
+		return array(
+			'headers'  => array(),
+			'body'     => $body, // Already over $max_bytes - the accumulated bytes ARE the proof.
+			'response' => array(
+				'code'    => 200,
+				'message' => '',
+			),
+		);
+	}
+	if ( false === $ok || 0 !== $errno ) {
+		return new WP_Error( 'aafm_fetch_failed', __( 'The URL could not be fetched.', 'agent-abilities-for-mcp' ) );
+	}
+
+	return array(
+		'headers'  => array(),
+		'body'     => $body,
+		'response' => array(
+			'code'    => $code,
+			'message' => '',
+		),
+	);
+}
+
+/**
+ * Args for aafm/update-media.
+ *
+ * Closed schema. title/alt/caption/description are all optional; the executor
+ * requires at least one. Per-object edit_post is the execute-time gate.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_update_media(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/update-media' ),
+		'description'         => aafm_ability_description( 'aafm/update-media' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'attachment_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the attachment to update.', 'agent-abilities-for-mcp' ),
+				),
+				'title'         => array(
+					'type'        => 'string',
+					'description' => __( 'New attachment title, sanitized as plain text. At least one of title, alt, caption, or description must be given.', 'agent-abilities-for-mcp' ),
+				),
+				'alt'           => array(
+					'type'        => 'string',
+					'description' => __( 'New alt text for the image, sanitized as plain text.', 'agent-abilities-for-mcp' ),
+				),
+				'caption'       => array(
+					'type'        => 'string',
+					'description' => __( 'New caption, sanitized as plain text with no HTML.', 'agent-abilities-for-mcp' ),
+				),
+				'description'   => array(
+					'type'        => 'string',
+					'description' => __( 'New description. Basic HTML is allowed and sanitized.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'attachment_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'media'      => array( 'type' => 'object' ),
+				'alt_status' => array(
+					'type' => 'string',
+					'enum' => array( 'written', 'unchanged' ),
+				),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_update_media',
+		'permission_callback' => 'aafm_perm_update_media',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/update-media: DIRECT per-object edit_post on the attachment.
+ *
+ * Attachments are a _builtin post type, so they are NOT eligible for the CPT
+ * chokepoint (aafm_can_edit_post_object / aafm_validate_post_type require
+ * public && !_builtin and fail-closed for ALL attachments). map_meta_cap resolves
+ * edit_post correctly for attachments, so we check it directly - after confirming
+ * the id is a real attachment. The denial is audited by the registration wrapper.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_update_media( array $input ): bool {
+	$att_id = isset( $input['attachment_id'] ) ? absint( $input['attachment_id'] ) : 0;
+	$att    = aafm_exact_object( 'post', $att_id );
+	if ( $att_id <= 0 || 'attachment' !== ( $att instanceof WP_Post ? $att->post_type : false ) ) {
+		return false;
+	}
+	return aafm_user_can_checked( 'edit_post', $att_id );
+}
+
+/**
+ * Execute aafm/update-media - title/alt/caption/description, at least one required.
+ *
+ * Re-confirms the target is a real attachment the caller can edit (defense in depth),
+ * sanitizes each field, and returns the rich media shape.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_update_media( array $input ) {
+	$att_id     = isset( $input['attachment_id'] ) ? absint( $input['attachment_id'] ) : 0;
+	$attachment = $att_id ? aafm_exact_object_chain( 'post', $att_id ) : null;
+	if ( ! $attachment instanceof WP_Post || 'attachment' !== $attachment->post_type
+		|| ! aafm_user_can_checked( 'edit_post', $att_id ) ) {
+		return aafm_generic_error();
+	}
+
+	$has_title       = array_key_exists( 'title', $input );
+	$has_alt         = array_key_exists( 'alt', $input );
+	$has_caption     = array_key_exists( 'caption', $input );
+	$has_description = array_key_exists( 'description', $input );
+
+	if ( ! $has_title && ! $has_alt && ! $has_caption && ! $has_description ) {
+		return new WP_Error( 'aafm_nothing_to_update', __( 'Provide at least one field to update.', 'agent-abilities-for-mcp' ) );
+	}
+
+	$postarr = array( 'ID' => $att_id );
+	if ( $has_title ) {
+		$postarr['post_title'] = aafm_sanitize_plain_text( (string) $input['title'] );
+	}
+	if ( $has_caption ) {
+		$postarr['post_excerpt'] = aafm_sanitize_multiline_text( (string) $input['caption'] );
+	}
+	if ( $has_description ) {
+		$postarr['post_content'] = wp_kses_post( (string) $input['description'] );
+	}
+
+	if ( count( $postarr ) > 1 ) {
+		// wp_update_post() unslashes its input, so slash here to keep literal
+		// backslashes in title/caption/description from being stripped on save.
+		$result = wp_update_post( wp_slash( $postarr ), true );
+		if ( is_wp_error( $result ) ) {
+			return aafm_generic_error();
+		}
+	}
+
+	$alt_result = null;
+	if ( $has_alt ) {
+		$alt_result = aafm_meta_set( 'post', $att_id, '_wp_attachment_image_alt', aafm_sanitize_plain_text( (string) $input['alt'] ), (string) get_object_subtype( 'post', $att_id ) );
+		if ( is_wp_error( $alt_result ) ) {
+			// The same code update-media returned for an alt it could not store before.
+			return aafm_media_write_unconfirmed_error();
+		}
+	}
+
+	$fresh = aafm_exact_object( 'post', $att_id );
+	if ( ! $fresh instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+
+	// The post-field write was only checked via is_wp_error(), and the alt
+	// meta write's return value was discarded outright - a wp_insert_post_data filter reverting a
+	// field, or an update_post_metadata filter vetoing the alt write, would report success while
+	// the response carried the caller's stale value. Confirm every field actually provided. Compare against each field's CANONICAL sanitize_post_field()/sanitize_meta()
+	// form, not the pre-write intent, so a legitimate normalization (kses for a user without
+	// unfiltered_html, the core `trim` on title) is not mistaken for a veto.
+	// $attachment was read before wp_update_post() ran, so its fields are each field's genuine
+	// pre-write value.
+	if ( $has_title && ! aafm_post_field_confirm_logged( $att_id, 'post_title', (string) ( $postarr['post_title'] ?? '' ), (string) $attachment->post_title ) ) {
+		return aafm_media_write_unconfirmed_error();
+	}
+	if ( $has_caption && ! aafm_post_field_confirm_logged( $att_id, 'post_excerpt', (string) ( $postarr['post_excerpt'] ?? '' ), (string) $attachment->post_excerpt ) ) {
+		return aafm_media_write_unconfirmed_error();
+	}
+	if ( $has_description && ! aafm_post_field_confirm_logged( $att_id, 'post_content', (string) $postarr['post_content'], (string) $attachment->post_content ) ) {
+		return aafm_media_write_unconfirmed_error();
+	}
+	if ( null !== $alt_result && ! in_array( $alt_result['status'], array( AAFM_WRITE_WRITTEN, AAFM_WRITE_UNCHANGED ), true ) ) {
+		$error = aafm_meta_write_error( $alt_result['status'], 'write', 'post', $att_id, '_wp_attachment_image_alt' );
+		return new WP_Error( 'aafm_media_write_unconfirmed', $error->get_error_message(), $error->get_error_data() );
+	}
+
+	$response = aafm_with_checked_reads(
+		static function () use ( $fresh ): array {
+			return array( 'media' => aafm_media_item_payload( $fresh ) );
+		},
+		aafm_media_write_unconfirmed_error()
+	);
+	if ( is_wp_error( $response ) ) {
+		return $response;
+	}
+	if ( null !== $alt_result ) {
+		$response['alt_status'] = $alt_result['status'];
+	}
+	return $response;
+}
+
+/**
+ * The structured error for aafm/update-media when a field could not be confirmed as saved.
+ *
+ * @return WP_Error
+ */
+function aafm_media_write_unconfirmed_error(): WP_Error {
+	return new WP_Error(
+		'aafm_media_write_unconfirmed',
+		__( 'The media item could not be confirmed as saved.', 'agent-abilities-for-mcp' )
+	);
+}
+
+/**
+ * Args for aafm/delete-media.
+ *
+ * Destructive: wp_delete_attachment( $id, true ) permanently removes the file and
+ * the DB record; not recoverable. Closed schema; per-object delete_post is the gate.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_delete_media(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/delete-media' ),
+		'description'         => aafm_ability_description( 'aafm/delete-media' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'attachment_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the attachment to permanently delete. Both the file and the library entry are removed; there is no undo.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'attachment_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'deleted'       => array( 'type' => 'boolean' ),
+				'attachment_id' => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_delete_media',
+		'permission_callback' => 'aafm_perm_delete_media',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/delete-media: DIRECT per-object delete_post on the attachment.
+ *
+ * Same _builtin rationale as update-media: the CPT chokepoint fails-closed for all
+ * attachments, so we check the per-object delete cap directly after confirming the
+ * id is a real attachment. The denial is audited by the registration wrapper.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_delete_media( array $input ): bool {
+	$att_id = isset( $input['attachment_id'] ) ? absint( $input['attachment_id'] ) : 0;
+	$att    = aafm_exact_object( 'post', $att_id );
+	if ( $att_id <= 0 || 'attachment' !== ( $att instanceof WP_Post ? $att->post_type : false ) ) {
+		return false;
+	}
+	return aafm_user_can_checked( 'delete_post', $att_id );
+}
+
+/**
+ * Execute aafm/delete-media - permanent delete via wp_delete_attachment( $id, true ).
+ *
+ * Re-confirms the target is a real attachment the caller can delete (defense in
+ * depth). wp_delete_attachment returns WP_Post on success, or false|null on failure;
+ * anything other than a WP_Post is treated as failure.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_delete_media( array $input ) {
+	$att_id = isset( $input['attachment_id'] ) ? absint( $input['attachment_id'] ) : 0;
+	$att    = aafm_exact_object( 'post', $att_id );
+	if ( $att_id <= 0 || 'attachment' !== ( $att instanceof WP_Post ? $att->post_type : false ) || ! aafm_user_can_checked( 'delete_post', $att_id ) ) {
+		return aafm_generic_error();
+	}
+
+	$result = wp_delete_attachment( $att_id, true );
+	if ( ! $result instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+
+	return array(
+		'deleted'       => true,
+		'attachment_id' => $att_id,
+	);
+}

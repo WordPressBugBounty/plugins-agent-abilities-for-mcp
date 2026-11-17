@@ -1,0 +1,638 @@
+<?php
+/**
+ * OAuth bearer-token validation at the WordPress auth layer.
+ *
+ * Resolves a presented OAuth access token to its approving WordPress user on the
+ * `determine_current_user` filter - the same layer Application Passwords resolve
+ * on. Once a user is resolved here, the adapter's transport gate (which only
+ * checks is_user_logged_in()) lets the request through under that identity.
+ *
+ * The resolver is deliberately narrow: it only ever acts on a bearer credential
+ * that carries the `aafm_oat_` access-token prefix, and only when no earlier
+ * filter has already resolved a user. Every other auth path - App Passwords,
+ * cookies, foreign bearer schemes, no auth at all - is returned untouched. A
+ * present-but-invalid OAuth token never hard-fails the request; it simply fails
+ * to resolve a user, and the transport gate issues its own 401 downstream.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * The literal prefix every minted OAuth access token carries.
+ */
+if ( ! defined( 'AAFM_OAUTH_ACCESS_TOKEN_PREFIX' ) ) {
+	define( 'AAFM_OAUTH_ACCESS_TOKEN_PREFIX', 'aafm_oat_' );
+}
+
+/**
+ * Remember (or read) the OAuth client_id a bearer token resolved for the current request.
+ *
+ * Only aafm_oauth_resolve_current_user() writes it, and only AFTER a token has already fully resolved
+ * a user. It never grants anything, but it has three kinds of reader: the activity-log rows for
+ * ability calls, discovery denials, transport outcomes and write outcomes record it as the calling
+ * connection; the allowlist keys its per-connection scope on it as the principal's client; and
+ * aafm_oauth_confine_bearer_to_mcp_handler() reads a non-empty value as the marker that the current
+ * user came from our bearer. Mirrors the aafm_remember_raw_permission() static store in
+ * register.php. A non-OAuth (Application Password/cookie) request never writes it.
+ *
+ * The store has to be per request, and a bare function static is not that on its own. On php-fpm and
+ * mod_php the process ends with the request, so the two are the same. Under a persistent worker SAPI
+ * (FrankenPHP worker mode, RoadRunner, Swoole) the static outlives the request: a worker that served
+ * an OAuth call for client 'abc' would still hold 'abc' when it next serves an Application Password
+ * request that never touches this store, and register.php would then mis-attribute that second call's
+ * audit row to 'abc'. So the value is cleared on `shutdown` (see aafm_oauth_reset_current_client_id())
+ * rather than trusted to die with the process, which makes "per request" true on every SAPI. The same
+ * reasoning is spelled out for the sibling static in includes/admin/review-request.php.
+ *
+ * @param string|null $client_id Client id to record, or null to read the currently stored value.
+ * @param bool        $forget    Discard the stored value and return ''. Used by the shutdown reset so
+ *                               the next request on a persistent worker starts with a cold store.
+ * @return string The stored client id, or '' when no OAuth bearer has resolved this request.
+ */
+function aafm_oauth_current_client_id( ?string $client_id = null, bool $forget = false ): string {
+	static $stored = '';
+
+	if ( $forget ) {
+		$stored = '';
+		return '';
+	}
+
+	if ( null !== $client_id ) {
+		$stored = $client_id;
+	}
+
+	return $stored;
+}
+
+/**
+ * Drop the remembered OAuth client_id at the end of the request.
+ *
+ * Hooked on `shutdown` so a persistent worker starts each request with a cold store. On php-fpm and
+ * mod_php the process was ending anyway, so this costs one function call and changes nothing.
+ *
+ * @return void
+ */
+function aafm_oauth_reset_current_client_id(): void {
+	aafm_oauth_current_client_id( null, true );
+	aafm_oauth_current_grant( null, true );
+	aafm_oauth_invalid_bearer( false );
+}
+
+/**
+ * Remember (or read) that this request presented one of our bearers and it failed to resolve.
+ *
+ * Set only by aafm_oauth_resolve_current_user(), from its own refusal branches: no active unexpired
+ * row, a token minted for another address, a deactivated client, or an expired or no longer allowed
+ * grant. aafm_oauth_filter_rest_challenge() reads it to add error="invalid_token" to the MCP 401
+ * (RFC 6750 section 3.1), so a client knows to refresh or sign in again. It holds a bool only, never
+ * the token or why it failed, and is cleared at the start of each resolution and on `shutdown` (see
+ * aafm_oauth_reset_current_client_id()), so it is per request on every SAPI.
+ *
+ * @param bool|null $set True or false to record, null to read.
+ * @return bool
+ */
+function aafm_oauth_invalid_bearer( ?bool $set = null ): bool {
+	static $flag = false;
+	if ( null !== $set ) {
+		$flag = $set;
+	}
+	return $flag;
+}
+
+// Registered at include time, beside the store whose contract it enforces, rather than in the
+// bootstrap's OAuth block. register.php reads the store during REST dispatch on any SAPI, so a
+// worker must clear it between requests whether or not OAuth is enabled; review-request.php wires
+// its own shutdown reset the same way and for the same reason.
+add_action( 'shutdown', 'aafm_oauth_reset_current_client_id' );
+
+/**
+ * Resolve an OAuth bearer token to the WordPress user that approved it.
+ *
+ * Hooked on `determine_current_user`. Returns the incoming `$user_id` unchanged
+ * in every case except a valid, audience-bound OAuth access token - see the
+ * file header for why each guard exists.
+ *
+ * @param int|false $user_id The user id resolved so far (false if none yet). Left
+ *                           untyped deliberately: WordPress passes int|false through
+ *                           the determine_current_user filter, and a scalar type hint
+ *                           would coerce that false to 0.
+ * @return int|false The approving wp_user_id, or the incoming value unchanged.
+ */
+function aafm_oauth_resolve_current_user( $user_id ) {
+	// 0. A failed bearer from an earlier resolution in this process never colours this one.
+	aafm_oauth_invalid_bearer( false );
+
+	// 1. Never preempt a user some earlier filter already resolved (App Password,
+	// cookie, another plugin). This early return is what makes the filter
+	// priority non-load-bearing for the frozen invariant.
+	if ( $user_id ) {
+		return $user_id;
+	}
+
+	// 2. Read the bearer and scope to our own access tokens FIRST, before touching anything else.
+	// A request that carries no `aafm_oat_` bearer - i.e. every ordinary page view - can never
+	// resolve an OAuth user, so we return immediately. Doing this first keeps the filter a true
+	// no-op for all non-OAuth traffic: it never builds a URL (rest_url()/home_url()) or reads an
+	// option during user resolution. That matters because this runs on determine_current_user for
+	// every logged-out request - resolving a URL here would fire the site-wide home_url/rest_url
+	// filter chain during user resolution, and a third-party filter on it that reads the current
+	// user would re-enter determine_current_user and recurse into a memory-exhaustion white-screen.
+	$credential = aafm_oauth_read_bearer_token();
+	if ( null === $credential
+		|| 0 !== strncmp( $credential, AAFM_OAUTH_ACCESS_TOKEN_PREFIX, strlen( AAFM_OAUTH_ACCESS_TOKEN_PREFIX ) )
+	) {
+		return $user_id;
+	}
+
+	// 3. Re-entrancy guard. Everything below can build site URLs (aafm_endpoint_url() at step 9),
+	// which fires the site-wide home_url/rest_url filter chains DURING user resolution. WordPress's
+	// _wp_get_current_user() has no re-entrancy lock, so a third-party filter on those URLs that
+	// calls a current-user function would re-enter this callback and recurse until memory is
+	// exhausted (a white-screen). Once we are already resolving, a nested call resolves no OAuth
+	// user. The bearer read above stays outside the guard so bearer-less traffic is unaffected. This
+	// CANNOT deadlock a legitimate token: only a nested (re-entrant) call sees the flag set; the
+	// outer call always resets it in the finally below.
+	static $resolving = false;
+	if ( $resolving ) {
+		return $user_id;
+	}
+	$resolving = true;
+
+	try {
+		// 4. Respect the operator's OAuth kill switch.
+		if ( ! aafm_oauth_enabled() ) {
+			return $user_id;
+		}
+
+		// 5. Bail until the plugin is fully loaded. The MCP-route match (step 6) and the audience
+		// binding (step 9) call functions defined only when aafm_bootstrap() runs on `plugins_loaded`
+		// - aafm_is_mcp_route() (includes/bootstrap.php, the file that defines aafm_mcp_rest_route(),
+		// the name checked below) and aafm_endpoint_url() (the connection module). This filter is
+		// registered at plugin-include time, so it can fire BEFORE our bootstrap when another active
+		// plugin resolves the current user during `plugins_loaded` (e.g. The Events Calendar calls
+		// wp_create_nonce() there). A fatal in a determine_current_user
+		// callback white-screens the request, so we fail closed and resolve no OAuth user until the
+		// helpers exist; the genuine MCP auth check runs later, during REST dispatch.
+		if ( ! function_exists( 'aafm_mcp_rest_route' ) || ! function_exists( 'aafm_endpoint_url' ) ) {
+			return $user_id;
+		}
+
+		// 6. Scope strictly to the MCP REST route. An aafm_oat_ token is a credential
+		// for the MCP endpoint, not a site-wide WP REST bearer. Resolving it on any
+		// other route would turn an MCP token into a general credential for every route
+		// that trusts is_user_logged_in()/current_user_can(). Off the MCP route we leave
+		// current_user untouched, exactly as Application Passwords are. The answer is the
+		// route core parsed; before the parse it is false and serve_request() asks again.
+		if ( ! aafm_oauth_request_targets_mcp_route() ) {
+			return $user_id;
+		}
+
+		// 7. Enforce the HTTPS policy. Where HTTPS is required, a bearer presented over
+		// plain http never resolves a user (the other OAuth paths already refuse http).
+		//
+		// Transport visibility: this bail used to be silent, so an operator whose agent presents an
+		// aafm_oat_ token over http (a reverse proxy that terminates TLS but forwards http without
+		// the forwarded-proto header WordPress trusts, say) saw the connection fail with no trace at
+		// all. Record one bounded (transport) row so the HTTPS-scheme bail is visible instead of
+		// invisible. Pure observability - the decision (return $user_id) is unchanged; only a row is
+		// added, and only when a real aafm_oat_ bearer targeting the MCP route was presented (we are
+		// past the prefix and route guards above). Bounded per source IP on its own 'ssl' bucket, the
+		// same anti-flood cap the other transport-denial rows use, so a client retrying over http
+		// cannot grow the log without limit. The function_exists guards mirror the rest of this
+		// resolver: these helpers exist by REST dispatch, but this filter can fire early on
+		// determine_current_user.
+		if ( aafm_oauth_https_required() && ! is_ssl() ) {
+			if ( function_exists( 'aafm_log_activity' )
+				&& function_exists( 'aafm_denial_log_within_cap' )
+				&& aafm_denial_log_within_cap( 'ssl' )
+			) {
+				aafm_log_activity(
+					array(
+						'ability' => '(transport)',
+						'status'  => 'denied',
+						'detail'  => __( 'Bearer token presented over insecure HTTP', 'agent-abilities-for-mcp' ),
+					)
+				);
+			}
+			return $user_id;
+		}
+
+		// 8. Resolve the token to its row in a single indexed lookup. The row
+		// resolver already gates on (active + unexpired), so a null row covers
+		// every present-but-invalid case - unknown, inactive, expired - and a
+		// present-but-invalid OAuth token simply fails to resolve a user rather
+		// than hard-failing the request. Audit a denial ONLY when the bearer
+		// matches a REAL stored token row that is now invalid (expired or
+		// deactivated) - genuine credential misuse. A bearer that matches NO
+		// stored token at all is unauthenticated, since anyone can fabricate the
+		// aafm_oat_ prefix, so logging it would let an attacker grow the activity
+		// log unbounded; skip the audit for that case. No client_id is known here
+		// - the lookup that would resolve one is exactly what just failed.
+		$row = aafm_oauth_get_access_token_row( $credential );
+		if ( null === $row ) {
+			if ( function_exists( 'aafm_oauth_log_event' ) && aafm_oauth_access_token_row_exists( $credential ) ) {
+				aafm_oauth_log_event( 'bearer', 'denied' );
+			}
+			aafm_oauth_invalid_bearer( true );
+			return $user_id;
+		}
+
+		// 9. Audience binding (RFC 8707): the token must have been minted for THIS
+		// endpoint. A token scoped to a different audience resolves no user here.
+		if ( ! aafm_oauth_resource_is_this_endpoint( (string) $row['resource'] ) ) {
+			if ( function_exists( 'aafm_oauth_log_event' ) ) {
+				aafm_oauth_log_event( 'bearer', 'denied', array( 'client_id' => (string) $row['client_id'] ) );
+			}
+			aafm_oauth_invalid_bearer( true );
+			return $user_id;
+		}
+
+		// 10. Re-enforce client deactivation. is_active is checked at authorize-time, but a token
+		// already in a client's hands keeps working unless its owning client is re-checked here -
+		// so disabling a compromised client invalidates its live access tokens immediately.
+		if ( aafm_oauth_client_is_deactivated( (string) $row['client_id'] ) ) {
+			if ( function_exists( 'aafm_oauth_log_event' ) ) {
+				aafm_oauth_log_event( 'bearer', 'denied', array( 'client_id' => (string) $row['client_id'] ) );
+			}
+			aafm_oauth_invalid_bearer( true );
+			return $user_id;
+		}
+
+		// 10b. Per-connection state (1.10.0). An expired grant ends the connection the way a deactivated
+		// client does, and a grant whose state cannot be certified is refused. A PAUSED grant is not refused
+		// here: it keeps a valid login and is answered with a 403 at the transport gate, so a client shows an
+		// error instead of looping through sign-in and refresh. A token with no consent row, and a site that
+		// has not run the v9 installer yet, read as the defaults (aafm_oauth_grant_state()).
+		// 10c. Roles that can connect. Narrowing the owner's list ends the grants of users it no longer
+		// covers; a site that never saved a list keeps every grant (aafm_oauth_user_still_may_connect()).
+		// Short-circuit order matters: the roles check never runs for a missing or expired grant.
+		$grant = aafm_oauth_grant_state( (int) $row['wp_user_id'], (string) $row['client_id'] );
+		if ( null === $grant || $grant['expired'] || ! aafm_oauth_user_still_may_connect( (int) $row['wp_user_id'] ) ) {
+			if ( function_exists( 'aafm_oauth_log_event' ) ) {
+				aafm_oauth_log_event( 'bearer', 'denied', array( 'client_id' => (string) $row['client_id'] ) );
+			}
+			aafm_oauth_invalid_bearer( true );
+			return $user_id;
+		}
+
+		// 11. Token capability map. The token resolves to the approver's FULL account by default
+		// (unchanged behaviour). A site that registers aafm_oauth_token_capabilities replaces the
+		// token's capabilities for the rest of this MCP request: each listed capability is set
+		// outright, a capability the approver lacks included, and every other capability is denied,
+		// in every user_has_cap check the request makes. The resolved identity is unchanged.
+		aafm_oauth_apply_token_capability_scope(
+			(int) $row['wp_user_id'],
+			isset( $row['scope'] ) ? (string) $row['scope'] : '',
+			(string) $row['client_id']
+		);
+
+		// 12. M16: record the resolved client_id. The activity-log rows attribute calls by it, the
+		// allowlist keys its per-connection scopes on it (aafm_ability_allowed_for_principal()), and
+		// aafm_oauth_confine_bearer_to_mcp_handler() reads it as the marker that the current user came
+		// from our bearer. The grant store beside it carries the connection's pause, preset and rate
+		// for the transport gate, the allowlist and the rate limiter. Both are written only after the
+		// token has resolved a user through every guard above, so they cannot change this resolution.
+		// Resolving is not using: the transport gate stamps last use once it admits the request.
+		aafm_oauth_current_client_id( (string) $row['client_id'] );
+		aafm_oauth_current_grant(
+			array_merge(
+				$grant,
+				array(
+					'client_id' => (string) $row['client_id'],
+					'user_id'   => (int) $row['wp_user_id'],
+				)
+			)
+		);
+
+		return (int) $row['wp_user_id'];
+	} finally {
+		$resolving = false;
+	}
+}
+
+/**
+ * Audience binding (RFC 8707): whether a token's stored resource is this request's MCP endpoint,
+ * byte for byte. The one rule both the bearer path and refresh rotation apply, so a token minted for
+ * an address the endpoint no longer has neither authenticates nor rolls forward.
+ *
+ * @param string $resource_url Stored token resource.
+ * @return bool
+ */
+function aafm_oauth_resource_is_this_endpoint( string $resource_url ): bool {
+	return hash_equals( aafm_endpoint_url(), $resource_url );
+}
+
+/**
+ * Optionally replace the capabilities an OAuth token may exercise for this request.
+ *
+ * The identity a token resolves to is never changed here: the token always acts AS the
+ * approving WordPress user. What this offers is a hook that sets the capabilities checked on
+ * the current MCP request, keyed on the scope the grant was minted with.
+ *
+ * By default it does nothing - the `aafm_oauth_token_capabilities` filter returns null, so no
+ * restriction is applied and existing "acts with the approver's full caps" behaviour is
+ * preserved (non-breaking; live tokens are never silently reduced). A hook that returns a
+ * capability => bool map instead installs a request-scoped `user_has_cap` filter that sets
+ * each listed capability outright, a capability the approver lacks included, and denies every
+ * capability not in the map. That filter applies to every user_has_cap check for the remainder
+ * of THIS request, whichever user it is for. The request only reaches here on the MCP route
+ * with a valid OAuth bearer, so the map never reaches an unrelated request.
+ *
+ * @param int    $user_id   The resolved approver (unchanged; passed for hook context).
+ * @param string $scope     The scope the token was minted with (may be '').
+ * @param string $client_id The client the token belongs to.
+ * @return void
+ */
+function aafm_oauth_apply_token_capability_scope( int $user_id, string $scope, string $client_id ): void {
+	/**
+	 * Filter the capabilities an OAuth-authenticated request may exercise.
+	 *
+	 * Return null (the default) to apply NO restriction - the token acts with the approving
+	 * user's full capabilities, exactly as before. Return an array of capability => bool to replace
+	 * the capabilities for the rest of this MCP request: each listed capability is granted or denied
+	 * outright, a capability the approver lacks included, and any capability not in the map is
+	 * denied. The map applies to every user_has_cap check in that request, whichever user it is for.
+	 *
+	 * @param array<string,bool>|null $caps      Capability allow-map, or null for no restriction.
+	 * @param string                  $scope     The scope the token was minted with (may be '').
+	 * @param string                  $client_id The client the token belongs to.
+	 * @param int                     $user_id   The approving WordPress user id.
+	 */
+	$caps = apply_filters( 'aafm_oauth_token_capabilities', null, $scope, $client_id, $user_id );
+
+	if ( ! is_array( $caps ) ) {
+		return; // Default (and any non-array return): acts as the approver, unchanged.
+	}
+
+	// Normalise to a capability => bool allow-map once, outside the per-check closure.
+	$allow = array();
+	foreach ( $caps as $cap => $granted ) {
+		$allow[ (string) $cap ] = (bool) $granted;
+	}
+
+	add_filter(
+		'user_has_cap',
+		static function ( $allcaps ) use ( $allow ) {
+			if ( ! is_array( $allcaps ) ) {
+				return $allcaps;
+			}
+			// Deny everything the token was not explicitly granted, then apply the allow-map.
+			foreach ( array_keys( $allcaps ) as $cap ) {
+				$allcaps[ $cap ] = isset( $allow[ $cap ] ) ? $allow[ $cap ] : false;
+			}
+			foreach ( $allow as $cap => $granted ) {
+				$allcaps[ $cap ] = $granted;
+			}
+			return $allcaps;
+		},
+		10,
+		1
+	);
+}
+
+/**
+ * Remember (or read) whether REST routing began after WordPress parsed this request.
+ *
+ * Set by aafm_oauth_forget_anonymous_user_on_mcp_route() when rest_api_init fires while WordPress is
+ * running parse_request with core's rest_api_loaded() still hooked, as it does inside
+ * rest_api_loaded(). rest_api_init fires once per process, on the first rest_get_server() from any
+ * caller, so a count of it alone cannot tell this request's REST routing from a REST server some
+ * plugin built earlier; this flag can. Cleared on `shutdown`, like the client id store, so a
+ * persistent worker starts each request without it.
+ *
+ * @param bool|null $began True to record, false to forget, null to read.
+ * @return bool
+ */
+function aafm_oauth_rest_routing_began( ?bool $began = null ): bool {
+	static $flag = false;
+	if ( null !== $began ) {
+		$flag = $began;
+	}
+	return $flag;
+}
+
+/**
+ * Forget the REST routing flag at the end of the request.
+ *
+ * @return void
+ */
+function aafm_oauth_forget_rest_routing(): void {
+	aafm_oauth_rest_routing_began( false );
+}
+add_action( 'shutdown', 'aafm_oauth_forget_rest_routing' );
+
+/**
+ * Whether WordPress routed this request to the MCP REST route.
+ *
+ * The answer is core's own: the rest_route WordPress::parse_request() settled on, untrailingslashed
+ * as rest_api_loaded() does, matched by aafm_is_mcp_route() as core's router matches it. It is
+ * false until WordPress has parsed the request and is serving it as REST: REST_REQUEST is defined
+ * (core defines it in rest_api_loaded(), the same signal core's Application Passwords wait for), or
+ * rest_api_init fired inside core's REST dispatch during parse_request
+ * (aafm_oauth_rest_routing_began()). That is safe for a healthy MCP call:
+ * WP_REST_Server::serve_request() forgets a cached anonymous user before dispatch, so the bearer
+ * resolves then. Entry points that never parse (wp-admin, admin-ajax, admin-post, wp-comments-post,
+ * cron, CLI) and requests answered during parse_request (the discovery documents) never match, even
+ * on a site where a plugin built the REST server before the parse. What is left is code that builds
+ * the REST server inside an early parse_request callback on a non-REST request, and, as for core's
+ * Application Passwords, code that defines REST_REQUEST itself on a request core does not serve as
+ * REST.
+ *
+ * @return bool True only when core routed the request to the MCP endpoint.
+ */
+function aafm_oauth_request_targets_mcp_route(): bool {
+	$wp = $GLOBALS['wp'] ?? null;
+	if ( ! did_action( 'parse_request' ) || ! $wp instanceof WP ) {
+		return false;
+	}
+	if ( ! ( defined( 'REST_REQUEST' ) && REST_REQUEST ) && ! aafm_oauth_rest_routing_began() ) {
+		return false;
+	}
+	$route = $wp->query_vars['rest_route'] ?? null;
+	return is_string( $route ) && aafm_is_mcp_route( untrailingslashit( $route ) );
+}
+
+/**
+ * Forget a cached anonymous user when an MCP-routed request carries our bearer.
+ *
+ * Runs first on rest_api_init, and does anything only while WordPress is still running
+ * parse_request: core serves a parsed rest_route from rest_api_loaded(), a parse_request callback,
+ * which defines REST_REQUEST and then obtains the REST server, initializing it (and firing
+ * rest_api_init) only if none exists. A server built later (during a page render on a site that
+ * unhooked rest_api_loaded()) or earlier (a plugin at plugins_loaded) is outside it, and this does
+ * nothing. Inside it, with rest_api_loaded() still hooked, it records that REST routing began after
+ * the parse (aafm_oauth_rest_routing_began()). WP::init() looks the user up before WordPress parses
+ * the request, when the bearer cannot resolve yet, and caches "nobody". Once core has defined
+ * REST_REQUEST, this makes the same clear core's WP_REST_Server::serve_request() makes, one step
+ * earlier, so in the normal routing order the tool registry built on rest_api_init sees the
+ * approver. A server some parse_request callback builds before core's dispatch clears nothing. On a
+ * site where code built the REST server before the parse, rest_api_init has already run and
+ * registration sees whoever was resolved then. It only ever forgets a cached user that does not
+ * exist, and only with an aafm_oat_ bearer on a request core routed to the MCP endpoint.
+ *
+ * @return void
+ */
+function aafm_oauth_forget_anonymous_user_on_mcp_route(): void {
+	global $current_user;
+	if ( ! doing_action( 'parse_request' ) ) {
+		return;
+	}
+	if ( false !== has_action( 'parse_request', 'rest_api_loaded' ) ) {
+		aafm_oauth_rest_routing_began( true );
+	}
+	if ( ! ( defined( 'REST_REQUEST' ) && REST_REQUEST ) || ! $current_user instanceof WP_User || $current_user->exists() || ! function_exists( 'aafm_is_mcp_route' ) ) {
+		return;
+	}
+	$credential = aafm_oauth_read_bearer_token();
+	if ( null === $credential || 0 !== strncmp( $credential, AAFM_OAUTH_ACCESS_TOKEN_PREFIX, strlen( AAFM_OAUTH_ACCESS_TOKEN_PREFIX ) ) ) {
+		return;
+	}
+	if ( aafm_oauth_request_targets_mcp_route() ) {
+		$current_user = null; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited -- the same clear core makes in WP_REST_Server::serve_request().
+	}
+}
+
+/**
+ * Refuse a user resolved from our bearer at any handler on the MCP path but an MCP transport's.
+ *
+ * Core runs the first handler whose route matches, so a route another plugin registers inside our
+ * namespace could run ahead of the adapter's on the MCP path. Runs on rest_request_before_callbacks,
+ * after core matched the handler and before the dispatch runs its permission_callback and callback
+ * (core's Allow-header pass still calls that permission_callback afterwards; see Limits). When the
+ * request is the MCP route and the current user came from an aafm_oat_ bearer, any handler whose
+ * callback is not an HttpTransport method gets the same 401 an unauthenticated MCP call gets.
+ *
+ * Limits (named residuals U-1b and U-1c): a second HttpTransport server registered at a route
+ * matching ours is let through; a foreign handler's argument validate and sanitize callbacks, core's
+ * Allow-header pass over its permission_callback, and any rest_request_before_callbacks filter that
+ * runs before this one still run with the bearer's user; and a filter another plugin adds at the same
+ * last priority after this one can undo the refusal.
+ *
+ * @param mixed $response The response so far (WP_Error, a short-circuit value, or null).
+ * @param mixed $handler  The matched route handler.
+ * @param mixed $request  The request.
+ * @return mixed $response unchanged, or a 401 WP_Error.
+ */
+function aafm_oauth_confine_bearer_to_mcp_handler( $response, $handler, $request ) {
+	if ( is_wp_error( $response ) || ! $request instanceof WP_REST_Request || ! function_exists( 'aafm_is_mcp_route' ) || ! aafm_is_mcp_route( $request->get_route() ) ) {
+		return $response;
+	}
+	get_current_user_id();
+	if ( '' === aafm_oauth_current_client_id() ) {
+		return $response;
+	}
+	$callback = is_array( $handler ) ? ( $handler['callback'] ?? null ) : null;
+	if ( is_array( $callback ) && isset( $callback[0] ) && $callback[0] instanceof \WP\MCP\Transport\HttpTransport ) {
+		return $response;
+	}
+	return new WP_Error( 'aafm_unauthenticated', __( 'Authentication required.', 'agent-abilities-for-mcp' ), array( 'status' => 401 ) );
+}
+
+/**
+ * Extract the bearer credential from the Authorization header, if present.
+ *
+ * Checks HTTP_AUTHORIZATION first, then the FastCGI-only
+ * REDIRECT_HTTP_AUTHORIZATION fallback. The `Bearer ` scheme is matched
+ * case-insensitively per RFC 6750.
+ *
+ * @return string|null The raw credential, or null when no bearer is present.
+ */
+function aafm_oauth_read_bearer_token(): ?string {
+	$header = '';
+	if ( isset( $_SERVER['HTTP_AUTHORIZATION'] ) ) {
+		$header = trim( sanitize_text_field( wp_unslash( $_SERVER['HTTP_AUTHORIZATION'] ) ) );
+	} elseif ( isset( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ) ) {
+		$header = trim( sanitize_text_field( wp_unslash( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ) ) );
+	}
+
+	if ( '' === $header ) {
+		return null;
+	}
+
+	// Case-insensitive "Bearer " scheme; the remainder is the credential.
+	if ( 0 !== strncasecmp( $header, 'Bearer ', 7 ) ) {
+		return null;
+	}
+
+	$credential = trim( substr( $header, 7 ) );
+
+	return '' === $credential ? null : $credential;
+}
+
+/**
+ * Fetch a full access-token row by the SHA-256 hash of the raw token.
+ *
+ * Returns the same row that {@see aafm_oauth_validate_access_token()} matches -
+ * active and unexpired - so the two functions always agree: a token that
+ * validates also returns a row here, and one that does not validate returns
+ * null. The row carries at least `resource` (the audience) and `wp_user_id`.
+ *
+ * This gates authentication for every bearer request, so it is the highest-stakes instance of the
+ * stale-reader class: a bare $wpdb->get_row() hands back the PREVIOUS
+ * query's row when this one fails, which here would authenticate the caller as whichever OTHER
+ * token happened to be looked up last on this connection - a cross-token identity confusion, not
+ * merely a missing row. Routed through aafm_wpdb_row() so a failed lookup denies, exactly like a
+ * genuinely absent/inactive/expired token already does.
+ *
+ * @param string $raw The raw access token presented by the client.
+ * @return array<string,mixed>|null The row as ARRAY_A, or null when not found / inactive / expired
+ *                                  / the lookup itself failed.
+ */
+function aafm_oauth_get_access_token_row( string $raw ): ?array {
+	global $wpdb;
+	$table = $wpdb->prefix . 'aafm_oauth_access_tokens';
+	$now   = gmdate( 'Y-m-d H:i:s', time() );
+
+	$view = aafm_wpdb_row(
+		$wpdb->prepare(
+			// Keep this WHERE clause in sync with aafm_oauth_validate_access_token() in tokens.php - the two must never disagree on the active/unexpired predicate.
+			'SELECT * FROM %i
+			 WHERE token_hash = %s
+			   AND is_active = 1
+			   AND expires_at > %s',
+			$table,
+			hash( 'sha256', $raw ),
+			$now
+		)
+	);
+
+	return ( $view['ok'] && is_array( $view['value'] ) ) ? $view['value'] : null;
+}
+
+/**
+ * Whether an access-token row exists for this raw token at all, ignoring the active/unexpired
+ * predicate {@see aafm_oauth_get_access_token_row()} applies.
+ *
+ * Used at the determine_current_user resolver to tell a genuine-but-invalid credential (a token that
+ * was once issued and is now expired or belongs to a deactivated client - worth auditing as credential
+ * misuse) apart from a bearer that matches NO stored token, which anyone can fabricate simply by using
+ * the aafm_oat_ prefix. Auditing the latter would let an unauthenticated caller grow the activity log
+ * at will, so the denial audit is gated on this existence check. token_hash is a UNIQUE key, so this
+ * is a single indexed lookup.
+ *
+ * Routed through aafm_wpdb_scalar() rather than a bare get_var() - a failed
+ * query here could otherwise inherit a stale non-null value left over from an unrelated earlier
+ * query in the same request and wrongly report a fabricated bearer as a real, once-issued token,
+ * defeating the anti-flood gate this existence check exists to enforce.
+ *
+ * @param string $raw The raw access token presented by the client.
+ * @return bool True when a row with this token hash exists, regardless of its active/expiry state.
+ */
+function aafm_oauth_access_token_row_exists( string $raw ): bool {
+	global $wpdb;
+	$table = $wpdb->prefix . 'aafm_oauth_access_tokens';
+
+	$view = aafm_wpdb_scalar(
+		$wpdb->prepare(
+			'SELECT id FROM %i WHERE token_hash = %s LIMIT 1',
+			$table,
+			hash( 'sha256', $raw )
+		)
+	);
+
+	return $view['ok'] && null !== $view['value'];
+}

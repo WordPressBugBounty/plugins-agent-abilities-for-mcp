@@ -1,0 +1,942 @@
+<?php
+/**
+ * OAuth 2.1 authorization endpoint and consent flow.
+ *
+ * Served off `init` at ?aafm_oauth=authorize. The handler enforces HTTPS, rate
+ * limiting, login, and a capability gate, then validates the request. On GET it
+ * either mints a code immediately (prior consent) or renders the consent screen; on
+ * POST it verifies the nonce, re-validates everything, and records consent before
+ * minting. PKCE S256 is mandatory and the code's `resource` is forced to the MCP
+ * endpoint so it audience-matches the bearer validator byte-for-byte.
+ *
+ * Open-redirect guard: the request is never bounced to a client redirect_uri until
+ * that URI has been matched against the client's registered allowlist. A bad
+ * client_id/redirect_uri (or a local authorization failure such as a capability or
+ * nonce error) renders a local error page instead of redirecting anywhere.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Whether a validation WP_Error may be handed back to the client's redirect_uri.
+ *
+ * "Local" errors (unknown client, unregistered redirect_uri) must never redirect -
+ * the redirect target is itself untrusted. They carry the 'aafm_local' error-data
+ * flag and render a local page. Every other validation error is a proper OAuth error
+ * that is safe to return to the (already-validated) redirect_uri.
+ *
+ * @param \WP_Error $error The validation error.
+ * @return bool True when the error may be redirected back to the client.
+ */
+function aafm_oauth_error_is_redirectable( WP_Error $error ): bool {
+	$data = $error->get_error_data();
+
+	if ( is_array( $data ) && ! empty( $data['aafm_local'] ) ) {
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * Build a non-redirectable ("local") validation error.
+ *
+ * @param string $code    OAuth-style error code.
+ * @param string $message Human-readable message.
+ * @return \WP_Error
+ */
+function aafm_oauth_local_error( string $code, string $message ): WP_Error {
+	return new WP_Error( $code, $message, array( 'aafm_local' => true ) );
+}
+
+/**
+ * Look up an active OAuth client row by client_id.
+ *
+ * Same stale-read class as aafm_oauth_get_client() in oauth/clients.php: a bare
+ * $wpdb->get_row() hands back the PREVIOUS query's row when this one fails, which here would let
+ * a failed lookup for one client authorize the request as whichever OTHER client the connection
+ * happened to look up last. This gates the whole authorize flow, so a failed lookup must DENY,
+ * the same way a genuinely missing/inactive client already does - never fall back to some other
+ * client's row.
+ *
+ * @param string $client_id The public client identifier.
+ * @return array<string,mixed>|null The client row, or null when missing/inactive/unreadable.
+ */
+function aafm_oauth_get_active_client( string $client_id ): ?array {
+	if ( '' === $client_id ) {
+		return null;
+	}
+
+	global $wpdb;
+	$view = aafm_wpdb_row(
+		$wpdb->prepare(
+			'SELECT * FROM %i WHERE client_id = %s AND is_active = 1',
+			$wpdb->prefix . 'aafm_oauth_clients',
+			$client_id
+		)
+	);
+
+	return ( $view['ok'] && is_array( $view['value'] ) ) ? $view['value'] : null;
+}
+
+/**
+ * Validate and normalize an authorization request's parameters.
+ *
+ * Returns a normalized param set (with `resource` defaulted to the MCP endpoint) on
+ * success, or a WP_Error on failure. Local errors (bad client / unregistered
+ * redirect_uri) are flagged non-redirectable via aafm_oauth_local_error(); every
+ * other failure is a redirectable OAuth error. The order matters: client_id and
+ * redirect_uri are resolved FIRST so an open-redirect can never seed a later error.
+ *
+ * @param array<string,mixed> $params Raw, already-sanitized request parameters.
+ * @return array<string,string>|\WP_Error Normalized params, or a validation error.
+ */
+function aafm_oauth_validate_authorize_params( array $params ) {
+	$response_type = isset( $params['response_type'] ) ? (string) $params['response_type'] : '';
+	$client_id     = isset( $params['client_id'] ) ? (string) $params['client_id'] : '';
+	$redirect_uri  = isset( $params['redirect_uri'] ) ? (string) $params['redirect_uri'] : '';
+	$challenge     = isset( $params['code_challenge'] ) ? (string) $params['code_challenge'] : '';
+	$method        = isset( $params['code_challenge_method'] ) ? (string) $params['code_challenge_method'] : '';
+	$resource      = isset( $params['resource'] ) ? (string) $params['resource'] : '';
+	$state         = isset( $params['state'] ) ? (string) $params['state'] : '';
+	$scope         = isset( $params['scope'] ) ? (string) $params['scope'] : '';
+
+	// 1. Resolve the client. Unknown/inactive => local error (never redirect).
+	$client = aafm_oauth_get_active_client( $client_id );
+	if ( null === $client ) {
+		return aafm_oauth_local_error(
+			'invalid_client',
+			__( 'This app is no longer registered with this site.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	// 2. The redirect_uri must exactly match one the client registered. Mismatch =>
+	// local error: we must not bounce to an unvalidated URI (open-redirect guard).
+	$registered = json_decode( isset( $client['redirect_uris'] ) ? (string) $client['redirect_uris'] : '[]', true );
+	if ( ! is_array( $registered ) || '' === $redirect_uri || ! in_array( $redirect_uri, $registered, true ) ) {
+		return aafm_oauth_local_error(
+			'invalid_redirect_uri',
+			__( 'The redirect URI does not match the client registration.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	// From here on, redirect_uri is trusted: remaining failures are redirectable OAuth errors.
+
+	// 3. Only the authorization-code flow is supported.
+	if ( 'code' !== $response_type ) {
+		return new WP_Error(
+			'unsupported_response_type',
+			__( 'Only the authorization code response type is supported.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	// 4. PKCE is mandatory and S256-only.
+	if ( 'S256' !== $method ) {
+		return new WP_Error(
+			'invalid_request',
+			__( 'PKCE with the S256 method is required.', 'agent-abilities-for-mcp' )
+		);
+	}
+	if ( '' === $challenge || ! aafm_pkce_is_valid_challenge( $challenge ) ) {
+		return new WP_Error(
+			'invalid_request',
+			__( 'A valid PKCE code challenge is required.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	// 5. Resource indicator: absent => default to the endpoint; present => must equal
+	// the endpoint exactly so the minted code audience-matches the bearer validator.
+	$endpoint = aafm_endpoint_url();
+	if ( '' === $resource ) {
+		$resource = $endpoint;
+	} elseif ( ! hash_equals( $endpoint, $resource ) ) {
+		return new WP_Error(
+			'invalid_target',
+			__( 'The requested resource is not served by this server.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	return array(
+		'response_type'         => 'code',
+		'client_id'             => $client_id,
+		'client_name'           => isset( $client['client_name'] ) ? (string) $client['client_name'] : '',
+		'redirect_uri'          => $redirect_uri,
+		'code_challenge'        => $challenge,
+		'code_challenge_method' => 'S256',
+		'resource'              => $resource,
+		'state'                 => $state,
+		'scope'                 => $scope,
+	);
+}
+
+/**
+ * Whether the user has already consented to this client, and whether that read could even be
+ * completed - one query answering both.
+ *
+ * The plain `$wpdb->get_var()` this used to be built on returns the
+ * PREVIOUS query's row when the current query itself fails ($wpdb->query() returns false before
+ * ever touching last_result on some paths - see aafm_wpdb_scalar()'s docblock), so a failed
+ * consent check could read as a positive consent left over from whatever query ran just before
+ * it - at the authorization-code redemption call site (rest.php), that query is the code lookup
+ * that just found a real row, so a failed consent read there would inherit a real, non-null id
+ * and report consent as granted. Routing through aafm_wpdb_scalar() closes that: a failed query
+ * is reported as failed, never silently reused as a stale answer.
+ *
+ * This also replaces the query-per-decision pair aafm_oauth_has_consent() plus the former
+ * aafm_oauth_consent_lookup_failed() used to require at the redemption call site
+ *  - one read now answers both "does consent exist" and "could this even be checked",
+ * so a caller that needs to distinguish a database fault from a genuine no-consent answer no
+ * longer needs a second, separate query to do it.
+ *
+ * @param int    $user_id   WordPress user ID.
+ * @param string $client_id The public client identifier.
+ * @return array{ok:bool,value:bool} ok is false when the read itself failed - value is not
+ *              trustworthy in that case. value is true when a consent row exists. An invalid
+ *              user id or empty client id is not a read failure - it reports ok=true, value=false,
+ *              the same genuine no-consent answer aafm_oauth_has_consent() has always given it.
+ */
+function aafm_oauth_consent_view( int $user_id, string $client_id ): array {
+	if ( $user_id <= 0 || '' === $client_id ) {
+		return array(
+			'ok'    => true,
+			'value' => false,
+		);
+	}
+
+	global $wpdb;
+	$view = aafm_wpdb_scalar(
+		$wpdb->prepare(
+			'SELECT id FROM %i WHERE wp_user_id = %d AND client_id = %s',
+			$wpdb->prefix . 'aafm_oauth_consents',
+			$user_id,
+			$client_id
+		)
+	);
+
+	return array(
+		'ok'    => $view['ok'],
+		'value' => $view['ok'] && null !== $view['value'],
+	);
+}
+
+/**
+ * Whether the user has already consented to this client.
+ *
+ * Fails closed (reports no consent) on a read failure - callers that need to tell a genuine
+ * "not consented" apart from "could not be checked" use aafm_oauth_consent_view() directly
+ * instead, the way the authorization-code redemption call site (rest.php) does.
+ *
+ * @param int    $user_id   WordPress user ID.
+ * @param string $client_id The public client identifier.
+ * @return bool
+ */
+function aafm_oauth_has_consent( int $user_id, string $client_id ): bool {
+	$view = aafm_oauth_consent_view( $user_id, $client_id );
+
+	return $view['ok'] && $view['value'];
+}
+
+/**
+ * Record (or refresh) the user's consent. The first approval stores the preset; a repeat approval
+ * changes only `granted_at` (pause, end date, last use, rate override and preset belong to the owner
+ * and survive it). The existing row keeps its `id`.
+ *
+ * This is an INSERT ... ON DUPLICATE KEY UPDATE on the UNIQUE (wp_user_id, client_id) key, not a
+ * REPLACE: REPLACE deletes and reinserts, which would wipe every owner setting on the row.
+ * $wpdb->prepare() cannot bind NULL, so a Custom approval simply names no preset column, which
+ * also keeps it working on a v8 table whose v9 columns have not installed yet.
+ *
+ * @param int    $user_id   WordPress user ID.
+ * @param string $client_id The public client identifier.
+ * @param string $preset    Access preset slug for a first approval; '' is Custom.
+ * @return bool True when the consent (and any requested preset) is confirmed stored after this call.
+ */
+function aafm_oauth_record_consent( int $user_id, string $client_id, string $preset = '' ): bool {
+	if ( $user_id <= 0 || '' === $client_id ) {
+		return false;
+	}
+
+	global $wpdb;
+	$table    = $wpdb->prefix . 'aafm_oauth_consents';
+	$existing = aafm_oauth_consent_view( $user_id, $client_id );
+	if ( ! $existing['ok'] ) {
+		return false;
+	}
+	// A repeat approval never changes the preset, for any approver: the owner changes it on the Connection tab.
+	$preset = $existing['value'] ? '' : $preset;
+	if ( '' !== $preset ) {
+		// A restrictive preset must be stored or the approval refused, never silently dropped. If the v9 columns
+		// did not install, try once more, then refuse.
+		aafm_maybe_upgrade_oauth_tables();
+		if ( ! aafm_oauth_table_has_column( $table, 'preset' ) ) {
+			return false;
+		}
+		$sql = $wpdb->prepare( 'INSERT INTO %i (wp_user_id, client_id, granted_at, preset) VALUES (%d, %s, %s, %s) ON DUPLICATE KEY UPDATE granted_at = VALUES(granted_at)', $table, $user_id, $client_id, gmdate( 'Y-m-d H:i:s' ), $preset );
+	} else {
+		$sql = $wpdb->prepare( 'INSERT INTO %i (wp_user_id, client_id, granted_at) VALUES (%d, %s, %s) ON DUPLICATE KEY UPDATE granted_at = VALUES(granted_at)', $table, $user_id, $client_id, gmdate( 'Y-m-d H:i:s' ) );
+	}
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared -- prepared just above.
+	$wpdb->query( $sql );
+
+	// Certify against a fresh read rather than trusting the write's own result: a
+	// failed write must stop the approval handler from minting a code that redemption will refuse, and a
+	// stored preset must be the one that was asked for (another request can win the race to the row).
+	if ( ! aafm_oauth_has_consent( $user_id, $client_id ) ) {
+		return false;
+	}
+	if ( '' === $preset ) {
+		return true;
+	}
+	$state = aafm_oauth_grant_state( $user_id, $client_id );
+	return null !== $state && $state['preset'] === $preset;
+}
+
+/**
+ * Read and sanitize the authorize parameters from the active request.
+ *
+ * Reads from $_POST on a POST, $_GET otherwise. Every value is unslashed and run
+ * through sanitize_text_field(). Nonce verification for the POST happens in the
+ * handler before this is trusted to act, so the read itself is recommended-only.
+ *
+ * @return array<string,string>
+ */
+function aafm_oauth_read_authorize_params(): array {
+	// phpcs:ignore WordPress.Security.NonceVerification.Missing, WordPress.Security.NonceVerification.Recommended -- nonce is verified in the handler before any state change.
+	$source = ( isset( $_SERVER['REQUEST_METHOD'] ) && 'POST' === $_SERVER['REQUEST_METHOD'] ) ? $_POST : $_GET;
+
+	$keys   = array( 'response_type', 'client_id', 'redirect_uri', 'code_challenge', 'code_challenge_method', 'resource', 'state', 'scope' );
+	$params = array();
+
+	foreach ( $keys as $key ) {
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- see above; values are sanitized here.
+		$params[ $key ] = isset( $source[ $key ] ) ? sanitize_text_field( wp_unslash( $source[ $key ] ) ) : '';
+	}
+
+	return $params;
+}
+
+/**
+ * Reduce a validated redirect_uri to its bare origin (scheme://host[:port]).
+ *
+ * Used to scope the consent CSP's form-action to the one approved client origin. Only
+ * the scheme, host, and explicit non-default port are kept - never the path or query -
+ * so the CSP source is a clean origin and nothing the client can otherwise control
+ * leaks into the header. Returns '' if the URI cannot be parsed into scheme+host.
+ *
+ * The caller MUST pass the redirect_uri that was already exact-matched against the
+ * client's registered allowlist, never raw request input, so the origin is trusted.
+ *
+ * @param string $redirect_uri The allowlist-validated client redirect URI.
+ * @return string The origin, or '' when the URI lacks a scheme/host.
+ */
+function aafm_oauth_redirect_uri_origin( string $redirect_uri ): string {
+	$scheme = wp_parse_url( $redirect_uri, PHP_URL_SCHEME );
+	$host   = wp_parse_url( $redirect_uri, PHP_URL_HOST );
+
+	if ( ! is_string( $scheme ) || '' === $scheme || ! is_string( $host ) || '' === $host ) {
+		return '';
+	}
+
+	$origin = strtolower( $scheme ) . '://' . $host;
+
+	$port = wp_parse_url( $redirect_uri, PHP_URL_PORT );
+	if ( is_int( $port ) ) {
+		$origin .= ':' . $port;
+	}
+
+	return $origin;
+}
+
+/**
+ * Build the Content-Security-Policy for the consent render.
+ *
+ * The form-action directive governs not only where the form may POST but also where the
+ * resulting response may REDIRECT. The consent form POSTs same-origin, but on Approve the server
+ * answers with a 302 to the client's external redirect_uri - a cross-origin hop the
+ * browser blocks against a bare 'self'. So when a validated client origin is supplied
+ * it is added to form-action ('self' <origin>), permitting the redirect to exactly that
+ * one approved origin and nothing else. Local error pages pass no origin and stay at
+ * 'self' alone, since they never redirect off-site.
+ *
+ * @param string $redirect_origin Validated client origin (scheme://host[:port]) to
+ *                                 allow in form-action, or '' for 'self' only.
+ * @return string The CSP header value.
+ */
+function aafm_oauth_consent_csp( string $redirect_origin = '' ): string {
+	$form_action = "form-action 'self'";
+	if ( '' !== $redirect_origin ) {
+		$form_action .= ' ' . $redirect_origin;
+	}
+
+	// The consent stylesheet is enqueued from plugins_url(), whose origin derives from
+	// WP_CONTENT_URL and can differ from the page origin when assets are offloaded to a CDN
+	// or a separate host. There, 'self' alone would block it and the page would render
+	// unstyled, so add exactly that one asset origin (never a wildcard) when it differs from
+	// the page origin; on a default install the two match and the directive stays 'self'.
+	$style_src    = "style-src 'self'";
+	$asset_origin = aafm_oauth_redirect_uri_origin( plugins_url( 'assets/consent.css', AAFM_PLUGIN_FILE ) );
+	$page_origin  = aafm_oauth_redirect_uri_origin( home_url() );
+	if ( '' !== $asset_origin && $page_origin !== $asset_origin ) {
+		$style_src .= ' ' . $asset_origin;
+	}
+
+	// img-src carries both 'self' and data:. data: covers the inlined SVG marks (brand logo,
+	// connector icons); 'self' covers the one uploaded raster on the page - the Customizer Site
+	// Icon, rendered as a same-origin <img> when the site has one. This is the minimal relaxation:
+	// 'self' admits only the page's own origin, so no external image host can load and the img-src
+	// beacon-exfiltration vector stays closed. Every other directive stays as tight as before.
+	return "default-src 'none'; {$style_src}; img-src 'self' data:; {$form_action}; base-uri 'none'; frame-ancestors 'none'";
+}
+
+/**
+ * The fixed (non-CSP) security headers sent on every consent-flow render: the consent
+ * screen itself and its local error pages. Content-Security-Policy is built separately
+ * by aafm_oauth_consent_csp(), which needs its own $redirect_origin argument; this is
+ * the rest of the set.
+ *
+ * Cache-Control: no-store and Pragma: no-cache keep the page out of any shared cache
+ * and a browser's back/forward cache - both the consent screen and its error variants
+ * carry OAuth flow state (client name, redirect host, the PKCE-bound nonce field) that
+ * must never be replayed from a stale cached copy. RFC 6749 §5.1 requires both headers
+ * on any response carrying tokens, credentials, or other sensitive information.
+ *
+ * Kept as a pure array-returning function (rather than folded into the header()-calling
+ * wrapper below) so the header set is directly assertable in tests without needing to
+ * inspect real header() output.
+ *
+ * @return array<string,string> Header name => value.
+ */
+function aafm_oauth_consent_security_headers(): array {
+	return array(
+		'X-Frame-Options' => 'DENY',
+		'Referrer-Policy' => 'no-referrer',
+		'Cache-Control'   => 'no-store',
+		'Pragma'          => 'no-cache',
+	);
+}
+
+/**
+ * Send the strict security headers used on the consent render.
+ *
+ * No external scripts or styles, framing denied, no referrer leakage of the authorize
+ * URL (which carries the PKCE challenge and state), and never cached. The form-action
+ * source list is built by aafm_oauth_consent_csp(); see it for why the validated client
+ * origin is allowed there on the consent page but not on local error pages.
+ *
+ * @param string $redirect_origin Validated client origin to allow in form-action, or
+ *                                 '' for 'self' only.
+ * @return void
+ */
+function aafm_oauth_send_consent_headers( string $redirect_origin = '' ): void {
+	header( 'Content-Security-Policy: ' . aafm_oauth_consent_csp( $redirect_origin ) );
+	foreach ( aafm_oauth_consent_security_headers() as $name => $value ) {
+		header( "{$name}: {$value}" );
+	}
+}
+
+/**
+ * Escaped help paragraphs for the unknown-client error page.
+ *
+ * A client that reconnects with a registration this site deleted lands here, and the only fix is
+ * on the client's side: remove the app and add it again with the MCP URL.
+ *
+ * @return string Escaped HTML.
+ */
+function aafm_oauth_unknown_client_help(): string {
+	return '<p>' . esc_html__( 'This site no longer recognizes the app that is trying to connect. Its registration may have been deleted.', 'agent-abilities-for-mcp' ) . '</p>'
+		. '<p>' . esc_html__( 'To fix this, remove the app in your AI client, then add it again with this site\'s MCP URL:', 'agent-abilities-for-mcp' ) . '</p>'
+		. '<p><code>' . esc_html( aafm_endpoint_url() ) . '</code></p>'
+		. '<ul><li>' . esc_html__( 'ChatGPT: open Settings > Integrations > Plugins, remove the app, then add it again.', 'agent-abilities-for-mcp' ) . '</li>'
+		. '<li>' . esc_html__( 'Claude: remove the connector, then add it again.', 'agent-abilities-for-mcp' ) . '</li></ul>';
+}
+
+/**
+ * The extra help markup for a local validation error: the unknown-client steps for invalid_client,
+ * nothing for any other error.
+ *
+ * @param \WP_Error $error The validation error.
+ * @return string Escaped HTML, or '' when there is no help for this error.
+ */
+function aafm_oauth_local_error_help( WP_Error $error ): string {
+	return 'invalid_client' === $error->get_error_code() ? aafm_oauth_unknown_client_help() : '';
+}
+
+/**
+ * The HTML of the minimal local error page.
+ *
+ * @param string $message Human-readable message (will be escaped).
+ * @param string $help    Optional extra markup (p, code, ul, li only) shown under the message.
+ * @return string
+ */
+function aafm_oauth_local_error_html( string $message, string $help = '' ): string {
+	return '<!DOCTYPE html><html><head><meta charset="utf-8"><title>'
+		. esc_html__( 'Authorization error', 'agent-abilities-for-mcp' )
+		. '</title></head><body><p>'
+		. esc_html( $message )
+		. '</p>'
+		. wp_kses(
+			$help,
+			array(
+				'p'    => array(),
+				'code' => array(),
+				'ul'   => array(),
+				'li'   => array(),
+			)
+		)
+		. '</body></html>';
+}
+
+/**
+ * Render a minimal local error page and exit.
+ *
+ * Used for failures that must NOT be handed back to the client: a disabled surface,
+ * a capability denial, a nonce failure, or a non-redirectable validation error. Sends
+ * the same hardened headers as the consent page.
+ *
+ * @param int    $status  HTTP status code.
+ * @param string $message Human-readable message (will be escaped).
+ * @param string $help    Optional extra markup (p, code, ul, li only) shown under the message.
+ * @return never
+ */
+function aafm_oauth_render_local_error( int $status, string $message, string $help = '' ): void {
+	aafm_oauth_send_consent_headers();
+	status_header( $status );
+	header( 'Content-Type: text/html; charset=utf-8' );
+	echo aafm_oauth_local_error_html( $message, $help ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- escaped in aafm_oauth_local_error_html().
+	exit;
+}
+
+/**
+ * Redirect back to a client redirect_uri with an OAuth error, then exit.
+ *
+ * The caller guarantees $redirect_uri was matched against the client's registered
+ * allowlist before this runs, so wp_redirect() (raw) is used deliberately:
+ * wp_safe_redirect() would reject the external client host.
+ *
+ * @param string $redirect_uri The allowlist-validated client redirect URI.
+ * @param string $error        The OAuth error code.
+ * @param string $state        The opaque state to echo back (may be empty).
+ * @return void
+ */
+function aafm_oauth_redirect_error( string $redirect_uri, string $error, string $state ): void {
+	// RFC 9207 §2 requires iss on every authorization response, error responses included.
+	$args = array(
+		'error' => $error,
+		'iss'   => aafm_oauth_issuer(),
+	);
+	if ( '' !== $state ) {
+		$args['state'] = $state;
+	}
+	$url = add_query_arg( array_map( 'rawurlencode', $args ), $redirect_uri );
+	// phpcs:ignore WordPress.Security.SafeRedirect.wp_redirect_wp_redirect -- redirect_uri is allowlist-validated against the client registration above.
+	wp_redirect( $url );
+	exit;
+}
+
+/**
+ * Redirect back to a client redirect_uri with a fresh authorization code, then exit.
+ *
+ * @param array<string,string> $valid The normalized, validated authorize params.
+ * @param int                  $user_id The approving user.
+ * @return void
+ */
+function aafm_oauth_issue_code_and_redirect( array $valid, int $user_id ): void {
+	$code = aafm_oauth_mint_code(
+		array(
+			'client_id'      => $valid['client_id'],
+			'wp_user_id'     => $user_id,
+			'redirect_uri'   => $valid['redirect_uri'],
+			'code_challenge' => $valid['code_challenge'],
+			'resource'       => aafm_endpoint_url(),
+			'scope'          => isset( $valid['scope'] ) ? $valid['scope'] : '',
+		)
+	);
+
+	// A WP_Error (or empty) code means the mint/insert failed; do not redirect with a code that
+	// was never persisted.
+	if ( is_wp_error( $code ) || '' === $code ) {
+		aafm_oauth_render_local_error(
+			500,
+			__( 'Could not issue an authorization code. Please try again.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	// Audit the grant: an authorization code was issued to this client for this user. The raw code
+	// is never logged - only who approved, which client, and where the grant is sent.
+	$approver = wp_get_current_user();
+	aafm_oauth_log_event(
+		'authorize',
+		'success',
+		array(
+			'client_id'     => $valid['client_id'],
+			'redirect_host' => aafm_oauth_audit_host_from_uri( $valid['redirect_uri'] ),
+			'user_id'       => $user_id,
+			'user_login'    => $approver instanceof WP_User ? (string) $approver->user_login : '',
+		)
+	);
+
+	// RFC 9207 §2 requires iss on every authorization response, single-sourced with the
+	// issuer the AS metadata publishes (aafm_oauth_issuer()) so the two can never drift.
+	$args = array(
+		'code' => $code,
+		'iss'  => aafm_oauth_issuer(),
+	);
+	if ( '' !== $valid['state'] ) {
+		$args['state'] = $valid['state'];
+	}
+	$url = add_query_arg( array_map( 'rawurlencode', $args ), $valid['redirect_uri'] );
+	// The 302 carries a freshly-minted, single-use authorization code in its Location
+	// URL; a cached copy of this response would hand that code to whoever reads the
+	// cache, so it must never be stored (same guarantee as the consent render). RFC
+	// 6749 §5.1 requires both Cache-Control: no-store and Pragma: no-cache here.
+	header( 'Cache-Control: ' . aafm_oauth_consent_security_headers()['Cache-Control'] );
+	header( 'Pragma: ' . aafm_oauth_consent_security_headers()['Pragma'] );
+	// phpcs:ignore WordPress.Security.SafeRedirect.wp_redirect_wp_redirect -- redirect_uri is allowlist-validated against the client registration above.
+	wp_redirect( $url );
+	exit;
+}
+
+/**
+ * Whether the user is an administrator: a super admin, or able to manage options.
+ *
+ * Narrower than aafm_oauth_user_is_high_privilege(), which also fires on unfiltered_html, a
+ * capability core Editors hold on a single site. This decides only the wording of the warning.
+ *
+ * @param WP_User $user The user.
+ * @return bool
+ */
+function aafm_oauth_user_is_administrator( WP_User $user ): bool {
+	return is_super_admin( $user->ID ) || user_can( $user, 'manage_options' );
+}
+
+/**
+ * Whether the approving user holds site-administration or privilege-escalation capabilities.
+ *
+ * A token is minted with the approving user's own capabilities, so approving a self-registered app
+ * while signed in as an administrator hands that app full administrative reach. This drives a louder
+ * warning on the consent screen and reinforces the "connect as a limited agent user" guidance.
+ *
+ * @param WP_User $user The user who would approve the grant.
+ * @return bool True when the user can administer the site or escalate privileges.
+ */
+function aafm_oauth_user_is_high_privilege( WP_User $user ): bool {
+	if ( is_super_admin( $user->ID ) ) {
+		return true;
+	}
+
+	foreach ( array( 'manage_options', 'edit_users', 'promote_users', 'install_plugins', 'unfiltered_html' ) as $cap ) {
+		if ( user_can( $user, $cap ) ) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/**
+ * The access presets the current approver may give, for the consent screen: an owner any, anyone
+ * else no wider than the site default, which starts checked.
+ *
+ * @return list<array{slug:string,label:string,summary:string,reach:string,checked:bool}>
+ */
+function aafm_oauth_consent_presets(): array {
+	$default  = aafm_default_preset();
+	$by_owner = current_user_can( 'manage_options' );
+	$presets  = array();
+	foreach ( aafm_access_presets() as $slug => $preset ) {
+		$value = 'custom' === $slug ? '' : $slug;
+		if ( ! $by_owner && aafm_preset_rank( $value ) > aafm_preset_rank( $default ) ) {
+			continue; // An approver who is not the owner may pick no wider than the owner's default.
+		}
+		$count     = aafm_preset_count( $value );
+		$presets[] = array(
+			'slug'    => $slug,
+			'label'   => $preset['label'],
+			'summary' => $preset['summary'],
+			'reach'   => 0 === $count['allowed']
+				? __( 'none of the abilities you have switched on', 'agent-abilities-for-mcp' )
+				/* translators: 1: abilities this preset reaches, 2: abilities switched on. */
+				: sprintf( __( 'up to %1$d of the %2$d abilities you have switched on', 'agent-abilities-for-mcp' ), $count['allowed'], $count['enabled'] ),
+			'checked' => $value === $default,
+		);
+	}
+	return $presets;
+}
+
+/**
+ * Render the consent screen for a validated authorize request, then exit.
+ *
+ * Carries every OAuth param as a hidden field (attribute-escaped) so the POST back
+ * re-presents them, plus the consent nonce. Flags the destination host and, when the
+ * approving user can administer the site, a high-privilege warning.
+ *
+ * Offers the access presets an approver may give (an owner any, anyone else no wider than the
+ * site default); an owner renewing an expired grant sees its current access and no choice.
+ *
+ * @param array<string,string>     $valid    The normalized, validated authorize params.
+ * @param array<string,mixed>|null $renewing The expired grant an owner is renewing, or null.
+ * @return void
+ */
+function aafm_oauth_show_consent( array $valid, ?array $renewing = null ): void {
+	$user = wp_get_current_user();
+
+	$hidden_keys   = array( 'response_type', 'client_id', 'redirect_uri', 'code_challenge', 'code_challenge_method', 'state', 'scope', 'resource' );
+	$hidden_inputs = array();
+	foreach ( $hidden_keys as $key ) {
+		$hidden_inputs[] = sprintf(
+			'<input type="hidden" name="%1$s" value="%2$s">',
+			esc_attr( $key ),
+			esc_attr( isset( $valid[ $key ] ) ? $valid[ $key ] : '' )
+		);
+	}
+
+	// The destination the grant is actually sent to is the single most decision-relevant
+	// fact for the human, so surface the redirect host (with any explicit port) on the
+	// consent card. Derived from the allowlist-validated redirect_uri in $valid, never raw
+	// request input, so it is a trusted value; the template still escapes it on output.
+	$redirect_host = '';
+	$parsed_host   = wp_parse_url( $valid['redirect_uri'], PHP_URL_HOST );
+	if ( is_string( $parsed_host ) && '' !== $parsed_host ) {
+		$redirect_host = $parsed_host;
+		$parsed_port   = wp_parse_url( $valid['redirect_uri'], PHP_URL_PORT );
+		if ( is_int( $parsed_port ) ) {
+			$redirect_host .= ':' . $parsed_port;
+		}
+	}
+
+	$view = array(
+		'client_name'      => '' !== $valid['client_name'] ? $valid['client_name'] : $valid['client_id'],
+		'user_login'       => $user->user_login,
+		'site_name'        => get_bloginfo( 'name' ),
+		'redirect_host'    => $redirect_host,
+		'high_privilege'   => aafm_oauth_user_is_high_privilege( $user ),
+		'is_administrator' => aafm_oauth_user_is_administrator( $user ),
+		'action_url'       => add_query_arg( 'aafm_oauth', 'authorize', home_url( '/' ) ),
+		'nonce_field'      => wp_nonce_field( 'aafm_oauth_consent|' . $valid['client_id'], '_wpnonce', true, false ),
+		'hidden_inputs'    => $hidden_inputs,
+		'presets'          => array(),
+		'renewing'         => null !== $renewing,
+		'current_label'    => '',
+	);
+	if ( null !== $renewing ) {
+		$view['current_label'] = aafm_access_presets()[ '' === $renewing['preset'] ? 'custom' : (string) $renewing['preset'] ]['label'] ?? '';
+	} else {
+		$view['presets'] = aafm_oauth_consent_presets();
+	}
+
+	// The consent form's POST is answered with a 302 to this validated client origin,
+	// so it must be permitted in form-action or the browser blocks the cross-origin
+	// redirect and the client never receives the code. The redirect_uri here came
+	// straight from the allowlist-validated $valid set, never raw request input.
+	$redirect_origin = aafm_oauth_redirect_uri_origin( $valid['redirect_uri'] );
+
+	aafm_oauth_send_consent_headers( $redirect_origin );
+	status_header( 200 );
+	header( 'Content-Type: text/html; charset=utf-8' );
+	aafm_oauth_render_consent_page( $view );
+	exit;
+}
+
+/**
+ * Handle the authorization endpoint, hooked on `wp_loaded` (after every init callback).
+ *
+ * Runs only for ?aafm_oauth=authorize. Enforces the surface toggle, HTTPS, rate
+ * limiting, login (logged-out users go to wp-login and return to this exact URL), and
+ * a capability gate, then validates and acts on the request per HTTP method.
+ *
+ * @return void
+ */
+function aafm_oauth_handle_authorize(): void {
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- route selector only; no state change here.
+	$marker = isset( $_GET['aafm_oauth'] ) ? sanitize_text_field( wp_unslash( $_GET['aafm_oauth'] ) ) : '';
+	if ( 'authorize' !== $marker ) {
+		return;
+	}
+
+	// Surface disabled: behave as if the endpoint does not exist.
+	if ( ! aafm_oauth_enabled() ) {
+		status_header( 404 );
+		header( 'Content-Type: text/plain; charset=utf-8' );
+		echo 'Not found';
+		exit;
+	}
+
+	// HTTPS is mandatory in production.
+	if ( aafm_oauth_https_required() && ! is_ssl() ) {
+		aafm_oauth_render_local_error( 400, __( 'HTTPS is required for authorization.', 'agent-abilities-for-mcp' ) );
+	}
+
+	// Rate limit the authorize surface.
+	if ( ! aafm_oauth_rate_ok( 'authorize', 30, 300 ) ) {
+		status_header( 429 );
+		header( 'Content-Type: text/plain; charset=utf-8' );
+		// RFC 9110 §10.2.3: tells the client how long to wait rather than leaving it to
+		// guess. AAFM_OAUTH_RATE_WINDOW is the one fixed window aafm_oauth_rate_ok()
+		// enforces on both its per-IP and global counters.
+		header( 'Retry-After: ' . AAFM_OAUTH_RATE_WINDOW );
+		echo 'Too many requests';
+		exit;
+	}
+
+	// Require login. The authorize URL is a FRONT-END path (?aafm_oauth=authorize on
+	// home_url(), not under /wp-admin), so we must NOT call auth_redirect() here: it
+	// validates the secure_auth cookie scheme whenever is_ssl() || force_ssl_admin(),
+	// and that cookie is scoped to /wp-admin (+ /wp-content/plugins), never to "/".
+	// On a real-HTTPS or FORCE_SSL_ADMIN site the secure_auth cookie is never sent on
+	// "/", so auth_redirect() would fail validation and bounce a fully logged-in user
+	// to wp-login forever. The logged_in cookie IS scoped to "/" and is what determines
+	// front-end login state, so gate on is_user_logged_in() instead and send only
+	// genuinely logged-out users to wp-login, returning to this exact authorize URL.
+	if ( ! is_user_logged_in() ) {
+		// Reconstruct the current authorize URL from the request path so the user
+		// returns to this exact endpoint after signing in. Built off home_url() + the
+		// raw REQUEST_URI rather than add_query_arg( array(), null ), which reads the
+		// superglobal implicitly and warns when it is absent.
+		//
+		// 1.7.2 bug #9: this MUST be esc_url_raw(), not sanitize_text_field(). REQUEST_URI is
+		// about to be reused as a URL, and sanitize_text_field() strips every %[a-f0-9]{2}
+		// sequence as part of its plain-text header-injection defense - verified directly:
+		// sanitize_text_field('...redirect_uri=' . rawurlencode('https://app.example/cb'))
+		// comes back as '...redirect_uri=httpsapp.examplecb', every percent-encoded octet gone.
+		// A percent-encoded redirect_uri or resource param (the normal shape for the dynamic-
+		// client-registration first-connect flow) was silently corrupted on every logged-out
+		// authorize request, hard-breaking with a local 400 invalid_redirect_uri once the user
+		// signed back in and this mangled value was used to re-parse the authorize params.
+		// esc_url_raw() is WordPress's own function for a URL string headed back out (not a
+		// display string) and leaves valid percent-encoding intact - verified directly against
+		// the same input above.
+		$request_uri = isset( $_SERVER['REQUEST_URI'] )
+			? esc_url_raw( wp_unslash( $_SERVER['REQUEST_URI'] ) )
+			: '';
+		$return_to   = home_url( '/' );
+		if ( '' !== $request_uri ) {
+			$return_to = home_url( $request_uri );
+		}
+		// wp-login on our own host; redirect_to is WP's own param, so wp_safe_redirect
+		// is appropriate (it rejects off-host targets).
+		wp_safe_redirect( wp_login_url( esc_url_raw( $return_to ) ) );
+		exit;
+	}
+
+	// Who may approve: the Settings roles list, or a site's aafm_oauth_min_capability filter
+	// (aafm_oauth_user_may_connect()). A failure is a LOCAL authorization failure, never a redirect.
+	if ( ! aafm_oauth_user_may_connect( wp_get_current_user() ) ) {
+		aafm_oauth_render_local_error(
+			403,
+			__( 'Your account does not have permission to authorize access.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	// Pause-all refuses the screen and the consent POST alike: nothing is approved while it is on.
+	if ( aafm_pause_all() ) {
+		aafm_oauth_render_local_error( 403, __( 'Access to this site is paused by its owner. Try again after they resume it.', 'agent-abilities-for-mcp' ) );
+	}
+
+	$is_post = isset( $_SERVER['REQUEST_METHOD'] ) && 'POST' === $_SERVER['REQUEST_METHOD'];
+
+	// On POST, verify the consent nonce BEFORE trusting any submitted field. A bad
+	// nonce is a local failure (render a local 403), never a redirect to the client.
+	// The nonce is bound to the client: the client id is read raw here only to name the
+	// action; the full parameter validation still runs below.
+	if ( $is_post ) {
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- explicit verification on the next line.
+		$nonce = isset( $_POST['_wpnonce'] ) ? sanitize_text_field( wp_unslash( $_POST['_wpnonce'] ) ) : '';
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- this read names the nonce action.
+		$nonce_client = isset( $_POST['client_id'] ) && is_string( $_POST['client_id'] ) ? sanitize_text_field( wp_unslash( $_POST['client_id'] ) ) : '';
+		if ( ! wp_verify_nonce( $nonce, 'aafm_oauth_consent|' . $nonce_client ) ) {
+			aafm_oauth_render_local_error(
+				403,
+				__( 'Your authorization session expired. Please start again.', 'agent-abilities-for-mcp' )
+			);
+		}
+	}
+
+	// Re-validate ALL params on every request (never trust hidden fields).
+	$params = aafm_oauth_read_authorize_params();
+	$valid  = aafm_oauth_validate_authorize_params( $params );
+
+	if ( $valid instanceof WP_Error ) {
+		// Local errors render a page; redirectable OAuth errors bounce back to the
+		// (now-validated) redirect_uri. The redirect_uri is trusted only because the
+		// validator resolved client + redirect BEFORE producing any redirectable error.
+		// Both branches below exit internally; the trailing return makes that terminal
+		// to static analysis so $valid narrows to the array shape past this block.
+		if ( ! aafm_oauth_error_is_redirectable( $valid ) ) {
+			aafm_oauth_render_local_error( 400, $valid->get_error_message(), aafm_oauth_local_error_help( $valid ) );
+		}
+
+		$redirect_uri = isset( $params['redirect_uri'] ) ? (string) $params['redirect_uri'] : '';
+		$state        = isset( $params['state'] ) ? (string) $params['state'] : '';
+		aafm_oauth_redirect_error( $redirect_uri, (string) $valid->get_error_code(), $state );
+		return;
+	}
+
+	$user_id = get_current_user_id();
+
+	// Per-connection state. An unreadable row never reaches consent or a code; a paused grant gets a
+	// local page (no consent screen, no code); an expired grant is renewed only by a site owner.
+	$grant = aafm_oauth_grant_state( $user_id, $valid['client_id'] );
+	if ( null === $grant ) {
+		aafm_oauth_render_local_error( 500, __( 'This connection could not be checked. Please try again.', 'agent-abilities-for-mcp' ) );
+	}
+	// Tri-state read: a failed consent SELECT must not read as "no consent" and let a paused grant through.
+	$consent = aafm_oauth_consent_view( $user_id, $valid['client_id'] );
+	if ( ! $consent['ok'] ) {
+		aafm_oauth_render_local_error( 500, __( 'This connection could not be checked. Please try again.', 'agent-abilities-for-mcp' ) );
+	}
+	$has_consent = $consent['value'];
+	if ( $has_consent && $grant['paused'] ) {
+		aafm_oauth_render_local_error( 403, __( 'The site owner has paused this connection. Ask them to resume it, then try again.', 'agent-abilities-for-mcp' ) );
+	}
+	$renewing = $has_consent && $grant['expired'];
+	if ( $renewing && ! current_user_can( 'manage_options' ) ) {
+		aafm_oauth_render_local_error( 403, __( 'This connection has ended. Ask the site owner to renew it.', 'agent-abilities-for-mcp' ) );
+	}
+
+	if ( $is_post ) {
+		// Default-deny: only an explicit 'approve' grants a code. Treat anything else -
+		// a blank field, 'deny', or any unexpected value - as a denial and hand
+		// access_denied back to the client. An allow-list (not a 'deny'-only check) is
+		// what makes a malformed consent decision fail CLOSED instead of falling through
+		// to approval.
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+		$decision = isset( $_POST['aafm_oauth_decision'] ) ? sanitize_text_field( wp_unslash( $_POST['aafm_oauth_decision'] ) ) : '';
+		if ( 'approve' !== $decision ) {
+			aafm_oauth_redirect_error( $valid['redirect_uri'], 'access_denied', $valid['state'] );
+		}
+
+		// Approve: persist consent, then issue the code. A code must never be minted over a
+		// consent write that did not actually take - redemption would only fail it later as a
+		// dead invalid_grant after the client was already told approval succeeded. Renewing an
+		// expired grant clears its end date first; the writer revokes the old tokens and certifies
+		// none is left, so old credentials never come back.
+		if ( $renewing && ! aafm_oauth_grant_update( $user_id, $valid['client_id'], array( 'expires_at' => null ) ) ) {
+			aafm_oauth_render_local_error( 500, __( 'Could not renew this connection. Please try again.', 'agent-abilities-for-mcp' ) );
+		}
+		// A first approval stores the picked preset, clamped to the owner's default for anyone who is not
+		// an owner; garbage falls back to the default, never to Custom. A repeat approval or a renewal
+		// ignores it: aafm_oauth_record_consent() keeps the stored preset.
+		// phpcs:ignore WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- nonce verified above; normalized against the preset list.
+		$posted = isset( $_POST['aafm_oauth_preset'] ) ? wp_unslash( $_POST['aafm_oauth_preset'] ) : null;
+		$preset = aafm_preset_clamp( aafm_preset_normalize( $posted, aafm_default_preset() ), current_user_can( 'manage_options' ) );
+		if ( ! aafm_oauth_record_consent( $user_id, $valid['client_id'], $preset ) ) {
+			aafm_oauth_render_local_error(
+				500,
+				__( 'Could not record your approval. Please try again.', 'agent-abilities-for-mcp' )
+			);
+		}
+		aafm_oauth_issue_code_and_redirect( $valid, $user_id );
+	}
+
+	// GET: a prior consent issues a code immediately; otherwise (or for an expired grant its owner
+	// is renewing) show the screen.
+	if ( $has_consent && ! $renewing ) {
+		aafm_oauth_issue_code_and_redirect( $valid, $user_id );
+	}
+
+	aafm_oauth_show_consent( $valid, $renewing ? $grant : null );
+}

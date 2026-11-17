@@ -1,0 +1,2717 @@
+<?php
+/**
+ * Post abilities (reads). Writes are appended in Phase 4.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * The default upper bound on a list ability's `per_page`. Used both as the schema `maximum`
+ * and the cap passed to aafm_paginate_args() so the declared bound and the enforced bound
+ * never drift. Shared across the post/page/user/media/comment/revision/search list tools.
+ */
+const AAFM_LIST_PER_PAGE_MAX = 50;
+
+/**
+ * The upper bound on `per_page` for taxonomy term lists. Terms are lightweight rows and a
+ * tree often runs to the hundreds, so the term lists allow a higher ceiling than the
+ * content lists (AAFM_LIST_PER_PAGE_MAX) to fetch a whole vocabulary in one page.
+ */
+const AAFM_TERMS_PER_PAGE_MAX = 100;
+
+/**
+ * The upper bound on a list ability's `page` number. A generous ceiling that still caps an
+ * agent from requesting an unbounded page offset; declared on every list tool's `page` arg.
+ */
+const AAFM_LIST_PAGE_MAX = 100000;
+
+add_filter( 'aafm_abilities_registry', 'aafm_register_posts_definitions' );
+
+/**
+ * Contribute post ability definitions to the registry.
+ *
+ * @param array<string,array<string,mixed>> $registry Registry.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_posts_definitions( array $registry ): array {
+	$registry['aafm/get-posts']        = array(
+		'label'        => __( 'Get posts', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'List posts filtered by type, status, and search term. Each item returns id, title, status, type, slug, link, author {id, display_name}, dates, excerpt, terms grouped by taxonomy, featured_image {id, url, alt} or null, and allowlisted meta. Set include_content=true to also return full content per item; content_format (rendered or raw) only takes effect when include_content is true. Response includes total.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_get_posts',
+	);
+	$registry['aafm/count-posts']      = array(
+		'label'        => __( 'Count posts', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Count posts of an allowlisted post type: a total of active (non-trashed) items, plus a breakdown by status (publish, draft, pending, private, future, trash). Trash and auto-draft are shown in the breakdown but excluded from total. When the caller cannot edit this post type, non-public status counts (draft, pending, private, future, trash) are reported as zero and only public statuses are counted.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_count_posts',
+	);
+	$registry['aafm/get-post']         = array(
+		'label'        => __( 'Get post', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Retrieve a single post by ID. Returns id, title, status, type, slug, link, author {id, display_name}, dates, full content (rendered HTML by default, or raw markup via content_format; omitted for password-protected posts), excerpt, terms grouped by taxonomy, featured_image {id, url, alt} or null, and meta (allowlisted scalar values only).', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_get_post',
+	);
+	$registry['aafm/create-draft']     = array(
+		'label'        => __( 'Create draft', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Create a new post, draft by default. An explicit status is honored, but publish, future, private, or any other publicly-visible status requires this content type\'s publish capability. Optional: slug, featured_media (attachment id), terms ({taxonomy: [termId]}, replaces existing terms per taxonomy), and meta ({key: value}, allowlisted keys only). Put any block styling in the block delimiter attributes, not inline style, or the editor marks the content invalid.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_create_draft',
+	);
+	$registry['aafm/create-post']      = array(
+		'label'        => __( 'Create post', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Create a new post, published by default (requires publish capability to call this ability at all). An explicit draft, pending, or private status is also accepted. Optional: slug, featured_media (attachment id), terms ({taxonomy: [termId]}, replaces existing terms per taxonomy), and meta ({key: value}, allowlisted keys only). Put any block styling in the block delimiter attributes, not inline style, or the editor marks the content invalid.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_create_post',
+	);
+	$registry['aafm/update-post']      = array(
+		'label'        => __( 'Update post', 'agent-abilities-for-mcp' ),
+		'description'  => sprintf(
+			/* translators: %s: page builder names, for example Elementor and Divi. */
+			__( 'Update an existing post by ID (publishing is a separate gate). Reaches a page, product, event, venue, organizer or listing only while that type\'s own tool is on. Optional: slug, featured_media (attachment id), terms ({taxonomy: [termId]}, replaces existing terms per taxonomy), and meta ({key: value}, allowlisted keys only). Put any block styling in the block delimiter attributes, not inline style, or the editor marks the content invalid. When the post is owned by a foreign page builder (%s), an edit that sends only post_id and excerpt is accepted and the post\'s stored content is left as it was; any other change is refused, and so is every edit when the plugin cannot tell which builder owns it, since a write here would either have no visible effect or corrupt the builder\'s stored markup.', 'agent-abilities-for-mcp' ),
+			aafm_page_builder_names()
+		),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_update_post',
+	);
+	$registry['aafm/replace-in-post']  = array(
+		'label'        => __( 'Replace in post', 'agent-abilities-for-mcp' ),
+		'description'  => sprintf(
+			/* translators: %s: page builder names, for example Elementor and Divi. */
+			__( 'Literal find-and-replace inside a post\'s content. Sanitizes the replacement text and edits only the replaced spans of the body; untouched content is left byte-for-byte as it was, and status is never touched. Matches literal text only: markdown such as [text](url) is inserted as typed, not turned into a link, and text inside markup (an href, src or other attribute) is refused, so use replace-block or update-post for links, src and markup. Reaches a page, product, event, venue, organizer or listing only while that type\'s own tool is on. With WordPress revisions enabled, later edits can be compared and restored from revision history; a post with no earlier revisions has no earlier copy to restore, so keep the old text. While change history is on, undo-change or the Changes tab can also revert this change. Refuses when the post is owned by a foreign page builder (%s), since a write here would either have no visible effect or corrupt its own stored markup.', 'agent-abilities-for-mcp' ),
+			aafm_page_builder_names()
+		),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_replace_in_post',
+	);
+	$registry['aafm/replace-block']    = array(
+		'label'        => __( 'Replace block', 'agent-abilities-for-mcp' ),
+		'description'  => sprintf(
+			/* translators: %s: page builder names, for example Elementor and Divi. */
+			__( 'Replace one whole block in a post or page with new block markup, without resending the rest of the content. The block is addressed by path: its index among the top-level blocks, then among that block\'s inner blocks, counting only real blocks (the blank lines between blocks are not counted), so [2, 0] is the first block inside the third top-level block. Reaches a page, product, event, venue, organizer or listing only while that type\'s own tool is on. Read the post with content_format raw to count them; classic HTML between blocks is not counted. Pass expect_block (for example core/group) to refuse the write if the block at that path has a different block name; it checks the name only, not the content, so two blocks of the same type cannot be told apart and the post should be read again just before writing if it may have changed. The plugin leaves other blocks\' parsed attributes and HTML unchanged; WordPress may sanitize the whole page on save for users who cannot post unfiltered HTML. Content warnings and strict-mode refusals cover the whole resulting page, not only the new block. Refuses when the post\'s existing block markup does not survive being re-serialized (for example a block with invalid attribute JSON); use aafm-update-post for those. With WordPress revisions enabled, later edits can be compared and restored from revision history; a post with no earlier revisions has no earlier copy to restore, so keep the old text. While change history is on, undo-change or the Changes tab can also revert this change. Refuses when the post is owned by a foreign page builder (%s), since a write here would either have no visible effect or corrupt its own stored markup.', 'agent-abilities-for-mcp' ),
+			aafm_page_builder_names()
+		),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_replace_block',
+	);
+	$registry['aafm/replace-sitewide'] = array(
+		'label'        => __( 'Replace sitewide', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Literal find-and-replace across multiple posts, scoped by post type and status. Skips pages, products, events, venues, organizers and listings while that type\'s own update tool is off. Dry-run by default (previews the match count and which posts would change, writes nothing); pass dry_run:false to apply. Each candidate post is guarded by the same structure-preserving check as replace-in-post, so a match landing inside markup is skipped and reported, not applied. A candidate owned by a foreign page builder is likewise skipped and counted in skipped_builder_owned, not applied. One call changes at most 50 posts. If the response says truncated:true, run the call again, since changed posts stop matching. Skipped posts keep matching, and so do posts whose new text contains the search text, so stop when a call changes nothing rather than repeating blindly.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_replace_sitewide',
+	);
+	$registry['aafm/trash-post']       = array(
+		'label'        => __( 'Trash post', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Move a post to trash (recoverable, never permanently deleted). Reaches a page, product or event only while that type\'s own tool is on.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'destructive',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_trash_post',
+	);
+	$registry['aafm/create-cpt-item']  = array(
+		'label'        => __( 'Create content item', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Create an item of an allowlisted custom content type (post_type), draft by default. An explicit status is honored, but publish, future, private, or any other publicly-visible status requires that type\'s publish capability. Put any block styling in the block delimiter attributes, not inline style, or the editor marks the content invalid.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_create_cpt_item',
+	);
+	$registry['aafm/update-cpt-item']  = array(
+		'label'        => __( 'Update content item', 'agent-abilities-for-mcp' ),
+		'description'  => sprintf(
+			/* translators: %s: page builder names, for example Elementor and Divi. */
+			__( 'Update an item by ID: an allowlisted custom content type, or a post, page, product, event, venue, organizer or listing while that type\'s own update tool is on (publishing requires that type\'s publish capability). Put any block styling in the block delimiter attributes, not inline style, or the editor marks the content invalid. When the item is owned by a foreign page builder (%s), an edit that sends only post_id and excerpt is accepted and the item\'s stored content is left as it was; any other change is refused, and so is every edit when the plugin cannot tell which builder owns it, since a write here would either have no visible effect or corrupt the builder\'s stored markup.', 'agent-abilities-for-mcp' ),
+			aafm_page_builder_names()
+		),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_update_cpt_item',
+	);
+	$registry['aafm/delete-post']      = array(
+		'label'        => __( 'Delete post', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Permanently delete a post, bypassing the Trash. This cannot be undone. Use trash-post to remove a post recoverably instead. Reaches a page or product only while that type\'s own tool is on.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'destructive',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_delete_post',
+	);
+	return $registry;
+}
+
+/**
+ * Args for aafm/get-posts.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_posts(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-posts' ),
+		'description'         => aafm_ability_description( 'aafm/get-posts' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				array(
+					'post_type' => array(
+						'type'        => 'string',
+						'default'     => 'post',
+						'description' => __( 'Slug of an allowlisted content type to list. Defaults to post. Types outside the operator\'s exposed allowlist are rejected.', 'agent-abilities-for-mcp' ),
+					),
+					'status'    => array(
+						'type'        => 'string',
+						'default'     => 'publish',
+						'description' => __( 'Post status to filter by. Defaults to publish. A non-public status (draft, pending, future, private) is only returned when the caller can read private content for this type; any, trash, auto-draft, inherit, and unrecognized values are rejected.', 'agent-abilities-for-mcp' ),
+					),
+					'search'    => array(
+						'type'        => 'string',
+						'description' => __( 'Free-text search term matched against the post title and content, using WordPress\'s normal search matching.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_pagination_schema_props(
+					AAFM_LIST_PER_PAGE_MAX,
+					__( 'Number of items per page, clamped to the 1-50 range regardless of the value requested. Defaults to 10 when omitted.', 'agent-abilities-for-mcp' ),
+					__( '1-based page number for pagination. Defaults to 1.', 'agent-abilities-for-mcp' )
+				),
+				array(
+					'content_format'  => array(
+						'type'        => 'string',
+						'enum'        => array( 'rendered', 'raw' ),
+						'default'     => 'rendered',
+						'description' => __( 'Format for each item\'s content when include_content is true: rendered HTML or raw block markup. Has no effect when include_content is false.', 'agent-abilities-for-mcp' ),
+					),
+					'include_content' => array(
+						'type'        => 'boolean',
+						'default'     => false,
+						'description' => __( 'When true, also returns each item\'s full content (in content_format). Defaults to false, returning metadata only, to keep responses small.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_lang_schema_fragment()
+			),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'posts'    => array(
+					'type'  => 'array',
+					'items' => array(
+						'type'       => 'object',
+						'properties' => aafm_rich_post_output_properties(),
+					),
+				),
+				'total'    => array( 'type' => 'integer' ),
+				'language' => array(
+					'type'        => array( 'string', 'null' ),
+					'description' => __( 'The WPML language the list was scoped to ("all" for every language), or null when WPML is inactive.', 'agent-abilities-for-mcp' ),
+				),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_posts',
+		'permission_callback' => 'aafm_perm_read',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Generic read permission.
+ *
+ * @return bool
+ */
+function aafm_perm_read(): bool {
+	return current_user_can( 'read' );
+}
+
+/**
+ * Execute aafm/get-posts.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_get_posts( array $input ) {
+	$type = aafm_validate_post_type( isset( $input['post_type'] ) ? (string) $input['post_type'] : 'post' );
+	if ( is_wp_error( $type ) ) {
+		return $type;
+	}
+
+	// Resolve the read-private capability from the post type's own cap map so a page
+	// query is gated by read_private_pages (and a custom type by its own cap), not the
+	// post default - get-pages delegates here with post_type pinned to 'page'.
+	$type_object = get_post_type_object( $type );
+	$private_cap = $type_object instanceof WP_Post_Type ? (string) $type_object->cap->read_private_posts : 'read_private_posts';
+	$can_private = current_user_can( $private_cap );
+	$status      = aafm_validate_post_status( isset( $input['status'] ) ? (string) $input['status'] : 'publish', $can_private );
+	if ( is_wp_error( $status ) ) {
+		return $status;
+	}
+
+	$paging = aafm_paginate_args( $input, AAFM_LIST_PER_PAGE_MAX );
+
+	$lang = aafm_resolve_lang( $input );
+	if ( is_wp_error( $lang ) ) {
+		return $lang;
+	}
+	// Someone else's draft, pending or scheduled item is listed only for a user who may edit it.
+	$own_only    = $type_object instanceof WP_Post_Type && aafm_status_needs_own_posts_only( $status, $type_object );
+	$build_query = static function () use ( $type, $status, $input, $paging, $own_only ): WP_Query {
+		$args = array(
+			'post_type'              => $type,
+			'post_status'            => $status,
+			's'                      => isset( $input['search'] ) ? sanitize_text_field( (string) $input['search'] ) : '',
+			'posts_per_page'         => $paging['per_page'],
+			'paged'                  => $paging['page'],
+			'no_found_rows'          => false,
+			'suppress_filters'       => false,
+			'update_post_meta_cache' => false,
+		);
+		if ( $own_only ) {
+			// author__in, not author: an author of 0 would drop the condition instead of matching nothing.
+			$args['author__in'] = array( get_current_user_id() );
+		}
+		return new WP_Query( $args );
+	};
+
+	$format          = isset( $input['content_format'] ) ? (string) $input['content_format'] : 'rendered';
+	$include_content = ! empty( $input['include_content'] );
+	$options         = array(
+		'content_format'  => $format,
+		'include_content' => $include_content,
+	);
+
+	// 'all' iterates every active language and concatenates: page/per_page apply PER language
+	// (documented on the lang schema fragment), total is the sum of each language's own count.
+	//
+	// aafm_rich_post() must run
+	// INSIDE the query's own aafm_with_language() scope, not after that scope restores to
+	// ambient - on BOTH branches, not only 'all'. Round 1's fix moved the shaping for 'all'
+	// but a query for a single EXPLICIT language had the identical gap: aafm_with_language()
+	// restores the original language before returning, and the shape step used to run after
+	// that restore. A theme or plugin filtering get_the_excerpt() (or any other
+	// language-sensitive field aafm_rich_post() derives) by ambient language stamped the
+	// result with whichever language was active before the call, not the one actually
+	// requested - a silent wrong-language shape on a post the call still reports finding
+	// correctly. Needs both plan 207's fix (before it, the non-default-language rows were
+	// never returned at all) and plan 208's delegation to get_the_excerpt() (before it, the
+	// auto-excerpt never ran a filter chain ambient language could reach). See
+	// WpmlLangAllTest and WpmlLanguageTest for the regression proofs, list-path and
+	// single-item respectively.
+	$shape_language = static function ( ?string $code ) use ( $build_query, $options ): array {
+		return aafm_with_language(
+			$code,
+			static function () use ( $build_query, $options ): array {
+				$query = $build_query();
+				aafm_prime_post_meta_checked( wp_list_pluck( $query->posts, 'ID' ) );
+				return array(
+					'rows'  => array_map(
+						static fn( WP_Post $post ): array => aafm_rich_post( $post, $options ),
+						array_values( array_filter( $query->posts, static fn( $post ): bool => $post instanceof WP_Post ) )
+					),
+					'found' => (int) $query->found_posts,
+				);
+			}
+		);
+	};
+
+	list( $posts, $total ) = aafm_collect_by_language( $lang, $shape_language );
+
+	return array(
+		'posts'    => $posts,
+		'total'    => $total,
+		'language' => $lang,
+	);
+}
+
+/**
+ * Shape one language, or every WPML language when $lang is 'all', joining the rows in language
+ * order and summing each language's found count.
+ *
+ * @param string|null $lang           A resolved language code, 'all', or null.
+ * @param callable    $shape_language Maps one language code to an array of 'rows' (a list) and 'found' (an int).
+ * @return array<int,mixed> The joined rows at index 0 and the summed total at index 1.
+ */
+function aafm_collect_by_language( ?string $lang, callable $shape_language ): array {
+	$rows  = array();
+	$total = 0;
+	foreach ( 'all' === $lang ? aafm_wpml_all_language_codes_for_iteration() : array( $lang ) as $code ) {
+		$shaped = $shape_language( $code );
+		$rows   = array_merge( $rows, $shaped['rows'] );
+		$total += $shaped['found'];
+	}
+	return array( $rows, $total );
+}
+
+/**
+ * Args for aafm/count-posts - total plus per-status breakdown, optional post_type.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_count_posts(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/count-posts' ),
+		'description'         => aafm_ability_description( 'aafm/count-posts' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				array(
+					'post_type' => array(
+						'type'        => 'string',
+						'description' => __( 'Slug of an allowlisted content type to count. Defaults to post. Types outside the operator\'s exposed allowlist are rejected.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_lang_schema_fragment()
+			),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'total'     => array( 'type' => 'integer' ),
+				'by_status' => array( 'type' => 'object' ),
+				'language'  => array(
+					'type'        => array( 'string', 'null' ),
+					'description' => __( 'The WPML language the list was scoped to ("all" for every language), or null when WPML is inactive.', 'agent-abilities-for-mcp' ),
+				),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_count_posts',
+		'permission_callback' => 'aafm_perm_read',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/count-posts. The post type defaults to 'post' and MUST clear the
+ * eligibility floor + allowlist (aafm_validate_post_type); a non-allowlisted type is
+ * refused. wp_count_posts() returns an object keyed by status; expose every status in
+ * by_status, and a `total` of ACTIVE (non-trashed) items only.
+ *
+ * `total` deliberately excludes the `trash` and `auto-draft` statuses - trash is recoverable
+ * removed content and auto-draft is abandoned editor scratch, neither of which is a live item.
+ * This matches the non-trash "active" total convention used by the WooCommerce count siblings
+ * (wc-count-products / wc-count-coupons / wc-count-orders). The per-status breakdown in
+ * by_status still reports trash and auto-draft for transparency.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_count_posts( array $input ) {
+	$type = aafm_validate_post_type( isset( $input['post_type'] ) ? (string) $input['post_type'] : 'post' );
+	if ( is_wp_error( $type ) ) {
+		return $type;
+	}
+
+	// Statuses excluded from the active total (still surfaced in by_status).
+	$non_active = array( 'trash', 'auto-draft' );
+
+	// Pass the 'readable' perm (via the helper's wp_count_posts() delegation) so counts
+	// respect the caller's read capability. On its own, though, 'readable' only restricts
+	// the `private` status - the raw counts still hand back draft/pending/future/trash counts
+	// to any reader, leaking how many unpublished items exist under this read-only gate. So
+	// layer a capability check on top of it. Under WPML the counts are language-scoped so they
+	// agree with aafm/get-posts instead of the language-blind wp_count_posts() total.
+	$lang = aafm_resolve_lang( $input );
+	if ( is_wp_error( $lang ) ) {
+		return $lang;
+	}
+	$counts = aafm_wpml_count_posts_by_status( $type, $lang );
+
+	// Editors of this post type get the full breakdown; everyone else is limited to counts
+	// for publicly-viewable statuses (normally just 'publish'). Non-public status counts are
+	// zeroed for non-editors so the breakdown keeps its shape without exposing the rest.
+	$type_object  = get_post_type_object( $type );
+	$can_edit     = ( null !== $type_object ) && current_user_can( $type_object->cap->edit_posts );
+	$public_stati = get_post_stati( array( 'public' => true ) );
+
+	$core_stati = get_post_stati( array( '_builtin' => true ) );
+	$by_status  = array();
+	$total      = 0;
+	foreach ( $counts as $status => $n ) {
+		$status = (string) $status;
+		$n      = (int) $n;
+
+		// Hide non-public status counts from callers who cannot edit this post type.
+		if ( ! $can_edit && ! in_array( $status, $public_stati, true ) ) {
+			$n = 0;
+		}
+
+		// A status a plugin registered and no post uses is noise (a store can register thirty). Core's own
+		// statuses keep their bucket at zero so the breakdown keeps its shape.
+		if ( 0 === $n && ! in_array( $status, $core_stati, true ) ) {
+			continue;
+		}
+
+		$by_status[ $status ] = $n;
+		if ( ! in_array( $status, $non_active, true ) ) {
+			$total += $n;
+		}
+	}
+
+	return array(
+		'total'     => $total,
+		// Cast so an empty breakdown JSON-encodes to "{}" (object) per the schema.
+		'by_status' => (object) $by_status,
+		'language'  => $lang,
+	);
+}
+
+/**
+ * Args for aafm/get-post.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_post(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-post' ),
+		'description'         => aafm_ability_description( 'aafm/get-post' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				array(
+					'post_id'         => array(
+						'type'        => 'integer',
+						'minimum'     => 1,
+						'description' => __( 'ID of the post to retrieve.', 'agent-abilities-for-mcp' ),
+					),
+					'content_format'  => array(
+						'type'        => 'string',
+						'enum'        => array( 'rendered', 'raw' ),
+						'default'     => 'rendered',
+						'description' => __( 'Format for the returned content: rendered HTML (default) or raw block markup.', 'agent-abilities-for-mcp' ),
+					),
+					'include_content' => array(
+						'type'        => 'boolean',
+						'default'     => true,
+						'description' => __( 'Whether to include the post content. Defaults to true; pass false to omit it, for example when only content_length is needed to preflight size.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_lang_schema_fragment()
+			),
+			'required'             => array( 'post_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'post' => array(
+					'type'       => 'object',
+					'properties' => aafm_rich_post_output_properties(),
+				),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_post',
+		'permission_callback' => 'aafm_perm_get_post',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/get-post: read, plus per-object edit for non-public posts.
+ *
+ * When a `lang` is requested, the id is resolved to that language's translation
+ * FIRST, so the capability check below runs against the id that will actually be
+ * loaded - a caller cannot pass a readable id but have a different, unreadable
+ * translation served.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_get_post( array $input ): bool {
+	if ( ! current_user_can( 'read' ) ) {
+		return false;
+	}
+	$id = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	if ( $id ) {
+		$id = aafm_get_post_lang_resolved_id( $id, $input );
+	}
+	$post = $id ? aafm_exact_object( 'post', $id ) : null;
+	if ( ! $post instanceof WP_Post ) {
+		return false;
+	}
+	// Single chokepoint: type must be exposed (floor + allowlist), and non-public
+	// statuses are gated per-object (mapped types only). Closes the attachment leak.
+	return aafm_can_read_post_object( $post );
+}
+
+/**
+ * Resolve a requested post id to its WPML translation per the caller's `lang`
+ * input. Feature-detected no-op: returns $id unchanged when WPML is off, no
+ * `lang` was requested, or `lang` is 'all' (no single translation to resolve to).
+ *
+ * @param int                 $id    Original post id.
+ * @param array<string,mixed> $input Ability input (read for `lang`).
+ * @return int
+ */
+function aafm_get_post_lang_resolved_id( int $id, array $input ): int {
+	$lang = aafm_resolve_lang( $input );
+	// A WP_Error (invalid code) resolves nothing here; the executor refuses it
+	// before serving data, and the permission callback just checks the original id.
+	if ( ! is_string( $lang ) || 'all' === $lang ) {
+		return $id;
+	}
+	// WPML's wpml_object_id filter resolves per the element's REAL type (the post type slug).
+	// Pinning 'post' here made a lang request on any CPT resolve against the wrong element
+	// type, so WPML fell back to the original id and the untranslated item was served
+	// silently. pages.php pins 'page' because its ids are type-pinned to pages; this
+	// getter serves every allowlisted type, so the type comes from the post itself.
+	$post = aafm_exact_object( 'post', $id );
+	if ( ! $post instanceof WP_Post ) {
+		return 0;
+	}
+	return aafm_wpml_translated_id( $id, (string) $post->post_type, $lang );
+}
+
+/**
+ * Execute aafm/get-post.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_get_post( array $input ) {
+	$lang = aafm_resolve_lang( $input );
+	if ( is_wp_error( $lang ) ) {
+		return $lang;
+	}
+	$id   = aafm_get_post_lang_resolved_id( absint( $input['post_id'] ), $input );
+	$post = aafm_exact_object( 'post', $id );
+	if ( ! $post instanceof WP_Post || ! aafm_can_read_post_object( $post ) ) {
+		return aafm_generic_error();
+	}
+	$format          = isset( $input['content_format'] ) ? (string) $input['content_format'] : 'rendered';
+	$include_content = ! array_key_exists( 'include_content', $input ) || (bool) $input['include_content'];
+	// Branch review fix (lang scope and result shaping): shape under the CORRECT language,
+	// never ambient. An explicit requested language shapes under that language, matching the
+	// translation aafm_get_post_lang_resolved_id() already resolved above. "all" or no lang at
+	// all shapes under the POST'S OWN language instead - both already treat id resolution as a
+	// no-op passthrough above (aafm_get_post_lang_resolved_id() itself branches on
+	// !is_string($lang) || 'all' === $lang), so neither one names a specific target for us to
+	// switch to. aafm_wpml_post_language() and aafm_with_language() both no-op when WPML is
+	// off, so a non-multilingual site is unaffected either way.
+	$shape_lang = ( is_string( $lang ) && 'all' !== $lang ) ? $lang : aafm_wpml_post_language( $post->ID );
+	return array(
+		'post' => aafm_with_language(
+			$shape_lang,
+			static fn(): array => aafm_rich_post(
+				$post,
+				array(
+					'content_format'  => $format,
+					'include_content' => $include_content,
+				)
+			)
+		),
+	);
+}
+
+/**
+ * Shared content input schema for post/page writes.
+ *
+ * The schema is closed (additionalProperties:false) so callers cannot smuggle
+ * post_author, post_type, meta_input, or other privileged fields - anything not
+ * declared here is rejected by the Abilities API before execute runs.
+ *
+ * @param bool $require_title Whether title is required.
+ * @return array<string,mixed>
+ */
+function aafm_write_content_schema( bool $require_title ): array {
+	$schema = array(
+		'type'                 => 'object',
+		'properties'           => array(
+			'title'          => array(
+				'type'        => 'string',
+				'minLength'   => 1,
+				'description' => __( 'Post title. Required to create; omitting it on update leaves the existing title unchanged. Sanitized as plain text and subject to the operator\'s optional maximum-length setting, if one is configured.', 'agent-abilities-for-mcp' ),
+			),
+			'content'        => array(
+				'type'        => 'string',
+				'description' => aafm_write_content_description(),
+			),
+			'excerpt'        => array(
+				'type'        => 'string',
+				'description' => __( 'Short manual excerpt for the post. Sanitized as plain text with no HTML; omitting it on update leaves the existing excerpt unchanged.', 'agent-abilities-for-mcp' ),
+			),
+			'status'         => array(
+				'type'        => 'string',
+				'description' => __( 'Status for the post. A status that makes content publicly visible now or on a future date (publish, future, private, or a custom public status) always requires this content type\'s publish capability; draft and pending need only the ability\'s base edit permission. any, trash, auto-draft, inherit, and unrecognized values are rejected; the operator\'s force-draft setting can still coerce such a request to draft. Omitting this field on update leaves the current status unchanged; create-draft defaults to draft, create-post and create-page default to publish.', 'agent-abilities-for-mcp' ),
+			),
+			'slug'           => array(
+				'type'        => 'string',
+				'description' => __( 'URL slug for the post. Run through WordPress\'s slug sanitizer; if that produces an empty string the slug is left as-is (auto-generated on create, unchanged on update) rather than cleared.', 'agent-abilities-for-mcp' ),
+			),
+			'featured_media' => array(
+				'type'        => 'integer',
+				'minimum'     => 1,
+				'description' => __( 'Attachment ID to set as the post\'s featured image. Must be an existing image attachment; a non-image or nonexistent attachment ID is rejected.', 'agent-abilities-for-mcp' ),
+			),
+			'terms'          => array(
+				'type'                 => 'object',
+				'description'          => __( 'Taxonomy slug to term ID list mapping, for example {"category": [3, 7]}. REPLACES the post\'s existing terms for each taxonomy named; taxonomies left out are untouched. Every term ID must already exist in that taxonomy, the taxonomy itself must be public, and the caller needs that taxonomy\'s assign_terms capability.', 'agent-abilities-for-mcp' ),
+				'additionalProperties' => array(
+					'type'  => 'array',
+					'items' => array(
+						'type'    => 'integer',
+						'minimum' => 1,
+					),
+				),
+			),
+			'meta'           => array(
+				'type'                 => 'object',
+				'description'          => __( 'Post meta to write as key/value pairs. Only keys on the operator\'s meta allowlist are accepted (protected and internal keys are always blocked regardless of the allowlist); values must be scalar (string, number, boolean, or integer).', 'agent-abilities-for-mcp' ),
+				'additionalProperties' => array(
+					'type' => array( 'string', 'number', 'boolean', 'integer' ),
+				),
+			),
+		),
+		'additionalProperties' => false,
+	);
+	if ( $require_title ) {
+		$schema['required'] = array( 'title' );
+	}
+	return $schema;
+}
+
+/**
+ * Closed content input schema for the generic CPT writes.
+ *
+ * Starts from the shared post/page schema (so CPT items inherit the exact C2 enrichment
+ * surface: title/content/excerpt/status/slug/featured_media/terms/meta) and adds a
+ * REQUIRED post_type string. The schema stays closed (additionalProperties:false) so the
+ * agent still cannot smuggle post_author, meta_input, or any other privileged field - the
+ * only privileged field exposed is post_type, which the execute path re-validates against
+ * the read allowlist + eligibility floor.
+ *
+ * @param bool $require_title Whether title is required (true for create, false for update).
+ * @return array<string,mixed>
+ */
+function aafm_write_cpt_content_schema( bool $require_title ): array {
+	$schema                            = aafm_write_content_schema( $require_title );
+	$schema['properties']['post_type'] = array(
+		'type'        => 'string',
+		'minLength'   => 1,
+		'description' => __( 'Slug of an agent-writable custom content type. Not every public type is writable: only types the operator has exposed to agents are accepted; others are rejected. Call aafm-get-post-types and use the writable flag to find valid slugs.', 'agent-abilities-for-mcp' ),
+	);
+	$required                          = $schema['required'] ?? array();
+	$required[]                        = 'post_type';
+	$schema['required']                = array_values( array_unique( $required ) );
+	return $schema;
+}
+
+/**
+ * Args for aafm/create-draft.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_create_draft(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/create-draft' ),
+		'description'         => aafm_ability_description( 'aafm/create-draft' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => aafm_write_content_schema( true ),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'post'       => array( 'type' => 'object' ),
+				'enrichment' => aafm_write_enrichment_output_schema(),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_create_draft',
+		'permission_callback' => 'aafm_perm_create_draft',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Permission: edit_posts (create drafts, not publish).
+ *
+ * @return bool
+ */
+function aafm_perm_edit_posts(): bool {
+	return current_user_can( 'edit_posts' );
+}
+
+/**
+ * Permission: publish_posts.
+ *
+ * @return bool
+ */
+function aafm_perm_publish_posts(): bool {
+	return current_user_can( 'publish_posts' );
+}
+
+/**
+ * Permission for aafm/create-draft: edit_posts to create at all, plus publish_posts when the
+ * request asks for a publicly-viewable status.
+ *
+ * Create-draft's floor is edit_posts alone, so any Contributor can call it. Without this
+ * input-aware check, a Contributor could pass status:"publish" straight through to a live
+ * post - the escalation this gate exists to refuse. Keys on aafm_status_requires_publish_cap()
+ * (core's public-status registry), not the literal 'publish', so a custom public status is
+ * gated the same way.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_create_draft( array $input ): bool {
+	if ( ! aafm_perm_edit_posts() ) {
+		return false;
+	}
+	if ( isset( $input['status'] ) && aafm_status_requires_publish_cap( (string) $input['status'] ) ) {
+		return aafm_perm_publish_posts();
+	}
+	return true;
+}
+
+/**
+ * The status a post has right now, for the update paths that must not take a live post offline.
+ *
+ * @param int $post_id Post ID.
+ * @return string|null Null when the post does not exist.
+ */
+function aafm_current_post_status( int $post_id ): ?string {
+	$post = aafm_exact_object( 'post', $post_id );
+
+	return $post instanceof WP_Post ? $post->post_status : null;
+}
+
+/**
+ * Authorize and validate a requested post status against a specific capability.
+ *
+ * The single chokepoint every write path (create-draft, create-post, create-page,
+ * create-cpt-item, update-post, update-cpt-item) resolves a caller-supplied `status` through.
+ * $publish_cap must be resolved from the TARGET post type's own capability map by every
+ * caller (e.g. publish_products for a CPT, never a hardcoded 'publish_posts' literal), so a
+ * custom type is judged by its own capability model, not the generic post primitive.
+ *
+ * A status aafm_status_requires_publish_cap() flags as publish-equivalent (publish, future,
+ * private, or a custom public status) is refused with a WP_Error unless the caller holds
+ * $publish_cap. draft and pending need no extra authority beyond the edit_posts-equivalent
+ * floor every caller already cleared before reaching here - this function does not re-check
+ * that floor. 'any'/'trash'/'auto-draft'/'inherit'/unknown values are always rejected. This
+ * intentionally does NOT delegate to aafm_validate_post_status(): that function's
+ * $can_read_private flag is a single boolean covering draft/pending/future/private together,
+ * which is right for filtering reads but wrong here - draft/pending must always be allowed
+ * once edit_posts is cleared, while future/private must only be allowed once $publish_cap is
+ * held, and a single boolean cannot express both at once.
+ *
+ * @param string        $requested       Raw requested status.
+ * @param string        $publish_cap     Capability required to request a publish-equivalent status.
+ * @param string[]|null $public_statuses The caller's already-computed public-status list, when
+ *                                       it has one. Passed through to both internal checks
+ *                                       below so this function computes get_post_stati() at
+ *                                       most once per call instead of twice. Null (the
+ *                                       default) computes it here, unchanged from before.
+ * @param string|null   $current_status  An update's current status for the post being edited, null
+ *                                       for a create. Force draft stops a post from going live; it
+ *                                       never takes one offline, so a request that only repeats the
+ *                                       current status is left as it is.
+ * @return string|WP_Error Sanitized status, or WP_Error when unauthorized/unrecognized.
+ */
+function aafm_authorize_post_status( string $requested, string $publish_cap, ?array $public_statuses = null, ?string $current_status = null ) {
+	$status = sanitize_key( $requested );
+	if ( null === $public_statuses ) {
+		$public_statuses = array_values( get_post_stati( array( 'public' => true ) ) );
+	}
+	if ( aafm_status_requires_publish_cap( $status, $public_statuses ) && ! current_user_can( $publish_cap ) ) {
+		return new WP_Error( 'aafm_status_forbidden', __( 'You do not have permission to set that status.', 'agent-abilities-for-mcp' ) );
+	}
+	$recognized = array_merge( $public_statuses, array( 'draft', 'pending', 'future', 'private' ) );
+	if ( ! in_array( $status, $recognized, true ) ) {
+		return new WP_Error( 'aafm_invalid_status', __( 'Unsupported or unauthorized post status.', 'agent-abilities-for-mcp' ) );
+	}
+	// The TEC create/update chokepoints route status entirely
+	// through this function (and aafm_resolve_create_status(), which delegates to it), but the
+	// operator's force-draft override was only ever applied by aafm_insert_post()'s own
+	// duplicate of this same coercion - TEC's writers never called that function, so an explicit
+	// publish/future/private request against an event, venue, or organizer bypassed force-draft
+	// entirely. Moving the coercion into this single shared chokepoint closes it for every
+	// caller at once, TEC included, rather than adding a fourth copy of the same three-line
+	// check. Applying it here is behaviourally identical to aafm_insert_post()'s existing
+	// separate call for its own callers (same condition, same outcome), so that call is left in
+	// place rather than removed for a fix that does not need it touched.
+	if ( aafm_force_draft() && $status !== $current_status && aafm_status_requires_publish_cap( $status, $public_statuses ) ) {
+		$status = 'draft';
+	}
+	return $status;
+}
+
+/**
+ * Resolve the effective post status for a create ability from `$input['status']`, falling
+ * back to $fallback_status when the caller omitted it. Delegates the authority + allow-list
+ * decision to aafm_authorize_post_status(), the shared chokepoint every create AND update
+ * write routes through - this is the same escalation gate as aafm_perm_create_draft,
+ * re-checked here so the guard lives at the write chokepoint rather than trusting the
+ * permission_callback alone.
+ *
+ * @param array<string,mixed> $input          Validated ability input.
+ * @param string              $fallback_status Status to use when `status` is omitted.
+ * @param string              $publish_cap    Capability required to request a public status.
+ * @return string|WP_Error
+ */
+function aafm_resolve_create_status( array $input, string $fallback_status, string $publish_cap ) {
+	if ( ! isset( $input['status'] ) ) {
+		return $fallback_status;
+	}
+	$status = aafm_authorize_post_status( (string) $input['status'], $publish_cap );
+	if ( is_wp_error( $status ) ) {
+		return $status;
+	}
+	// aafm_authorize_post_status() only forces draft for a status it recognizes as
+	// publish-equivalent (mirroring the narrower rule an UPDATE needs, so it never touches
+	// pending or retro-unpublishes). A CREATE is held to aafm_insert_post()'s own stricter,
+	// unconditional rule instead - force-draft always wins on create, even for a requested
+	// 'pending' - so this delegating chokepoint applies that second, stronger pass for every
+	// caller that routes through it (TEC events/venues/organizers included), matching what
+	// aafm_insert_post() has always done for its own callers.
+	return aafm_force_draft() ? 'draft' : $status;
+}
+
+/**
+ * Output schema of the `enrichment` field a create or update adds beside the post: per-field
+ * outcomes for the terms, featured image and meta the request carried.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_write_enrichment_output_schema(): array {
+	return array(
+		'type'       => 'object',
+		'properties' => array(
+			'terms'          => array( 'type' => 'object' ),
+			'featured_media' => array( 'type' => 'string' ),
+			'meta'           => array( 'type' => 'object' ),
+		),
+	);
+}
+
+/**
+ * Insert a post with a forced/default status and type, returning the redacted post.
+ *
+ * Anti-escalation: post_author is never threaded from input - wp_insert_post
+ * defaults it to the current (agent) user, so a caller cannot spoof authorship.
+ * post_type is forced by the caller of this function, never by the agent's input. Title is
+ * sanitized with aafm_sanitize_plain_text and content with aafm_kses_block_markup() (wp_kses_post(),
+ * keeping tag-free attribute text as sent for unfiltered_html users when kses would only
+ * entity-encode it), so no agent can store a script element.
+ *
+ * When $publish_cap is given, the effective status is resolved from $input['status'] (falling
+ * back to $default_status when omitted) via aafm_resolve_create_status() - this is the shared
+ * chokepoint create-draft/create-post/create-page route through so all three honour a
+ * requested status under the same cap gate. When $publish_cap is null (the CPT-item create
+ * path, which resolves its own status before calling in), $default_status is used exactly as
+ * given, unchanged from prior behaviour.
+ *
+ * @param array<string,mixed> $input          Validated input.
+ * @param string              $default_status Forced status, or the default when $publish_cap
+ *                                             is set and the caller omitted `status`.
+ * @param string              $type           Forced post type.
+ * @param string|null         $publish_cap    Capability required to request a public status,
+ *                                             or null to skip status resolution entirely.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_insert_post( array $input, string $default_status, string $type, ?string $publish_cap = null ) {
+	if ( null !== $publish_cap ) {
+		$status = aafm_resolve_create_status( $input, $default_status, $publish_cap );
+		if ( is_wp_error( $status ) ) {
+			return $status;
+		}
+	} else {
+		$status = $default_status;
+	}
+
+	// Force-draft override applies to every create that routes here (post + page), even
+	// when the request explicitly asked for a public status.
+	if ( aafm_force_draft() ) {
+		$status = 'draft';
+	}
+
+	// Max-title guard covers create (post + page via delegation) and, in the updater, update (post + page).
+	$title = isset( $input['title'] ) ? aafm_sanitize_plain_text( (string) $input['title'] ) : '';
+	if ( ! aafm_title_within_limit( $title ) ) {
+		return new WP_Error( 'aafm_title_too_long', __( 'The title exceeds the maximum allowed length.', 'agent-abilities-for-mcp' ) );
+	}
+
+	// Validate enrichment BEFORE inserting so a bad term/attachment/meta aborts with nothing written.
+	// Pass the real target post type ($type), not the default 'post', so the
+	// meta probe is not blind to a sanitize_callback registered for this create's actual type.
+	// Unlike the update path, there is no post id yet at this point, so
+	// get_object_subtype( 'post', $id ) cannot be resolved here - $type (the intended post type
+	// this create will be assigned) is the closest available proxy for it.
+	$enrichment = aafm_validate_write_enrichment( $input, $type );
+	if ( is_wp_error( $enrichment ) ) {
+		return $enrichment;
+	}
+	// Page-only parent and template, checked before the insert like the enrichment.
+	$page_fields = aafm_page_write_fields( $input, $type, null );
+	if ( is_wp_error( $page_fields ) ) {
+		return $page_fields;
+	}
+
+	$sanitized = aafm_kses_block_markup( isset( $input['content'] ) ? (string) $input['content'] : '' );
+	$postarr   = array_merge(
+		array(
+			'post_type'    => $type,
+			'post_status'  => $status,
+			'post_title'   => $title,
+			'post_content' => $sanitized['content'],
+			'post_excerpt' => isset( $input['excerpt'] ) ? aafm_sanitize_plain_text( (string) $input['excerpt'] ) : '',
+		),
+		$page_fields
+	);
+
+	// Optional slug → sanitize_title → post_name, folded into the same atomic row write.
+	if ( isset( $input['slug'] ) ) {
+		$slug = sanitize_title( (string) $input['slug'] );
+		if ( '' !== $slug ) {
+			$postarr['post_name'] = $slug;
+		}
+	}
+
+	// Guard the final, post-KSES markup for editor-invalid block content. In strict mode a
+	// mismatch aborts before anything is written; otherwise the warnings ride back on the response.
+	$guard = aafm_block_guard_evaluate( (string) $postarr['post_content'] );
+	if ( $guard['error'] instanceof WP_Error ) {
+		return $guard['error'];
+	}
+	$guard['warnings'] = array_merge( $guard['warnings'], $sanitized['warnings'] );
+
+	$id = wp_insert_post( wp_slash( $postarr ), true );
+	if ( is_wp_error( $id ) ) {
+		return aafm_generic_error();
+	}
+	$created = aafm_exact_object( 'post', $id );
+	if ( ! $created instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+
+	// The reread above only proved the row exists, never that what came back
+	// matches what this create actually asked for - a wp_insert_post_data filter silently vetoing
+	// or normalizing a field would still report success while the response carried the caller's
+	// stale intent instead of what storage actually holds. The same defect is closed at other
+	// write sites through these same shared helpers. $sanitize_context_id is 0, not (int) $id:
+	// core's own sanitize_post( $postarr, 'db' ) inside wp_insert_post() ran BEFORE this row
+	// existed, with ID defaulted to 0 (aafm_post_field_write_confirmed()'s own docblock).
+	//
+	// post_status and post_name are
+	// deliberately NOT confirmed here at all, not even through a replicated core pipeline. Three
+	// rounds of trying to replicate wp_insert_post()'s own status/slug resolution (the
+	// publish<->future date transition, wp_unique_post_slug()'s dedup, its filters, the
+	// pending-post capability clearing, Trash-restore metadata, emoji charset encoding, and the
+	// order those run in relative to each other and to the row's real id/date/parent) kept finding
+	// another legitimate core normalization that a strict comparison misreported as a vetoed
+	// write - see includes/helpers.php's git history for the discarded aafm_effective_post_status()
+	// and aafm_post_slug_write_confirmed() helpers. Replicating that pipeline correctly is
+	// replicating WordPress core; a wrong replication is worse than no confirmation, because it
+	// falsely rejects (and, on GeoDirectory's create path, deletes) an otherwise valid write.
+	// title/content/excerpt do not have this problem - they run through sanitize_post_field()'s
+	// ordinary save-filter pipeline with no separate core-side transition - so those stay
+	// confirmed below. Accepted blind spot: a wp_insert_post_data filter that swaps status or slug
+	// to another plausible value (still a real status, still non-empty/unique) is indistinguishable
+	// from legitimate core/site normalization and is not detected.
+	$fields_to_confirm = array(
+		'post_title'   => $title,
+		'post_content' => (string) $postarr['post_content'],
+		'post_excerpt' => (string) $postarr['post_excerpt'],
+	);
+	foreach ( $fields_to_confirm as $field => $intended ) {
+		// A CREATE: the field never existed before this row did, so its pre-write value is
+		// always ''. See aafm_post_field_write_confirmed()'s docblock for why the exact-replay
+		// check is no longer the only signal.
+		if ( ! aafm_post_field_confirm_logged( (int) $id, $field, $intended, '', 0 ) ) {
+			return aafm_generic_error();
+		}
+	}
+	if ( array() !== $page_fields && ! aafm_page_write_fields_landed( (int) $id, $page_fields ) ) {
+		return aafm_generic_error();
+	}
+
+	// Apply the pre-validated enrichment now that the id exists.
+	$enriched = aafm_apply_write_enrichment( (int) $id, $enrichment );
+
+	$response = array( 'post' => aafm_redact_post( $created ) );
+	if ( ! empty( $guard['warnings'] ) ) {
+		$response['content_warnings'] = $guard['warnings'];
+	}
+	if ( array() !== $enriched ) {
+		$response['enrichment'] = $enriched;
+	}
+	return $response;
+}
+
+/**
+ * Execute aafm/create-draft - defaults to draft, honours a requested status when the caller
+ * holds publish_posts (the permission_callback already refused the request otherwise).
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_create_draft( array $input ) {
+	return aafm_insert_post( $input, 'draft', 'post', 'publish_posts' );
+}
+
+/**
+ * Args for aafm/create-post.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_create_post(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/create-post' ),
+		'description'         => aafm_ability_description( 'aafm/create-post' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => aafm_write_content_schema( true ),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'post'       => array( 'type' => 'object' ),
+				'enrichment' => aafm_write_enrichment_output_schema(),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_create_post',
+		'permission_callback' => 'aafm_perm_publish_posts',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/create-post - defaults to publish (the permission_callback already requires
+ * publish_posts to call this ability at all), honours a requested draft/pending/private status.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_create_post( array $input ) {
+	return aafm_insert_post( $input, 'publish', 'post', 'publish_posts' );
+}
+
+/**
+ * Args for aafm/create-cpt-item.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_create_cpt_item(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/create-cpt-item' ),
+		'description'         => aafm_ability_description( 'aafm/create-cpt-item' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => aafm_write_cpt_content_schema( true ),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'post'       => array( 'type' => 'object' ),
+				'enrichment' => aafm_write_enrichment_output_schema(),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_create_cpt_item',
+		'permission_callback' => 'aafm_perm_create_cpt_item',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/create-cpt-item: the type must be allowlisted+eligible AND the agent
+ * must hold that type's own create cap. When the request asks to publish, the type's publish
+ * cap is also required. Never bypasses the type's WP capability model.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_create_cpt_item( array $input ): bool {
+	$type = isset( $input['post_type'] ) ? sanitize_key( (string) $input['post_type'] ) : '';
+	if ( is_wp_error( aafm_validate_post_type( $type ) ) ) {
+		return false;
+	}
+	$caps = aafm_type_caps( $type );
+	if ( ! $caps['object'] instanceof WP_Post_Type ) {
+		return false;
+	}
+	// Deliberately NO $caps['mapped']/map_meta_cap gate here, unlike the update/read paths.
+	// Create is pre-insert: there is no per-object edit_post to degrade-open against, the author
+	// is forced to the current user (no spoof), and edit_posts/publish_posts are real assigned
+	// primitives that hold regardless of map_meta_cap. The mapped check is unnecessary here and
+	// must NOT be copied to the per-object edit/delete paths where degraded caps can fail open.
+	// Base authoring cap for the type (edit_posts-equivalent).
+	if ( ! current_user_can( (string) $caps['object']->cap->edit_posts ) ) {
+		return false;
+	}
+	// A publish-equivalent status requested (publish, future, private, or a custom public
+	// status - see aafm_status_requires_publish_cap()) → require the type's publish cap too.
+	if ( isset( $input['status'] ) && aafm_status_requires_publish_cap( (string) $input['status'] ) ) {
+		return current_user_can( (string) $caps['object']->cap->publish_posts );
+	}
+	return true;
+}
+
+/**
+ * Execute aafm/create-cpt-item.
+ *
+ * Re-validates post_type against the allowlist+floor at execute time (defense in depth: the
+ * type could have been de-allowlisted between the permission check and execute), then resolves
+ * the requested status through the shared aafm_resolve_create_status() chokepoint - gated on
+ * THIS type's own publish cap (e.g. publish_products), never a hardcoded 'publish' string
+ * compare - and delegates to aafm_insert_post(), so the CPT item inherits force-draft,
+ * author-forcing, content sanitization, the status floor, and the C2 enrichment exactly as
+ * post/page creates do.
+ *
+ * Previously this compared the raw input directly against the literal string 'publish' and
+ * fell back to 'draft' for anything else, with no error - so a request for pending, private,
+ * or future was silently downgraded to draft instead of being honoured or refused.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_create_cpt_item( array $input ) {
+	$type      = isset( $input['post_type'] ) ? sanitize_key( (string) $input['post_type'] ) : '';
+	$validated = aafm_validate_post_type( $type );
+	if ( is_wp_error( $validated ) ) {
+		return aafm_generic_error();
+	}
+
+	$caps = aafm_type_caps( $validated );
+	if ( ! $caps['object'] instanceof WP_Post_Type ) {
+		return aafm_generic_error();
+	}
+
+	$status = aafm_resolve_create_status( $input, 'draft', (string) $caps['object']->cap->publish_posts );
+	if ( is_wp_error( $status ) ) {
+		return $status;
+	}
+
+	return aafm_insert_post( $input, $status, $validated );
+}
+
+/**
+ * Args for aafm/update-post.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_update_post(): array {
+	$schema                          = aafm_write_content_schema( false );
+	$schema['properties']['post_id'] = array(
+		'type'        => 'integer',
+		'minimum'     => 1,
+		'description' => __( 'ID of the post to update.', 'agent-abilities-for-mcp' ),
+	);
+	$schema['required']              = array( 'post_id' );
+
+	return array(
+		'label'               => aafm_ability_label( 'aafm/update-post' ),
+		'description'         => aafm_ability_description( 'aafm/update-post' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => $schema,
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'post'       => array( 'type' => 'object' ),
+				'enrichment' => aafm_write_enrichment_output_schema(),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_update_post',
+		'permission_callback' => 'aafm_perm_update_post',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/update-post: per-object edit_post, plus publish_posts when publishing.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_update_post( array $input ): bool {
+	$id   = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$post = $id ? aafm_exact_object( 'post', $id ) : null;
+	if ( ! $post instanceof WP_Post || ! aafm_can_edit_post_object( $post ) || ! aafm_post_tool_reach_allowed( $post, 'update' ) ) {
+		return false;
+	}
+	if ( isset( $input['status'] ) && aafm_status_requires_publish_cap( (string) $input['status'] ) ) {
+		$caps = aafm_type_caps( $post->post_type );
+		return $caps['object'] instanceof WP_Post_Type
+			&& current_user_can( (string) $caps['object']->cap->publish_posts );
+	}
+	return true;
+}
+
+/**
+ * Execute aafm/update-post. Status may only become a validated allow-list value.
+ *
+ * Only the four declared fields are ever written. Content is re-sanitized with
+ * wp_kses_post; status is run through the strict allow-list validator (no 'any',
+ * 'trash', or unknown statuses).
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_update_post( array $input ) {
+	$id   = absint( $input['post_id'] );
+	$post = aafm_exact_object_chain( 'post', $id );
+	if ( ! $post instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+
+	// A builder-owned post accepts one write: the excerpt alone, with its stored content pinned. The
+	// cached post must match the stored row before anything is written, or the write is refused.
+	$owning_builder = aafm_post_has_foreign_builder_ownership( $id );
+	$builder_row    = null;
+	if ( false !== $owning_builder ) {
+		if ( AAFM_BUILDER_OWNERSHIP_UNKNOWN === $owning_builder || ! aafm_page_builder_excerpt_only_input( $input ) ) {
+			return aafm_page_builder_owned_error( $owning_builder );
+		}
+		$builder_row = aafm_page_builder_excerpt_start( $post );
+		if ( is_wp_error( $builder_row ) ) {
+			return $builder_row;
+		}
+	}
+
+	// Validate enrichment BEFORE wp_update_post so a bad term/attachment/meta aborts
+	// with the post left exactly as it was (no half-applied update). Pass the
+	// post's real, existing type, not the default 'post'. The id already
+	// exists here, so resolve the same filterable get_object_subtype( 'post', $id ) call core
+	// itself makes at write time, rather than the raw $post->post_type, so a get_object_subtype_post
+	// filter is honoured the same way it is at write time.
+	$enrichment = aafm_validate_write_enrichment( $input, (string) get_object_subtype( 'post', $id ) );
+	if ( is_wp_error( $enrichment ) ) {
+		return $enrichment;
+	}
+	// Page-only parent and template, checked before any write. A builder-owned page never gets here
+	// with either: the excerpt-only check above refuses every other key.
+	$page_fields = aafm_page_write_fields( $input, $post->post_type, $post );
+	if ( is_wp_error( $page_fields ) ) {
+		return $page_fields;
+	}
+
+	$guard   = array(
+		'warnings' => array(),
+		'error'    => null,
+	);
+	$postarr = array_merge( array( 'ID' => $id ), $page_fields );
+	if ( isset( $input['title'] ) ) {
+		$title = aafm_sanitize_plain_text( (string) $input['title'] );
+		if ( ! aafm_title_within_limit( $title ) ) {
+			return new WP_Error( 'aafm_title_too_long', __( 'The title exceeds the maximum allowed length.', 'agent-abilities-for-mcp' ) );
+		}
+		$postarr['post_title'] = $title;
+	}
+	if ( isset( $input['content'] ) ) {
+		$sanitized               = aafm_kses_block_markup( (string) $input['content'] );
+		$postarr['post_content'] = $sanitized['content'];
+		// Guard the final markup: strict mode blocks the write, warn mode rides on the response.
+		$guard = aafm_block_guard_evaluate( (string) $postarr['post_content'] );
+		if ( $guard['error'] instanceof WP_Error ) {
+			return $guard['error'];
+		}
+		$guard['warnings'] = array_merge( $guard['warnings'], $sanitized['warnings'] );
+	}
+	if ( isset( $input['excerpt'] ) ) {
+		$postarr['post_excerpt'] = aafm_sanitize_plain_text( (string) $input['excerpt'] );
+	}
+	if ( isset( $input['slug'] ) ) {
+		$slug = sanitize_title( (string) $input['slug'] );
+		if ( '' !== $slug ) {
+			$postarr['post_name'] = $slug;
+		}
+	}
+	if ( isset( $input['status'] ) ) {
+		// Gate a publish-equivalent target status (publish/future/private/a custom public
+		// status) on the POST TYPE's OWN publish cap, not a hardcoded 'publish_posts' literal -
+		// a custom type is judged by its own capability model (e.g. publish_products), mirroring
+		// aafm_perm_update_post()'s permission_callback gate and core's own
+		// WP_REST_Posts_Controller::handle_status_param(), which requires publish_posts for
+		// publish/future/private alike (WordPress has no separate "set post private" cap).
+		// Previously this used the type's edit_others cap, which is the wrong question (can this
+		// caller edit someone else's post) and wrongly refused an Author - holds publish_posts
+		// but not edit_others_posts - trying to schedule or privatize their OWN post.
+		$type_object     = get_post_type_object( $post->post_type );
+		$publish_cap     = $type_object instanceof WP_Post_Type ? (string) $type_object->cap->publish_posts : 'publish_posts';
+		$public_statuses = array_values( get_post_stati( array( 'public' => true ) ) );
+		// Force draft is applied inside aafm_authorize_post_status(): a request to move the post to
+		// a publicly visible status becomes 'draft'. A request that only repeats the post's current
+		// status, or an edit with no 'status' field, is left alone, so a live post is never taken
+		// offline.
+		$status = aafm_authorize_post_status( (string) $input['status'], $publish_cap, $public_statuses, $post->post_status );
+		if ( is_wp_error( $status ) ) {
+			return $status;
+		}
+		$postarr['post_status'] = $status;
+	}
+
+	if ( null !== $builder_row ) {
+		$result = aafm_page_builder_write_excerpt( $id, $postarr, $builder_row );
+		if ( is_wp_error( $result ) ) {
+			return $result;
+		}
+	} else {
+		$result = wp_update_post( wp_slash( $postarr ), true );
+		if ( is_wp_error( $result ) ) {
+			return aafm_generic_error();
+		}
+	}
+
+	// Apply the pre-validated enrichment after the core fields land.
+	$enriched = aafm_apply_write_enrichment( (int) $result, $enrichment );
+
+	// Re-fetch by the id wp_update_post() returned. A destructive save_post/post_updated
+	// hook (or a TOCTOU race) can delete the post during the update, so this can be null;
+	// guard it so the typed aafm_redact_post() degrades to a generic error, never a fatal.
+	$updated = aafm_exact_object( 'post', (int) $result );
+	if ( ! $updated instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+
+	// The reread above only proved the post still exists, never that what
+	// came back matches this update's own request - a wp_insert_post_data filter silently
+	// vetoing or normalizing one of these fields would still report success while the response
+	// carried the caller's stale intent instead of what storage actually holds. Only the fields
+	// THIS call actually set are checked, each against its CANONICAL sanitize_post_field() form
+	// (aafm_post_field_write_confirmed()'s default $sanitize_context_id, the existing $id - this
+	// is an update, the row already existed at sanitize time).
+	//
+	// post_status and post_name are
+	// deliberately NOT confirmed here - see the create path above for the full reasoning. Same
+	// accepted blind spot on this path: a filter swapping status or slug to another plausible
+	// value is not detected.
+	// $post was read before wp_update_post() ran (get_post()'s default 'raw' filter, same
+	// context aafm_post_field_write_confirmed()'s own read-back uses), so its fields are each
+	// field's genuine pre-write value.
+	foreach ( array( 'post_title', 'post_content', 'post_excerpt' ) as $field ) {
+		if ( ! isset( $postarr[ $field ] ) ) {
+			continue;
+		}
+		if ( ! aafm_post_field_confirm_logged( $id, $field, (string) $postarr[ $field ], (string) $post->$field ) ) {
+			return aafm_generic_error();
+		}
+	}
+	if ( array() !== $page_fields && ! aafm_page_write_fields_landed( $id, $page_fields ) ) {
+		return aafm_generic_error();
+	}
+
+	$response = array( 'post' => aafm_redact_post( $updated ) );
+	if ( ! empty( $guard['warnings'] ) ) {
+		$response['content_warnings'] = $guard['warnings'];
+	}
+	if ( array() !== $enriched ) {
+		$response['enrichment'] = $enriched;
+	}
+	return $response;
+}
+
+/**
+ * Args for aafm/replace-in-post.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_replace_in_post(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/replace-in-post' ),
+		'description'         => aafm_ability_description( 'aafm/replace-in-post' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the post to edit.', 'agent-abilities-for-mcp' ),
+				),
+				'search'  => array(
+					'type'        => 'string',
+					'minLength'   => 1,
+					'description' => __( 'Literal text to find in the post content. Matched as-is, not as a regular expression.', 'agent-abilities-for-mcp' ),
+				),
+				'replace' => array(
+					'type'        => 'string',
+					'description' => __( 'Literal text to substitute for every match of search. Sanitized the same way as a full content update.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id', 'search', 'replace' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'post'         => array( 'type' => 'object' ),
+				'replacements' => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_replace_in_post',
+		'permission_callback' => 'aafm_perm_replace_in_post',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/replace-in-post: per-object edit_post on the target post - the
+ * established edit chokepoint. Reuses aafm_can_edit_post_object (floor + allowlist +
+ * map_meta_cap + current_user_can edit_post).
+ *
+ * @param array<string,mixed> $input Ability input.
+ * @return bool
+ */
+function aafm_perm_replace_in_post( array $input ): bool {
+	$id   = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$post = $id ? aafm_exact_object( 'post', $id ) : null;
+	return $post instanceof WP_Post && aafm_can_edit_post_object( $post ) && aafm_post_tool_reach_allowed( $post, 'update' );
+}
+
+/**
+ * The HTML elements core's tokenizer consumes whole, body and all, as a single token.
+ *
+ * These are the raw-text and RCDATA elements. Their contents are never markup and never child
+ * tokens, so the body is reported as the element's own modifiable text rather than as separate
+ * text tokens between an opener and a closer - the element has no closer in the token stream at
+ * all. Anything spliced into one of these bodies is therefore invisible to a comparison that only
+ * looks at tag names and attributes, which is exactly how an earlier regression happened.
+ *
+ * Taken from the switch in WP_HTML_Tag_Processor that decides which openers to skip past whole,
+ * not from memory. Verified identical on the WP 6.9 floor and on 7.0. NOSCRIPT is deliberately
+ * absent: the Tag Processor parses with the scripting flag disabled and descends into it, so its
+ * contents arrive as ordinary tokens and are already covered.
+ *
+ * @return array<string,true> Uppercase tag names, as a lookup.
+ */
+function aafm_html_raw_text_elements(): array {
+	return array(
+		'SCRIPT'   => true,
+		'TEXTAREA' => true,
+		'TITLE'    => true,
+		'IFRAME'   => true,
+		'NOEMBED'  => true,
+		'NOFRAMES' => true,
+		'STYLE'    => true,
+		'XMP'      => true,
+	);
+}
+
+/**
+ * The attributes of the token a processor is parked on, in a stable comparable form.
+ *
+ * @param WP_HTML_Tag_Processor $processor Processor parked on a tag token.
+ * @return string
+ */
+function aafm_html_token_attributes( WP_HTML_Tag_Processor $processor ): string {
+	$attributes = array();
+	foreach ( (array) $processor->get_attribute_names_with_prefix( '' ) as $name ) {
+		$value = $processor->get_attribute( (string) $name );
+		// A boolean attribute reads as true; keep the distinction from an empty string.
+		$attributes[ (string) $name ] = is_string( $value ) ? $value : wp_json_encode( $value );
+	}
+	ksort( $attributes );
+
+	return (string) wp_json_encode( $attributes );
+}
+
+/**
+ * A flat signature of every NON-text token, from core's tokenizer.
+ *
+ * Built on WP_HTML_Tag_Processor, which reads the byte stream without building a tree. That makes
+ * it the half that never gives up: it has no unsupported markup, and it still reports tokens a
+ * tree builder would discard. What it cannot do is tell an SVG or MathML subtree from HTML, which
+ * is what the tree signature is for.
+ *
+ * Raw-text bodies are part of this signature. Leaving them out is what let a splice inside a
+ * SCRIPT or TITLE body through while every gate stayed green.
+ *
+ * Text tokens are excluded: changing text is the entire point of this ability. What must survive
+ * untouched is the structure around the text, which is everything else.
+ *
+ * @param string $html Document to tokenize.
+ * @return array<int,string>|null One comparable string per non-text token, or null if the document
+ *                                ran out mid-token and the tokenizer could not finish it.
+ */
+function aafm_html_flat_signature( string $html ): ?array {
+	$processor = new WP_HTML_Tag_Processor( $html );
+	$raw_text  = aafm_html_raw_text_elements();
+	$signature = array();
+
+	while ( $processor->next_token() ) {
+		$type = (string) $processor->get_token_type();
+		if ( '#text' === $type ) {
+			continue;
+		}
+
+		if ( '#tag' === $type ) {
+			$name  = strtoupper( (string) $processor->get_tag() );
+			$entry = 'tag:' . strtolower( $name )
+				. ':' . ( $processor->is_tag_closer() ? 'close' : 'open' )
+				. ':' . ( $processor->has_self_closing_flag() ? 'self' : '-' )
+				. ':' . aafm_html_token_attributes( $processor );
+
+			if ( isset( $raw_text[ $name ] ) && ! $processor->is_tag_closer() ) {
+				$entry .= ':body=' . $processor->get_modifiable_text();
+			}
+
+			$signature[] = $entry;
+			continue;
+		}
+
+		// Comments, doctype, CDATA-ish and funky tokens: their own text is part of the structure,
+		// because ending a comment early turns whatever followed it into live markup.
+		$signature[] = $type . ':' . $processor->get_modifiable_text();
+	}
+
+	// A document that ran out mid-token yields a truncated signature. Refuse rather than compare
+	// two truncations against each other.
+	return $processor->paused_at_incomplete_token() ? null : $signature;
+}
+
+/**
+ * A tree-aware signature of every NON-text token, from core's full HTML processor.
+ *
+ * WP_HTML_Processor implements the actual parsing algorithm, so unlike the tag processor it knows
+ * which namespace each token is in and preserves the self-closing flag where the spec honours it.
+ *
+ * Be precise about what that is worth here, because it is easy to claim too much for it. Measured
+ * against the corpus by removing this half and re-running, what it uniquely contributes is the
+ * ability to REFUSE: it knows when core declines to parse a document, and the flat tokenizer never
+ * does. The foreign-content rows are already caught by exact equality on the flat signature, and
+ * removing the namespace or the self-closing flag from this signature currently fails no row at
+ * all. Both are kept because they close a named gap by construction and cost nothing, not because
+ * anything here has been shown to depend on them.
+ *
+ * It is used ALONGSIDE the flat signature, not instead of it. The tree builder discards tokens the
+ * flat pass still reports, and the flat pass catches a document that runs out mid-token, which
+ * this one does not. Each covers the other's blind spot and a replacement must satisfy both.
+ *
+ * @param string $html Document to parse.
+ * @return array<int,string>|null One comparable string per non-text token, or null if the document
+ *                                could not be parsed with confidence.
+ */
+function aafm_html_tree_signature( string $html ): ?array {
+	$processor = WP_HTML_Processor::create_fragment( $html );
+	if ( ! $processor instanceof WP_HTML_Processor ) {
+		return null;
+	}
+
+	$raw_text  = aafm_html_raw_text_elements();
+	$signature = array();
+
+	while ( $processor->next_token() ) {
+		$type = (string) $processor->get_token_type();
+		if ( '#text' === $type ) {
+			continue;
+		}
+
+		$namespace = $processor->get_namespace();
+
+		if ( '#tag' === $type ) {
+			$name  = strtoupper( (string) $processor->get_tag() );
+			$entry = 'tag:' . $namespace . ':' . strtolower( $name )
+				. ':' . ( $processor->is_tag_closer() ? 'close' : 'open' )
+				. ':' . ( $processor->has_self_closing_flag() ? 'self' : '-' )
+				. ':d' . $processor->get_current_depth()
+				. ':' . aafm_html_token_attributes( $processor );
+
+			if ( 'html' === $namespace && isset( $raw_text[ $name ] ) && ! $processor->is_tag_closer() ) {
+				$entry .= ':body=' . $processor->get_modifiable_text();
+			}
+
+			$signature[] = $entry;
+			continue;
+		}
+
+		$signature[] = $type . ':' . $namespace . ':' . $processor->get_modifiable_text();
+	}
+
+	// Core raises WP_HTML_Unsupported_Exception internally for markup it declines to parse and
+	// surfaces it here. A partial parse is not evidence of anything, so refuse instead.
+	return null === $processor->get_last_error() ? $signature : null;
+}
+
+/**
+ * Whether the replacement changed the document's text and nothing else.
+ *
+ * The test is exact equality of both signatures, not an accounting of what grew. That is the
+ * whole point of this revision. The previous version allowed the token count to grow by whatever
+ * the replacement contributed and then checked that the original tokens still appeared in order -
+ * which is satisfiable by a splice that breaks out of an SVG subtree and re-opens it, because the
+ * originals do all survive and the arithmetic balances. Demanding that the structure be IDENTICAL
+ * removes that whole class of evasion, and it makes the property provable by reading the function
+ * rather than by reasoning about what an attacker can make the numbers add up to.
+ *
+ * The cost is deliberate and worth stating: a replacement that introduces markup is now refused
+ * even when the markup is harmless and survives wp_kses_post(), because introducing markup is by
+ * definition a structural change. Text goes in, text comes out; a caller that wants to change
+ * markup should edit the content directly. That trade buys a guard whose guarantee can be checked
+ * rather than argued.
+ *
+ * FAILS CLOSED. If either tokenizer cannot finish the document with confidence, this returns false
+ * and the replacement is refused. A false alarm costs the caller one rejected edit; a false
+ * reassurance on this surface stores markup that runs in every visitor's browser.
+ *
+ * @param string $before Original content.
+ * @param string $after  Content with the replacement applied.
+ * @return bool
+ */
+function aafm_replacement_preserves_structure( string $before, string $after ): bool {
+	$builders = array( 'aafm_html_flat_signature', 'aafm_html_tree_signature' );
+
+	foreach ( $builders as $builder ) {
+		$original = $builder( $before );
+		$result   = $builder( $after );
+
+		if ( null === $original || null === $result || $original !== $result ) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/**
+ * Execute aafm/replace-in-post.
+ *
+ * Literal str_replace (no regex - avoids ReDoS/injection). Counts occurrences of the
+ * search term BEFORE replacing.
+ *
+ * Two requirements pull against each other here, and the resolution is worth stating because
+ * either one alone produces a bug this ability has already shipped.
+ *
+ * Sanitizing only the inserted text is not enough. wp_kses_post() judges the replacement in
+ * isolation, and `x" onmouseover="alert(1)" data-z="` contains no tags at all, so kses returns it
+ * unchanged and is right to. Spliced into an existing attribute value it closes that attribute and
+ * opens an event handler, and the assembled document was never looked at again.
+ *
+ * Sanitizing the assembled document is not available either. That is what this used to do, and a
+ * one-word edit silently stripped an unfiltered_html user's markup everywhere else in the post
+ * while reporting success. The invariant that no byte outside the replaced
+ * spans changes is not negotiable.
+ *
+ * So the assembled document is VALIDATED rather than rewritten. Both versions are parsed twice -
+ * once flatly with WP_HTML_Tag_Processor, once as a tree with WP_HTML_Processor - and their
+ * non-text structure must come out IDENTICAL. A replacement in ordinary body text satisfies that
+ * and goes through with the rest of the post untouched. One that lands in a tag, an attribute, a
+ * comment, a raw-text body or a foreign-content subtree does not, and neither does one that brings
+ * markup of its own. Refusing keeps both properties above; rewriting would have to give one up.
+ *
+ * The comparison is built on core's parsers rather than a hand-rolled scan because the first
+ * attempt at this was wrong in BOTH directions at once. It ended a tag at the first
+ * `>` even inside a quoted attribute value, so the break-out splice still went through, and it
+ * treated a literal `<` in prose as a tag opener, so ordinary sentences were refused. An evadable
+ * refusal is worse than no refusal, because it reads as protection. Quote state, raw-text elements
+ * and the rule that `<` only opens a tag before a letter are exactly what a spec parser already
+ * handles.
+ *
+ * What the second attempt got wrong is worth naming too, because it was subtler and the commit
+ * message asserted the opposite. Core's tokenizer does isolate a SCRIPT or TITLE body correctly;
+ * the signature built on top of it then threw that body away, so a splice inside one was invisible.
+ * Being right about the library says nothing about the code calling it. The corpus in
+ * tests/abilities/ReplaceInPostStructureTest.php now pins every case any version of this guard has
+ * ever protected, so the next rewrite fails loudly instead of silently dropping one.
+ *
+ * The guard's bound, stated rather than implied: it decides whether the document's STRUCTURE
+ * changed. It does not judge whether the resulting text is safe wherever that text ends up, and it
+ * makes no claim about content this ability never touches.
+ *
+ * Note what this does NOT rely on: core's kses save filters. kses_init() attaches
+ * wp_filter_post_kses only for users who LACK unfiltered_html, and on a standard single site both
+ * editors and administrators hold it, while the permission callback asks only for edit_post. An
+ * earlier version of this docblock cited those filters as a safety net; they are not one for
+ * anybody who can actually reach this ability.
+ *
+ * Only post_content is written - status is never touched, so this inherits nothing
+ * status-related and can never publish/unpublish. A search term that does not occur is a
+ * no-op (replacements:0) returning the unchanged post, not an error.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_replace_in_post( array $input ) {
+	$id   = absint( $input['post_id'] );
+	$post = aafm_exact_object_chain( 'post', $id );
+	if ( ! $post instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+
+	$owning_builder = aafm_post_has_foreign_builder_ownership( $id );
+	if ( false !== $owning_builder ) {
+		return aafm_page_builder_owned_error( $owning_builder );
+	}
+
+	$search  = (string) $input['search'];
+	$replace = (string) $input['replace'];
+	$content = (string) $post->post_content;
+
+	// Count occurrences against the original body; '' search is barred by schema minLength.
+	$replacements = substr_count( $content, $search );
+
+	if ( 0 === $replacements ) {
+		// No-op: return the unchanged post with a zero count, never an error.
+		return array(
+			'post'         => aafm_redact_post( $post ),
+			'replacements' => 0,
+		);
+	}
+
+	$inserted = wp_kses_post( $replace );
+	$new      = str_replace( $search, $inserted, $content );
+
+	// Compare the assembled document's structure against the original before writing anything.
+	// Sanitizing the inserted text cannot settle this on its own: it is judged in isolation, where
+	// it is harmless, and only becomes an attribute break-out once spliced.
+	if ( ! aafm_replacement_preserves_structure( $content, $new ) ) {
+		return new WP_Error(
+			'aafm_replace_inside_markup',
+			__( 'That replacement would change the structure of the page rather than its text. Either the search term sits inside markup (a tag, an attribute value, an HTML comment, a script or style block, or an SVG) or the replacement introduces markup of its own. Nothing was changed. Choose a search term that appears in the visible body text and a replacement that is plain text, or edit the content directly. To change one whole block, use aafm-replace-block if it is enabled.', 'agent-abilities-for-mcp' ),
+			array( 'status' => 400 )
+		);
+	}
+
+	// Guard the rewritten markup so a replacement cannot silently introduce editor-invalid blocks.
+	$guard = aafm_block_guard_evaluate( $new );
+	if ( $guard['error'] instanceof WP_Error ) {
+		return $guard['error'];
+	}
+
+	$result = wp_update_post(
+		wp_slash(
+			array(
+				'ID'           => $id,
+				'post_content' => $new,
+			)
+		),
+		true
+	);
+	if ( is_wp_error( $result ) ) {
+		return aafm_generic_error();
+	}
+
+	$updated = aafm_exact_object( 'post', (int) $result );
+	// Only is_wp_error() was checked here, so a wp_insert_post_data filter
+	// that vetoed or reverted the content would report the pre-computed replacement count as
+	// though it had landed. Confirm the exact intended content actually made it to storage,
+	// matching Avada's replace-text fix. Compare against the
+	// CANONICAL sanitize_post_field() form, not $new itself, so a legitimate normalization (kses
+	// for a user without unfiltered_html re-running over the whole assembled document) is not
+	// mistaken for a veto.
+	if ( ! $updated instanceof WP_Post || ! aafm_post_field_confirm_logged( $id, 'post_content', $new, $content ) ) {
+		return new WP_Error(
+			'aafm_replace_write_unconfirmed',
+			__( 'The replacement could not be confirmed as saved.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	$response = array(
+		'post'         => aafm_redact_post( $updated ),
+		'replacements' => $replacements,
+	);
+	if ( ! empty( $guard['warnings'] ) ) {
+		$response['content_warnings'] = $guard['warnings'];
+	}
+	return $response;
+}
+
+/**
+ * Args for aafm/replace-block.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_replace_block(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/replace-block' ),
+		'description'         => aafm_ability_description( 'aafm/replace-block' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id'      => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the post or page to edit.', 'agent-abilities-for-mcp' ),
+				),
+				'path'         => array(
+					'type'        => 'array',
+					'minItems'    => 1,
+					'maxItems'    => 10,
+					'items'       => array(
+						'type'    => 'integer',
+						'minimum' => 0,
+					),
+					'description' => __( 'Index path to the block, from 0: its position among the top-level blocks, then among each parent\'s inner blocks. Only real blocks count, not the blank lines between them. [2, 0] is the first block inside the third top-level block.', 'agent-abilities-for-mcp' ),
+				),
+				'markup'       => array(
+					'type'        => 'string',
+					'minLength'   => 1,
+					'description' => __( 'The complete markup of exactly one replacement block, from its opening delimiter to its closing one.', 'agent-abilities-for-mcp' ) . ' ' . aafm_write_content_description(),
+				),
+				'expect_block' => array(
+					'type'        => 'string',
+					'description' => __( 'Optional block name, such as core/group, that the block at path must have. The write is refused if the name differs. Only the name is compared, not the content, so it does not guard against another edit to a neighbouring block of the same type.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id', 'path', 'markup' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'post'             => array( 'type' => 'object' ),
+				'replaced'         => array(
+					'type'       => 'object',
+					'properties' => array(
+						'path'  => array(
+							'type'  => 'array',
+							'items' => array( 'type' => 'integer' ),
+						),
+						'block' => array( 'type' => 'string' ),
+					),
+				),
+				'content_warnings' => array( 'type' => 'array' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_replace_block',
+		'permission_callback' => 'aafm_perm_update_post',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/replace-block: swap one block, found by its path over named blocks.
+ *
+ * Same calls in the same order as aafm_exec_replace_in_post(): ownership guard, build the new
+ * content, block guard, wp_update_post(), then confirm the stored content against its canonical
+ * form, so a vetoing wp_insert_post_data filter is reported rather than mistaken for success.
+ *
+ * The page is rebuilt with serialize_blocks() from its parsed tree, so only the replacement is
+ * sanitized here. Re-sanitizing the whole page would strip an unfiltered_html author's markup in
+ * every other block, the bug replace-in-post already fixed once. Every other block keeps its parsed
+ * attributes and HTML; its delimiter JSON may be re-encoded in canonical form, as the block editor
+ * does on every save, so a page already in canonical form keeps every byte outside the replaced
+ * block. A page whose parsed tree does not survive that round trip (a block with invalid delimiter
+ * JSON loses its attributes) is refused instead. For a user without unfiltered_html, core's own
+ * kses re-sanitizes the whole saved page, the same as that user's own editor.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_replace_block( array $input ) {
+	$id   = absint( $input['post_id'] );
+	$post = aafm_exact_object_chain( 'post', $id );
+	if ( ! $post instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+
+	$owning_builder = aafm_post_has_foreign_builder_ownership( $id );
+	if ( false !== $owning_builder ) {
+		return aafm_page_builder_owned_error( $owning_builder );
+	}
+
+	$old  = (string) $post->post_content;
+	$tree = parse_blocks( $old );
+	if ( parse_blocks( serialize_blocks( $tree ) ) !== $tree ) {
+		return new WP_Error(
+			'aafm_not_round_trippable',
+			__( 'This post\'s block markup does not survive being re-serialized (for example, a block has invalid attribute JSON), so one block cannot be replaced safely. Nothing was changed. Use aafm-update-post to rewrite the whole content instead.', 'agent-abilities-for-mcp' ),
+			array( 'status' => 400 )
+		);
+	}
+
+	// Walk the path over named blocks only; $list is the block list holding the current step.
+	$path  = array_map( 'intval', (array) $input['path'] );
+	$list  = &$tree;
+	$found = null;
+	foreach ( $path as $depth => $index ) {
+		$named = array_keys( array_filter( $list, static fn( array $block ): bool => null !== $block['blockName'] ) );
+		if ( 0 === $depth && array() === $named ) {
+			return new WP_Error(
+				'aafm_block_path_not_found',
+				__( 'This post has no blocks to address by path. Nothing was changed. Use aafm-update-post to replace its content.', 'agent-abilities-for-mcp' ),
+				array( 'status' => 400 )
+			);
+		}
+		if ( ! isset( $named[ $index ] ) ) {
+			return new WP_Error(
+				'aafm_block_path_not_found',
+				sprintf(
+					/* translators: 1: level in the path, counted from 1; 2: number of blocks at that level. */
+					__( 'No block at that path. Level %1$d of the path has %2$d blocks, counted from 0 and skipping the blank lines between blocks. Nothing was changed.', 'agent-abilities-for-mcp' ),
+					$depth + 1,
+					count( $named )
+				),
+				array( 'status' => 400 )
+			);
+		}
+		$found = $named[ $index ];
+		if ( $depth < count( $path ) - 1 ) {
+			$list = &$list[ $found ]['innerBlocks'];
+		}
+	}
+
+	$current = (string) $list[ $found ]['blockName'];
+	if ( isset( $input['expect_block'] ) && (string) $input['expect_block'] !== $current ) {
+		return new WP_Error(
+			'aafm_block_mismatch',
+			sprintf(
+				/* translators: %s: block name found at the path. */
+				__( 'The block at that path is %s, not the expected block. Nothing was changed.', 'agent-abilities-for-mcp' ),
+				$current
+			),
+			array( 'status' => 400 )
+		);
+	}
+
+	$sanitized   = aafm_kses_block_markup( (string) $input['markup'] );
+	$replacement = array();
+	foreach ( parse_blocks( $sanitized['content'] ) as $block ) {
+		if ( null !== $block['blockName'] || '' !== trim( (string) $block['innerHTML'] ) ) {
+			$replacement[] = $block;
+		}
+	}
+	if ( 1 !== count( $replacement ) || null === $replacement[0]['blockName'] ) {
+		return new WP_Error(
+			'aafm_replacement_not_one_block',
+			__( 'The markup must be exactly one block, from its opening delimiter to its closing one, with nothing else around it. Nothing was changed.', 'agent-abilities-for-mcp' ),
+			array( 'status' => 400 )
+		);
+	}
+
+	// The parent's innerContent keeps its null slot, so only the innerBlocks entry changes.
+	$list[ $found ] = $replacement[0];
+	unset( $list );
+	$new = serialize_blocks( $tree );
+
+	$guard = aafm_block_guard_evaluate( $new );
+	if ( $guard['error'] instanceof WP_Error ) {
+		return $guard['error'];
+	}
+
+	$result = wp_update_post(
+		wp_slash(
+			array(
+				'ID'           => $id,
+				'post_content' => $new,
+			)
+		),
+		true
+	);
+	if ( is_wp_error( $result ) ) {
+		return aafm_generic_error();
+	}
+
+	$updated = aafm_exact_object( 'post', (int) $result );
+	if ( ! $updated instanceof WP_Post || ! aafm_post_field_confirm_logged( $id, 'post_content', $new, $old ) ) {
+		return new WP_Error(
+			'aafm_replace_block_write_unconfirmed',
+			__( 'The replaced block could not be confirmed as saved.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	$response = array(
+		'post'     => aafm_redact_post( $updated ),
+		'replaced' => array(
+			'path'  => $path,
+			'block' => (string) $replacement[0]['blockName'],
+		),
+	);
+	$warnings = array_merge( $sanitized['warnings'], $guard['warnings'] );
+	if ( ! empty( $warnings ) ) {
+		$response['content_warnings'] = $warnings;
+	}
+	return $response;
+}
+
+/**
+ * The upper bound on how many posts a single aafm/replace-sitewide call touches (or
+ * previews, in dry-run). Mirrors AAFM_LIST_PER_PAGE_MAX's role for list abilities.
+ */
+const AAFM_REPLACE_SITEWIDE_MAX_POSTS = 50;
+
+/**
+ * The upper bound on how many raw SQL matches a single call will examine (get_post() + a
+ * permission/ownership check each) while filling AAFM_REPLACE_SITEWIDE_MAX_POSTS's editable-
+ * candidate budget. Without a ceiling here, a search term matching
+ * an enormous number of posts the caller cannot edit (all owned by someone else, all sitting
+ * before the caller's own editable match in ID order) would scan every one of them looking for
+ * 50 it could act on - unbounded work driven entirely by how the matches happen to be
+ * distributed, not by anything the caller controls. This does not add pagination or a
+ * continuation cursor (the locked contract for this ability deliberately has neither); it only
+ * bounds the worst case to a fixed amount of scanning per call, same as the editable-candidate
+ * cap already bounds the worst case of actual writing.
+ */
+const AAFM_REPLACE_SITEWIDE_MAX_SCAN = 5000;
+
+/**
+ * Args for aafm/replace-sitewide.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_replace_sitewide(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/replace-sitewide' ),
+		'description'         => aafm_ability_description( 'aafm/replace-sitewide' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'search'    => array(
+					'type'        => 'string',
+					'minLength'   => 1,
+					'description' => __( 'Literal text to find. Matched as-is, not as a regular expression.', 'agent-abilities-for-mcp' ),
+				),
+				'replace'   => array(
+					'type'        => 'string',
+					'description' => __( 'Literal text to substitute for every match.', 'agent-abilities-for-mcp' ),
+				),
+				'post_type' => array(
+					'type'        => 'string',
+					'default'     => 'post',
+					'description' => __( 'Slug of an allowlisted content type to scope the replace to. Defaults to post.', 'agent-abilities-for-mcp' ),
+				),
+				'status'    => array(
+					'type'        => 'string',
+					'default'     => 'publish',
+					'description' => __( 'Post status to scope the replace to. Defaults to publish.', 'agent-abilities-for-mcp' ),
+				),
+				'dry_run'   => array(
+					'type'        => 'boolean',
+					'default'     => true,
+					'description' => __( 'When true (the default), previews the match without writing anything. Pass false to apply the change.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'search', 'replace' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'dry_run'                 => array( 'type' => 'boolean' ),
+				'matched_posts'           => array( 'type' => 'integer' ),
+				'updated_posts'           => array( 'type' => 'integer' ),
+				'skipped_no_permission'   => array( 'type' => 'integer' ),
+				'skipped_structure_guard' => array( 'type' => 'integer' ),
+				'skipped_builder_owned'   => array(
+					'type'        => 'integer',
+					'description' => sprintf(
+						/* translators: %s: page builder names, for example Elementor and Divi. */
+						__( 'Matched posts skipped because a foreign page builder (%s) owns their content.', 'agent-abilities-for-mcp' ),
+						aafm_page_builder_names()
+					),
+				),
+				'failed_updates'          => array(
+					'type'        => 'integer',
+					'description' => __( 'Posts that cleared the structure guard but whose wp_update_post() call itself failed. Counted separately from skipped_structure_guard so a real write failure is never indistinguishable from a guard refusal.', 'agent-abilities-for-mcp' ),
+				),
+				'truncated'               => array( 'type' => 'boolean' ),
+				'total_matches'           => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_replace_sitewide',
+		'permission_callback' => 'aafm_perm_edit_posts',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/replace-sitewide.
+ *
+ * The literal-substring match is done in SQL (a posts_where LIKE clause, mirroring the
+ * get-media search pattern in includes/abilities/media.php) rather than fetched-page-then-
+ * filtered-in-PHP: an SQL-side match means pagination and matching happen in the same query, so
+ * a match sitting outside the first AAFM_REPLACE_SITEWIDE_MAX_POSTS rows by ID is never silently
+ * missed from the total - the exact "reported total doesn't match reality" bug class this
+ * release exists to stop repeating. total_matches and truncated are computed from an
+ * unpaginated count of the same WHERE-scoped query before the bounded page is fetched.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_replace_sitewide( array $input ) {
+	$type = aafm_validate_post_type( isset( $input['post_type'] ) ? (string) $input['post_type'] : 'post' );
+	if ( is_wp_error( $type ) ) {
+		return $type;
+	}
+	$type_object = get_post_type_object( $type );
+	$can_private = $type_object instanceof WP_Post_Type && current_user_can( (string) $type_object->cap->read_private_posts );
+	$status      = aafm_validate_post_status( isset( $input['status'] ) ? (string) $input['status'] : 'publish', $can_private );
+	if ( is_wp_error( $status ) ) {
+		return $status;
+	}
+
+	// Someone else's draft, pending or scheduled item is neither counted nor scanned for a user who
+	// may not edit it, so total_matches says nothing about its content.
+	$own_scope = $type_object instanceof WP_Post_Type && aafm_status_needs_own_posts_only( $status, $type_object )
+		? array( 'author__in' => array( get_current_user_id() ) )
+		: array();
+
+	$search  = (string) $input['search'];
+	$replace = (string) $input['replace'];
+	$dry_run = ! array_key_exists( 'dry_run', $input ) || (bool) $input['dry_run'];
+
+	// An unscoped 'posts_where' filter runs against EVERY WP_Query
+	// built while it's attached, not only this function's own two queries below - an unrelated
+	// nested query (fired from any hook during either query) would silently receive this same
+	// LIKE clause. A private, per-call marker in the query args (harmless to core - unrecognized
+	// keys are ignored when building SQL, but still readable via $query->get()) scopes the filter
+	// to this function's own queries only.
+	$query_marker = 'aafm_replace_sitewide_' . wp_generate_password( 12, false, false );
+	$like_filter  = static function ( string $where, WP_Query $query ) use ( $search, $query_marker ): string {
+		if ( $query_marker !== $query->get( 'aafm_query_marker' ) ) {
+			return $where;
+		}
+		global $wpdb;
+		// BINARY forces a byte-exact, case- and accent-sensitive comparison, matching PHP's
+		// str_replace() semantics exactly. Without it MySQL's default collation makes LIKE
+		// case-insensitive, so a search for "quick" would SQL-match "Quick", get selected and
+		// counted as a match, str_replace() would then leave it byte-for-byte unchanged, and
+		// wp_update_post() would still run and be counted as an update - a silent no-op inflating
+		// updated_posts and total_matches alike.
+		// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name is an internal constant ($wpdb->posts).
+		return $where . $wpdb->prepare(
+			" AND {$wpdb->posts}.post_content LIKE BINARY %s",
+			'%' . $wpdb->esc_like( $search ) . '%'
+		);
+	};
+
+	// That scan had no ceiling of its own, so a search term matching
+	// an enormous number of non-editable posts could force scanning all of them (get_post() plus
+	// two checks each) looking for AAFM_REPLACE_SITEWIDE_MAX_POSTS editable ones -
+	// AAFM_REPLACE_SITEWIDE_MAX_SCAN bounds that worst case; see its own docblock for why this is
+	// not the continuation cursor the locked contract deliberately omits. Filterable so a test can
+	// prove the scan actually stops without creating thousands of posts to reach the real default
+	// - the same pattern already used for the GeoDirectory list batch size.
+	$max_scan = max( 1, (int) apply_filters( 'aafm_replace_sitewide_max_scan', AAFM_REPLACE_SITEWIDE_MAX_SCAN ) );
+
+	add_filter( 'posts_where', $like_filter, 10, 2 );
+	try {
+		// The real total used to come from fetching EVERY matching id
+		// unpaginated (posts_per_page => -1) - for a search term matching an enormous number of
+		// posts, that alone materializes an enormous id array before any scanning even starts.
+		// WP_Query computes an exact row count via its own single SELECT COUNT(*) whenever
+		// no_found_rows is false, regardless of posts_per_page, so a 1-row probe query gets the
+		// real total without ever fetching the matching ids themselves.
+		$count_probe   = new WP_Query(
+			array(
+				'post_type'         => $type,
+				'post_status'       => $status,
+				'fields'            => 'ids',
+				'posts_per_page'    => 1,
+				'no_found_rows'     => false,
+				'aafm_query_marker' => $query_marker,
+			) + $own_scope
+		);
+		$total_matches = (int) $count_probe->found_posts;
+		$truncated     = $total_matches > AAFM_REPLACE_SITEWIDE_MAX_POSTS;
+
+		// The actual candidate-scanning fetch is bounded to $max_scan ids by the query itself -
+		// The earlier fix (scan in ID order, fill the cap with EDITABLE,
+		// non-builder-owned candidates only; a skipped post costs nothing against the cap) still
+		// applies to this bounded list, it just no longer needs an enormous unbounded one to work
+		// from.
+		// The scan's ids feed writes, and WP_Query's own get_col() hands back the previous query's
+		// rows when the SELECT fails without flushing. So the scan runs its built SQL through
+		// aafm_wpdb_col() and a failure refuses the request. Attached at PHP_INT_MAX around the scan
+		// only (never the count probe), and an earlier posts_pre_query answer is passed through
+		// untouched (ledger s14hunta-4).
+		$scan_failed = false;
+		$scan_filter = static function ( $posts, WP_Query $query ) use ( $query_marker, &$scan_failed ) {
+			if ( null !== $posts || $query_marker !== $query->get( 'aafm_query_marker' ) ) {
+				return $posts;
+			}
+			$ids = aafm_wpdb_col( (string) $query->request );
+			if ( ! $ids['ok'] ) {
+				$scan_failed = true;
+				return array();
+			}
+			return array_map( 'intval', (array) $ids['value'] );
+		};
+		add_filter( 'posts_pre_query', $scan_filter, PHP_INT_MAX, 2 );
+		try {
+			$scan_query = new WP_Query(
+				array(
+					'post_type'         => $type,
+					'post_status'       => $status,
+					'fields'            => 'ids',
+					'posts_per_page'    => $max_scan,
+					'orderby'           => 'ID',
+					'order'             => 'ASC',
+					'no_found_rows'     => true,
+					'aafm_query_marker' => $query_marker,
+				) + $own_scope
+			);
+		} finally {
+			remove_filter( 'posts_pre_query', $scan_filter, PHP_INT_MAX );
+		}
+	} finally {
+		remove_filter( 'posts_where', $like_filter, 10 );
+	}
+
+	if ( $scan_failed ) {
+		return aafm_generic_error();
+	}
+
+	// An SQL-side `LIMIT AAFM_REPLACE_SITEWIDE_MAX_POSTS` applied
+	// BEFORE permission/builder-ownership filtering meant that enough non-editable matching posts
+	// sitting earlier in ID order could occupy the entire cap, so the caller's own editable match
+	// was never even fetched, let alone processed - repeating the call selected the exact same
+	// unreachable window every time. Scan the bounded id list above in ID order and fill the cap
+	// with EDITABLE, non-builder-owned candidates only; a skipped post costs nothing against it.
+	$candidates    = array();
+	$no_perm       = 0;
+	$builder_owned = 0;
+	$failed        = 0;
+	/**
+	 * With 'fields' => 'ids' the query returns ids; the WP_Query stub types ->posts as WP_Post[].
+	 *
+	 * @var int[] $post_ids
+	 */
+	$post_ids = $scan_query->posts;
+	foreach ( $post_ids as $post_id ) {
+		if ( count( $candidates ) >= AAFM_REPLACE_SITEWIDE_MAX_POSTS ) {
+			break;
+		}
+		$post = aafm_exact_object_chain( 'post', $post_id );
+		if ( ! $post instanceof WP_Post ) {
+			// A post that does not load could not be updated, in a dry run as well.
+			++$failed;
+			continue;
+		}
+		if ( $type !== $post->post_type || $status !== $post->post_status ) {
+			// Outside the requested scope: a filtered scan answer, or a post changed since the scan.
+			++$failed;
+			continue;
+		}
+		$can_edit = aafm_can_edit_post_object_state( $post );
+		if ( null === $can_edit ) {
+			// The capability check could not load the post's metadata, so nothing was decided.
+			++$failed;
+			continue;
+		}
+		if ( ! $can_edit || ! aafm_post_tool_reach_allowed( $post, 'update' ) ) {
+			// A type whose own update tool is off is skipped like a post this user can't edit.
+			++$no_perm;
+			continue;
+		}
+		$owning_builder = aafm_post_has_foreign_builder_ownership( $post->ID );
+		if ( false !== $owning_builder ) {
+			++$builder_owned;
+			continue;
+		}
+		$candidates[] = $post;
+	}
+
+	$updated = 0;
+	$guarded = 0;
+
+	foreach ( $candidates as $post ) {
+		// Guards run identically in dry-run and a real apply, so a preview's counters are an
+		// honest forecast of what applying would do - only the actual write is skipped below.
+		$inserted = wp_kses_post( $replace );
+		$new      = str_replace( $search, $inserted, (string) $post->post_content );
+		if ( $new === (string) $post->post_content ) {
+			// Defensive: the SQL-side LIKE BINARY match and str_replace() should always agree,
+			// but if a match somehow produces no actual byte change, treat it as guarded rather
+			// than silently reporting a successful update that touched nothing.
+			++$guarded;
+			continue;
+		}
+		if ( ! aafm_replacement_preserves_structure( (string) $post->post_content, $new ) ) {
+			++$guarded;
+			continue;
+		}
+		$guard = aafm_block_guard_evaluate( $new );
+		if ( $guard['error'] instanceof WP_Error ) {
+			++$guarded;
+			continue;
+		}
+
+		if ( $dry_run ) {
+			continue; // Counted in matched_posts below; nothing written.
+		}
+		// An earlier write in this loop drops its post from the cache, and that post can be this
+		// one's parent, so load the chain again right before core walks it.
+		$reloaded = aafm_exact_object_chain( 'post', (int) $post->ID );
+		if ( ! $reloaded instanceof WP_Post || $type !== $reloaded->post_type || $status !== $reloaded->post_status ) {
+			++$failed;
+			continue;
+		}
+
+		// One change row per post, all sharing the call's group. Finished in the finally below, so the
+		// error, the confirm miss and the success all settle the row.
+		$undo_child = aafm_undo_begin_object( 'aafm/replace-sitewide', 'post', (int) $post->ID, array( 'post:post_content' ), array( 'post_id' => (int) $post->ID ) );
+		try {
+			$result = wp_update_post(
+				wp_slash(
+					array(
+						'ID'           => $post->ID,
+						'post_content' => $new,
+					)
+				),
+				true
+			);
+			if ( is_wp_error( $result ) ) {
+				++$failed;
+				continue;
+			}
+			// is_wp_error() alone does not catch a wp_insert_post_data filter
+			// that vetoes or reverts the content, which would count a post as updated when nothing
+			// actually changed. Confirm the exact intended content landed, matching the single-post
+			// replace-text fix above. Compare against the CANONICAL
+			// sanitize_post_field() form, not $new itself, so a legitimate normalization is not
+			// mistaken for a veto.
+			$after = aafm_exact_object( 'post', (int) $result );
+			if ( ! $after instanceof WP_Post || ! aafm_post_field_confirm_logged( $post->ID, 'post_content', $new, (string) $post->post_content ) ) {
+				++$failed;
+				continue;
+			}
+			++$updated;
+		} finally {
+			aafm_undo_finish_object( $undo_child );
+		}
+	}
+
+	return array(
+		'dry_run'                 => $dry_run,
+		'matched_posts'           => count( $candidates ),
+		'updated_posts'           => $updated,
+		'skipped_no_permission'   => $no_perm,
+		'skipped_structure_guard' => $guarded,
+		'skipped_builder_owned'   => $builder_owned,
+		'failed_updates'          => $failed,
+		'truncated'               => $truncated,
+		'total_matches'           => $total_matches,
+	);
+}
+
+/**
+ * Args for aafm/update-cpt-item.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_update_cpt_item(): array {
+	$schema                          = aafm_write_content_schema( false );
+	$schema['properties']['post_id'] = array(
+		'type'        => 'integer',
+		'minimum'     => 1,
+		'description' => __( 'ID of the content item to update.', 'agent-abilities-for-mcp' ),
+	);
+	$schema['required']              = array( 'post_id' );
+
+	return array(
+		'label'               => aafm_ability_label( 'aafm/update-cpt-item' ),
+		'description'         => aafm_ability_description( 'aafm/update-cpt-item' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => $schema,
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'post'       => array( 'type' => 'object' ),
+				'enrichment' => aafm_write_enrichment_output_schema(),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_update_cpt_item',
+		'permission_callback' => 'aafm_perm_update_cpt_item',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/update-cpt-item: per-object edit on a type that clears the floor+allowlist
+ * AND is map_meta_cap (via aafm_can_edit_post_object), plus the type's publish cap when the
+ * request asks to publish. The post_id resolves the type, so no post_type arg is needed here -
+ * editing is per-object and the object knows its own type.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_update_cpt_item( array $input ): bool {
+	$id   = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$post = $id ? aafm_exact_object( 'post', $id ) : null;
+	if ( ! $post instanceof WP_Post || ! aafm_can_edit_post_object( $post ) || ! aafm_post_tool_reach_allowed( $post, 'update', '' ) ) {
+		return false;
+	}
+	if ( isset( $input['status'] ) && aafm_status_requires_publish_cap( (string) $input['status'] ) ) {
+		$caps = aafm_type_caps( $post->post_type );
+		return $caps['object'] instanceof WP_Post_Type
+			&& current_user_can( (string) $caps['object']->cap->publish_posts );
+	}
+	return true;
+}
+
+/**
+ * Execute aafm/update-cpt-item.
+ *
+ * Loads the target, re-validates its post_type against the allowlist+floor at execute time
+ * (defense in depth against a de-allowlist race), then delegates to the existing, type-generic
+ * aafm_exec_update_post() so the CPT update inherits status validation, content sanitization,
+ * the force-draft public-status coercion, and the C2 enrichment with no duplicated logic.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_update_cpt_item( array $input ) {
+	$id   = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$post = $id ? aafm_exact_object( 'post', $id ) : null;
+	if ( ! $post instanceof WP_Post || is_wp_error( aafm_validate_post_type( $post->post_type ) ) ) {
+		return aafm_generic_error();
+	}
+	// The per-type publish gate is enforced in aafm_perm_update_cpt_item(), which the Abilities API
+	// always runs before execute, so this executor intentionally does not re-check the publish cap.
+	return aafm_exec_update_post( $input );
+}
+
+/**
+ * Args for aafm/trash-post.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_trash_post(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/trash-post' ),
+		'description'         => aafm_ability_description( 'aafm/trash-post' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the post to move to trash.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array( 'trashed' => array( 'type' => 'boolean' ) ),
+		),
+		'execute_callback'    => 'aafm_exec_trash_post',
+		'permission_callback' => 'aafm_perm_trash_post',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/trash-post: per-object delete_post.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_trash_post( array $input ): bool {
+	$id   = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$post = $id ? aafm_exact_object( 'post', $id ) : null;
+	return $post instanceof WP_Post && aafm_can_delete_post_object( $post ) && aafm_post_tool_reach_allowed( $post, 'trash' );
+}
+
+/**
+ * Execute aafm/trash-post - wp_trash_post only (recoverable), never wp_delete_post.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_trash_post( array $input ) {
+	if ( ! aafm_trash_is_enabled() ) {
+		return aafm_trash_disabled_error();
+	}
+	$id   = absint( $input['post_id'] );
+	$post = aafm_exact_object_chain( 'post', $id );
+	if ( ! $post instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+	if ( 'trash' === $post->post_status ) {
+		return aafm_already_trashed_error( $post );
+	}
+	$ok = wp_trash_post( $id );
+	if ( ! $ok ) {
+		return aafm_generic_error();
+	}
+	return array( 'trashed' => true );
+}
+
+/**
+ * The refusal for trashing something already in the Trash. The status is only named to a caller who can read
+ * that post; anyone else gets the generic answer, so the message cannot confirm the state of a post they
+ * cannot see.
+ *
+ * The tools for content types that sit outside the generic post exposure list (reusable blocks, events)
+ * pass $own_gate: their permission callback already demanded a per-object delete capability on this very
+ * item, which is the stronger check, and the generic list would refuse a type those tools legitimately own.
+ *
+ * @param WP_Post $post     The post that is already in the Trash.
+ * @param bool    $own_gate True when the calling tool's own per-object permission already vouched for the caller.
+ * @return WP_Error
+ */
+function aafm_already_trashed_error( WP_Post $post, bool $own_gate = false ): WP_Error {
+	if ( ! $own_gate && ! aafm_can_read_post_object( $post ) ) {
+		return aafm_generic_error();
+	}
+	return new WP_Error(
+		'aafm_already_trashed',
+		__( 'That item is already in the Trash, so nothing was changed.', 'agent-abilities-for-mcp' ),
+		array( 'status' => 400 )
+	);
+}
+
+/**
+ * Args for aafm/delete-post.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_delete_post(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/delete-post' ),
+		'description'         => aafm_ability_description( 'aafm/delete-post' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the post to permanently delete. This bypasses the Trash; there is no undo.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array( 'deleted' => array( 'type' => 'boolean' ) ),
+		),
+		'execute_callback'    => 'aafm_exec_delete_post',
+		'permission_callback' => 'aafm_perm_delete_post',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/delete-post: per-object delete_post (mirrors aafm_perm_trash_post).
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_delete_post( array $input ): bool {
+	$id   = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$post = $id ? aafm_exact_object( 'post', $id ) : null;
+	return $post instanceof WP_Post && aafm_can_delete_post_object( $post ) && aafm_post_tool_reach_allowed( $post, 'delete' );
+}
+
+/**
+ * The single sanctioned force-delete executor: the only wp_delete_post(...,true) call site
+ * in the abilities layer. delete-page delegates here with the page type pinned, so pages.php
+ * never force-deletes directly - proven by SecurityRegressionTest::test_no_force_delete_in_source,
+ * which sanctions only this file. Callers must have already capability-checked the id.
+ *
+ * Naming note: "force_delete" mirrors WordPress's own `wp_delete_post( $id, $force_delete = true )`
+ * argument - it means "bypass the Trash and delete permanently," NOT "bypass the capability
+ * guard." The permission callback (aafm_perm_delete_post / aafm_perm_delete_page) has already
+ * run before any caller reaches here; this function performs no capability check of its own.
+ *
+ * @param int    $id            Post id (already capability-checked by the caller).
+ * @param string $expected_type Post type to pin (e.g. 'page'), or '' to accept any.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_force_delete_post( int $id, string $expected_type = '' ) {
+	$post = $id ? aafm_exact_object( 'post', $id ) : null;
+	if ( ! $post instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+	if ( '' !== $expected_type && $expected_type !== $post->post_type ) {
+		return aafm_generic_error();
+	}
+	$result = wp_delete_post( $id, true );
+	// wp_delete_post() documents false|null on failure, but a pre_delete_post veto can
+	// short-circuit it to any falsy value a plugin returns. Guard on "not a WP_Post"
+	// rather than "exactly false", so an unrecognized veto is never mistaken for success.
+	if ( ! ( $result instanceof WP_Post ) ) {
+		return aafm_generic_error();
+	}
+	return array( 'deleted' => true );
+}
+
+/**
+ * Execute aafm/delete-post - force-deletes through the single shared executor.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_delete_post( array $input ) {
+	return aafm_force_delete_post( absint( $input['post_id'] ?? 0 ) );
+}

@@ -1,0 +1,1123 @@
+<?php
+/**
+ * Comment abilities: reads, moderation, and the full CRUD set
+ * (get / create / update / delete, plus the moderation queue and actions).
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter( 'aafm_abilities_registry', 'aafm_register_comments_definitions' );
+
+/**
+ * Contribute comment ability definitions to the registry (reads).
+ *
+ * @param array<string,array<string,mixed>> $registry Registry.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_comments_definitions( array $registry ): array {
+	$registry['aafm/get-comments']         = array(
+		'label'        => __( 'Get comments', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'List approved comments for a post, or across the whole site when post_id is omitted (email and IP are never returned). The whole-site listing is scanned up to an internal cap before pagination; truncated: true means that cap was hit, so total is a floor rather than an exact count.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'comments',
+		'args_builder' => 'aafm_args_get_comments',
+	);
+	$registry['aafm/get-pending-comments'] = array(
+		'label'        => __( 'Get pending comments', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'List the moderation queue (requires moderate_comments).', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'comments',
+		'args_builder' => 'aafm_args_get_pending_comments',
+	);
+	$registry['aafm/moderate-comment']     = array(
+		'label'        => __( 'Moderate comment', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Approve, unapprove, spam, or trash a comment (requires moderate_comments).', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'comments',
+		'args_builder' => 'aafm_args_moderate_comment',
+	);
+	$registry['aafm/get-comment']          = array(
+		'label'        => __( 'Get comment', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Read one comment by id (email and IP are never returned). status is usually approved/unapproved/spam/trash; a comment whose parent post is trashed reports status post-trashed. The comment itself was never trashed, its post was.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'comments',
+		'args_builder' => 'aafm_args_get_comment',
+	);
+	$registry['aafm/create-comment']       = array(
+		'label'        => __( 'Create comment', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Add a pending comment to a post as the agent user (requires moderate_comments).', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'comments',
+		'args_builder' => 'aafm_args_create_comment',
+	);
+	$registry['aafm/update-comment']       = array(
+		'label'        => __( 'Update comment', 'agent-abilities-for-mcp' ),
+		'description'  => __( "Edit a comment's content (requires edit access to that comment). The returned comment's status is usually approved/unapproved/spam/trash; because this ability re-reads the comment with no status filter, it can also report post-trashed when the comment's parent post is trashed. The comment itself was never trashed, its post was.", 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'comments',
+		'args_builder' => 'aafm_args_update_comment',
+	);
+	$registry['aafm/delete-comment']       = array(
+		'label'        => __( 'Delete comment', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Permanently delete a comment (not recoverable; use moderate-comment to trash recoverably).', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'destructive',
+		'subject'      => 'comments',
+		'args_builder' => 'aafm_args_delete_comment',
+	);
+	return $registry;
+}
+
+/**
+ * Args for aafm/get-comments.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_comments(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-comments' ),
+		'description'         => aafm_ability_description( 'aafm/get-comments' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				array(
+					'post_id' => array(
+						'type'        => 'integer',
+						'minimum'     => 1,
+						'description' => __( 'ID of the post to list comments for. Omit to list approved comments across the whole site, filtered to posts you can read; if given, the post must exist and you must be able to read it.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_pagination_schema_props(
+					AAFM_LIST_PER_PAGE_MAX,
+					__( 'Number of comments per page, clamped to the 1-50 range regardless of the value requested. Defaults to 10 when omitted.', 'agent-abilities-for-mcp' ),
+					__( '1-based page number for pagination. Defaults to 1.', 'agent-abilities-for-mcp' ),
+					true
+				)
+			),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'comments'  => array(
+					'type'  => 'array',
+					'items' => array( 'type' => 'object' ),
+				),
+				'total'     => array( 'type' => 'integer' ),
+				'truncated' => array( 'type' => 'boolean' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_comments',
+		'permission_callback' => 'aafm_perm_get_comments',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/get-comments: per-object post visibility.
+ *
+ * A comment is only as visible as the post it belongs to. Approved comments on a
+ * public, non-password-protected post are readable by any logged-in caller; for
+ * every other post (draft, private, scheduled, pending, password-protected, or
+ * unknown) the caller must be able to read the post itself. This closes the gap
+ * where a low-privilege agent could pass a hidden post's id and read its approved
+ * comment bodies and author names.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_get_comments( array $input ): bool {
+	$post_id = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+
+	// No post targeted: the whole-site approved listing is readable by any logged-in
+	// caller. The execute callback post-filters the results to comments whose parent
+	// post the caller can read, so a hidden post's approved comments never leak.
+	if ( $post_id <= 0 ) {
+		return current_user_can( 'read' );
+	}
+
+	if ( ! aafm_exact_object( 'post', $post_id ) instanceof WP_Post ) {
+		// Default-deny on a missing post so the ability can't probe for ids.
+		return false;
+	}
+
+	return aafm_comment_post_is_readable( $post_id );
+}
+
+/**
+ * Scan ceiling for aafm_exec_get_comments()'s whole-site, unprivileged branch.
+ *
+ * That branch used to ask get_comments() for one DB page, THEN drop
+ * comments on unreadable posts - so a readable comment could be pushed off page 1 (or off
+ * every page) by unreadable ones consuming its slot, with no `total` and no truncation
+ * signal to tell the caller a readable result was stranded further in. Comments are now
+ * fetched in one bounded, unpaginated scan (default id/date order preserved), filtered by
+ * post readability, and only THEN paginated - the same authorize-before-paginate fix
+ * already applied to GeoDirectory listings. The filter is narrow-only (matching
+ * aafm_geodirectory_listing_batch_cap()'s own posture) so a hook can lower the cap for a
+ * test without ever raising it past the hard ceiling.
+ *
+ * ponytail: 2000 is a flat, deliberate ceiling on a single call, not a true site-wide
+ * limit - a subscriber's own site-wide comment feed rarely needs to look past the newest
+ * couple thousand approved comments. If a real site needs this branch to page reliably
+ * past that many comments on hidden posts, replace this single bounded scan with
+ * GeoDirectory's batched keyset loop (includes/abilities/geodirectory.php) instead of
+ * just raising the number.
+ *
+ * @return int
+ */
+function aafm_comments_sitewide_scan_cap(): int {
+	return min( 2000, max( 1, (int) apply_filters( 'aafm_comments_sitewide_scan_cap', 2000 ) ) );
+}
+
+/**
+ * Execute aafm/get-comments.
+ *
+ * Returns APPROVED comments only. The status filter is pinned server-side so a
+ * low-privilege caller can never reach a pending, spam, or trashed comment body
+ * through this ability - unapproved bodies are only available via
+ * aafm/get-pending-comments, which requires moderate_comments.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>
+ */
+function aafm_exec_get_comments( array $input ): array {
+	$paging  = aafm_paginate_args( $input, AAFM_LIST_PER_PAGE_MAX );
+	$post_id = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+
+	// A moderate_comments caller sees every comment anyway, and a post-scoped query is
+	// already gated by the permission callback on that one post's readability, so neither
+	// branch can hide a readable result behind an unreadable one - DB-side pagination stays
+	// correct and cheap for both.
+	if ( $post_id > 0 || current_user_can( 'moderate_comments' ) ) {
+		$comments = get_comments(
+			array(
+				'post_id' => $post_id,
+				'status'  => 'approve',
+				'number'  => $paging['per_page'],
+				'paged'   => $paging['page'],
+			)
+		);
+
+		return array(
+			'comments'  => aafm_redact_comments( $comments ),
+			'total'     => (int) get_comments(
+				array(
+					'post_id' => $post_id,
+					'status'  => 'approve',
+					'count'   => true,
+				)
+			),
+			'truncated' => false,
+		);
+	}
+
+	// Whole-site listing, unprivileged caller: a comment whose parent post they can't read
+	// must never occupy a page slot or count toward `total`. Scan up to the cap in one
+	// unpaginated fetch, filter to readable posts, THEN paginate/count the readable set -
+	// see aafm_comments_sitewide_scan_cap() for why this must run before pagination rather
+	// than after it.
+	$raw_total = (int) get_comments(
+		array(
+			'status' => 'approve',
+			'count'  => true,
+		)
+	);
+
+	if ( 0 === $raw_total ) {
+		return array(
+			'comments'  => array(),
+			'total'     => 0,
+			'truncated' => false,
+		);
+	}
+
+	$scan_cap        = aafm_comments_sitewide_scan_cap();
+	$is_readable     = static fn( $comment ): bool => $comment instanceof WP_Comment
+		&& aafm_comment_post_is_readable( (int) $comment->comment_post_ID );
+	$may_be_readable = static fn( $comment ): bool => $comment instanceof WP_Comment
+		&& false !== aafm_comment_post_readable_state( (int) $comment->comment_post_ID );
+	$scanned         = get_comments(
+		array(
+			'status' => 'approve',
+			'number' => min( $raw_total, $scan_cap ),
+		)
+	);
+
+	$visible = array_values( array_filter( (array) $scanned, $is_readable ) );
+
+	// `truncated` must be computed from what THIS caller can see, not the raw site-wide scan.
+	// Every earlier predicate - comparing raw_total against scan_cap, requiring the
+	// whole window to be visible, a bounded second-window lookahead sized or OFFSET from a count
+	// that includes hidden rows - shared the same flaw: inserting or removing ONE hidden comment
+	// anywhere before a count-based boundary shifts every comment after it by one position, which
+	// can push a genuinely visible comment across whichever boundary the predicate was watching,
+	// flipping `truncated` on content the caller never saw and never asked about.
+	//
+	// So probe by IDENTITY, not by count/offset. `comment__not_in` excludes exactly the
+	// comment ids already examined, so the next probe batch is always "whatever wasn't already
+	// looked at", regardless of how many hidden comments were inserted or removed anywhere in the
+	// approved set - unlike an offset, an id exclusion list cannot be shifted by unrelated rows.
+	// Walk forward in bounded batches (mirrors aafm_exec_geodirectory_get_listings()'s own
+	// keyset-based disambiguation probe) until a readable comment resolves this true, a batch
+	// comes back short of what was asked for (proving no more approved comments exist at all,
+	// resolving this false), or a small reserve of probe batches is exhausted without resolving
+	// either way - at which point, as with that same GeoDirectory probe, an unresolved state
+	// reports true rather than assert a "nothing more" the scan never actually confirmed. For the
+	// same reason a readability check that could not decide counts as readable in the probe only,
+	// while the list above still omits every comment it could not prove readable.
+	$truncated = false;
+	if ( count( (array) $scanned ) < $raw_total ) {
+		$ids_of    = static fn( array $comments ): array => array_map(
+			static fn( $comment ): int => $comment instanceof WP_Comment ? (int) $comment->comment_ID : 0,
+			$comments
+		);
+		$excluded  = $ids_of( (array) $scanned );
+		$probe_cap = 2; // Small, fixed reserve - see the docblock above for why an unresolved probe defaults to true rather than growing without bound.
+		for ( $i = 0; $i < $probe_cap; $i++ ) {
+			$probe = get_comments(
+				array(
+					'status'          => 'approve',
+					'number'          => $scan_cap,
+					'comment__not_in' => $excluded,
+				)
+			);
+			if ( array() !== array_filter( (array) $probe, $may_be_readable ) ) {
+				$truncated = true;
+				break;
+			}
+			if ( count( (array) $probe ) < $scan_cap ) {
+				break; // A short batch proves no more approved comments exist at all: stays false.
+			}
+			$excluded = array_merge( $excluded, $ids_of( (array) $probe ) );
+			if ( $i === $probe_cap - 1 ) {
+				$truncated = true; // Reserve exhausted without resolving either way: unknown, so assume yes.
+			}
+		}
+	}
+
+	$page_comments = array_slice( $visible, ( $paging['page'] - 1 ) * $paging['per_page'], $paging['per_page'] );
+
+	return array(
+		'comments'  => aafm_redact_comments( $page_comments ),
+		// A floor, not an exact count, when truncated: comments past the scan cap were
+		// never examined, so some of them could also be readable.
+		'total'     => count( $visible ),
+		'truncated' => $truncated,
+	);
+}
+
+/**
+ * Whether the current user may read the post a comment belongs to.
+ *
+ * Approved comments on a public, non-password-protected post are readable by any
+ * logged-in caller; for every other post (draft, private, scheduled, pending,
+ * password-protected, or missing) the caller must be able to read the post itself.
+ * This is the per-comment form of the visibility logic in aafm_perm_get_comments().
+ *
+ * @param int $post_id Parent post id.
+ * @return bool
+ */
+function aafm_comment_post_is_readable( int $post_id ): bool {
+	return true === aafm_comment_post_readable_state( $post_id );
+}
+
+/**
+ * Whether the current user may read the post a comment belongs to, as true, false, or null when
+ * the check could not decide.
+ *
+ * False means the post is certainly unreadable: an id of 0, a post whose row is certainly absent,
+ * a revision whose parent row is certainly absent (core denies that case), or a capability check
+ * that answered no. Null means a load or the checked-read scope failed, so nothing was proved.
+ *
+ * @param int $post_id Parent post id.
+ * @return bool|null
+ */
+function aafm_comment_post_readable_state( int $post_id ): ?bool {
+	if ( $post_id <= 0 ) {
+		return false;
+	}
+
+	$post = aafm_exact_object_chain( 'post', $post_id );
+	if ( ! $post instanceof WP_Post ) {
+		if ( aafm_object_absent( 'post', $post_id ) ) {
+			return false;
+		}
+		$node = aafm_exact_object( 'post', $post_id );
+		if ( $node instanceof WP_Post && 'revision' === $node->post_type && aafm_object_absent( 'post', (int) $node->post_parent ) ) {
+			return false;
+		}
+		return null;
+	}
+
+	$read = aafm_with_checked_reads(
+		static function () use ( $post, $post_id ): array {
+			// A password-protected public post fell straight through to
+			// the read_post branch below, which maps to the ordinary 'read' capability - the password
+			// itself was never checked, so a Subscriber could read approved comments on a password-
+			// protected published post. Matches core's own REST comments controller
+			// (WP_REST_Comments_Controller::get_items_permissions_check()): a still-password-required
+			// post is gated on edit_post, not on merely being able to read the post record.
+			// post_password_required() itself already accounts for the caller having supplied the
+			// password (the post-password cookie), so this only tightens the case that cookie does not
+			// cover.
+			if ( post_password_required( $post ) ) {
+				return array( 'readable' => current_user_can( 'edit_post', $post_id ) );
+			}
+
+			$status_object = get_post_status_object( (string) get_post_status( $post ) );
+			$is_public     = null !== $status_object && ! empty( $status_object->public );
+
+			if ( $is_public ) {
+				return array( 'readable' => current_user_can( 'read' ) );
+			}
+
+			return array( 'readable' => current_user_can( 'read_post', $post_id ) );
+		},
+		aafm_generic_error()
+	);
+
+	return is_wp_error( $read ) ? null : true === $read['readable'];
+}
+
+/**
+ * Redact a list of comment results to safe public shapes.
+ *
+ * A get_comments() result can be comment IDs or objects depending on the query;
+ * keep only WP_Comment instances before redacting so no partial record leaks.
+ *
+ * @param mixed $comments Result of get_comments().
+ * @return array<int,array<string,mixed>>
+ */
+function aafm_redact_comments( $comments ): array {
+	$objects = array_filter(
+		(array) $comments,
+		static fn( $comment ): bool => $comment instanceof WP_Comment
+	);
+
+	return array_values( array_map( 'aafm_redact_comment', $objects ) );
+}
+
+/**
+ * Args for aafm/get-comment.
+ *
+ * One comment by id, returned in the same redacted shape as the list reads - never
+ * the author email or IP. The read is gated by the parent post's visibility, exactly
+ * like aafm/get-comments, so an approved comment on a hidden post never leaks.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_comment(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-comment' ),
+		'description'         => aafm_ability_description( 'aafm/get-comment' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'comment_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the comment to read. An approved comment on a public, non-password-protected post is visible to any logged-in caller; anything else (pending, spam, trashed, or on a hidden post) requires moderation rights on this comment. An unknown ID returns a generic error rather than confirming which IDs exist.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'comment_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'comment' => array( 'type' => 'object' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_comment',
+		'permission_callback' => 'aafm_perm_get_comment',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/get-comment.
+ *
+ * A comment is only as visible as the post it belongs to. Approved comments on a
+ * public, non-password-protected post are readable by any logged-in caller; every
+ * other comment (pending, spam, trash, or on a hidden post) requires the caller to
+ * be able to read that post AND to moderate/edit the comment - the same posture as
+ * aafm/get-comments, refined to a single object. A missing comment default-denies
+ * so the ability can't be used to probe for ids.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_get_comment( array $input ): bool {
+	$id = isset( $input['comment_id'] ) ? absint( $input['comment_id'] ) : 0;
+	if ( $id <= 0 ) {
+		return current_user_can( 'read' );
+	}
+
+	$comment = aafm_exact_object_chain( 'comment', $id );
+	if ( ! $comment instanceof WP_Comment ) {
+		// Default-deny on a missing comment so the ability can't probe for ids -
+		// the same posture as aafm_perm_get_comments() for a missing target post.
+		return false;
+	}
+
+	$post_id     = (int) $comment->comment_post_ID;
+	$is_approved = '1' === (string) $comment->comment_approved || 'approve' === (string) $comment->comment_approved;
+
+	// Approved comment on a readable post: the same floor as the list read.
+	if ( $is_approved && aafm_comment_post_is_readable( $post_id ) ) {
+		return true;
+	}
+
+	// Non-approved (hold/spam/trash) or on a hidden post: require moderation rights
+	// on the specific comment.
+	return current_user_can( 'moderate_comments' ) && aafm_user_can_checked( 'edit_comment', $id );
+}
+
+/**
+ * Execute aafm/get-comment.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_get_comment( array $input ) {
+	$id      = isset( $input['comment_id'] ) ? absint( $input['comment_id'] ) : 0;
+	$comment = aafm_exact_object( 'comment', $id );
+	if ( ! $comment instanceof WP_Comment ) {
+		return aafm_generic_error();
+	}
+	return array( 'comment' => aafm_redact_comment( $comment ) );
+}
+
+/**
+ * Args for aafm/create-comment.
+ *
+ * Security posture (this is the main abuse surface):
+ *  - Floor cap is moderate_comments: an autonomous agent posting comments is a
+ *    privileged moderation action, not an anonymous public comment. This blocks a
+ *    low-cap caller from mass-creating spam.
+ *  - The author is ALWAYS the current (agent) user. No comment_author,
+ *    comment_author_email, author_url, or comment_author_IP is accepted from input,
+ *    so identity can never be spoofed or used as an injection vector.
+ *  - Content is run through wp_kses_post() and wp_filter_comment() before insert, so
+ *    raw script is never stored.
+ *  - The comment is created PENDING (comment_approved '0'); a human or
+ *    aafm/moderate-comment approves it. An agent never auto-publishes.
+ *  - comment_post_ID must resolve to a real post. Optional parent must be a real
+ *    comment ON THE SAME POST. comments_open() is deliberately not required -
+ *    moderators add to closed threads in the dashboard and the cap floor gates abuse.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_create_comment(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/create-comment' ),
+		'description'         => aafm_ability_description( 'aafm/create-comment' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the post to comment on. Must be a real post; creating the comment requires the moderate-comments capability regardless of who owns the post.', 'agent-abilities-for-mcp' ),
+				),
+				'content' => array(
+					'type'        => 'string',
+					'minLength'   => 1,
+					// Character cap, not a byte cap: WordPress stores comment_content in a TEXT
+					// column (~65,535 BYTES). A comment of multi-byte (UTF-8) characters can still
+					// exceed the byte limit even under this length, so the DB write is the final
+					// guard; this bound just rejects the obviously-oversized payload up front.
+					'maxLength'   => 65525,
+					'description' => __( 'Comment body. Sanitized with wp_kses_post, so scripts are stripped but basic HTML survives. The comment is always created pending; it is never auto-published, even for a caller who could otherwise approve comments.', 'agent-abilities-for-mcp' ),
+				),
+				'parent'  => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of an existing comment to reply to. Must already be a comment on the same post; a comment from a different post is refused. Omit for a top-level comment.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id', 'content' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'comment' => array( 'type' => 'object' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_create_comment',
+		'permission_callback' => 'aafm_perm_create_comment',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/create-comment: moderate_comments.
+ *
+ * An agent creating comments is treated as a moderation-class action. The single
+ * site-wide cap is the gate; there is no per-object refinement because the author is
+ * pinned to the current user, not a target the caller might not own. Every denial is
+ * audited by the registration wrapper.
+ *
+ * @return bool
+ */
+function aafm_perm_create_comment(): bool {
+	return current_user_can( 'moderate_comments' );
+}
+
+/**
+ * Execute aafm/create-comment.
+ *
+ * Builds the insert array from the current user (never from input), sanitizes the
+ * content, forces pending status, validates the target post and optional parent, runs
+ * the array through wp_filter_comment(), and inserts. Returns the redacted comment.
+ *
+ * Two deliberate choices worth calling out:
+ *  - The post-insert wp_set_comment_status( $id, 'hold' ) pin is intentional. Even if a
+ *    filter on insert flips the status, the comment must land in the moderation queue;
+ *    an agent should never auto-publish its own comment.
+ *  - wp_insert_comment() bypasses wp_allow_comment()'s duplicate / flood / disallowed-key
+ *    checks. That is acceptable here precisely because the caller already holds
+ *    moderate_comments - this is a moderation action, not an anonymous public submission.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_create_comment( array $input ) {
+	$post_id = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$parent  = isset( $input['parent'] ) ? absint( $input['parent'] ) : 0;
+	$content = isset( $input['content'] ) ? wp_kses_post( (string) $input['content'] ) : '';
+
+	if ( '' === trim( $content ) ) {
+		return aafm_generic_error();
+	}
+
+	$post = aafm_exact_object( 'post', $post_id );
+	if ( ! $post instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+
+	// An optional parent must be a real comment on the SAME post - no cross-post threading.
+	if ( $parent > 0 ) {
+		$parent_comment = aafm_exact_object( 'comment', $parent );
+		if ( ! $parent_comment instanceof WP_Comment || (int) $parent_comment->comment_post_ID !== $post_id ) {
+			return aafm_generic_error();
+		}
+	}
+
+	$user = wp_get_current_user();
+	if ( ! $user instanceof WP_User || 0 === (int) $user->ID ) {
+		return aafm_generic_error();
+	}
+
+	// Author identity is the agent user - never free-form input. Status is pending.
+	// wp_slash() the strings: wp_insert_comment() expects slashed data and unslashes
+	// internally, matching the post-writer convention elsewhere in the plugin.
+	$commentdata = array(
+		'comment_post_ID'      => $post_id,
+		'comment_parent'       => $parent,
+		'comment_content'      => wp_slash( $content ),
+		'comment_author'       => wp_slash( (string) $user->display_name ),
+		'comment_author_email' => wp_slash( (string) $user->user_email ),
+		'comment_author_url'   => '',
+		'user_id'              => (int) $user->ID,
+		'comment_approved'     => '0',
+		'comment_type'         => 'comment',
+		// Present but empty: wp_filter_comment() reads these keys, and we never record
+		// the agent's IP/user-agent for an agent-authored comment. Neither is ever
+		// returned - the response is built by aafm_redact_comment().
+		'comment_author_IP'    => '',
+		'comment_agent'        => '',
+	);
+
+	// Apply WordPress's own comment filters (pre_comment_content / kses) as a second pass.
+	$commentdata = wp_filter_comment( $commentdata );
+
+	$comment_id = wp_insert_comment( $commentdata );
+	if ( ! $comment_id ) {
+		return aafm_generic_error();
+	}
+
+	// Pin status to pending in case a filter flipped it on insert.
+	wp_set_comment_status( $comment_id, 'hold' );
+
+	// wp_set_comment_status()'s return value was discarded here, and only
+	// existence was checked afterward - so if its own DB update failed, or a 'wp_set_comment_status'
+	// hook it fires (synchronously, before it returns) moved the comment somewhere other than
+	// pending, this reported success with an approved (or otherwise non-pending) comment,
+	// contradicting the pending-queue guarantee this function exists to enforce. Read the actual
+	// stored status back and require it to be pending ('0', the literal value wp_set_comment_status()
+	// itself writes for 'hold' - wp-includes/comment.php) rather than trusting the call succeeded.
+	$created = aafm_comment_readback( (int) $comment_id );
+	if ( null === $created || '0' !== $created->comment_approved ) {
+		return aafm_generic_error();
+	}
+
+	return array( 'comment' => aafm_redact_comment( $created ) );
+}
+
+/**
+ * Args for aafm/get-pending-comments.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_pending_comments(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-pending-comments' ),
+		'description'         => aafm_ability_description( 'aafm/get-pending-comments' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => aafm_pagination_schema_props(
+				AAFM_LIST_PER_PAGE_MAX,
+				__( 'Number of comments per page, clamped to the 1-50 range regardless of the value requested. Defaults to 10 when omitted.', 'agent-abilities-for-mcp' ),
+				__( '1-based page number for pagination. Defaults to 1.', 'agent-abilities-for-mcp' ),
+				true
+			),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'comments' => array(
+					'type'  => 'array',
+					'items' => array( 'type' => 'object' ),
+				),
+				'total'    => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_pending_comments',
+		'permission_callback' => 'aafm_perm_moderate_comments',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for the moderation queue: moderate_comments.
+ *
+ * This is the only gate to unapproved comment bodies. A caller without
+ * moderate_comments is denied (and the denial is audited by the registration
+ * wrapper) before any pending/spam content is read.
+ *
+ * @return bool
+ */
+function aafm_perm_moderate_comments(): bool {
+	return current_user_can( 'moderate_comments' );
+}
+
+/**
+ * Execute aafm/get-pending-comments (moderation queue).
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>
+ */
+function aafm_exec_get_pending_comments( array $input ): array {
+	$paging   = aafm_paginate_args( $input, AAFM_LIST_PER_PAGE_MAX );
+	$comments = get_comments(
+		array(
+			'status' => 'hold',
+			'number' => $paging['per_page'],
+			'paged'  => $paging['page'],
+		)
+	);
+
+	$total = (int) get_comments(
+		array(
+			'status' => 'hold',
+			'count'  => true,
+		)
+	);
+
+	return array(
+		'comments' => aafm_redact_comments( $comments ),
+		'total'    => $total,
+	);
+}
+
+
+/**
+ * Args for aafm/moderate-comment.
+ *
+ * Moderation only - this write never edits the comment content or author. The
+ * action is constrained to a closed allowlist by the input schema, and again at
+ * execute, so an arbitrary status can never be set.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_moderate_comment(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/moderate-comment' ),
+		'description'         => aafm_ability_description( 'aafm/moderate-comment' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'comment_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the comment to moderate. The caller must hold moderate-comments and be able to edit this specific comment.', 'agent-abilities-for-mcp' ),
+				),
+				'action'     => array(
+					'type'        => 'string',
+					'enum'        => array( 'approve', 'unapprove', 'spam', 'trash' ),
+					'description' => __( 'Moderation action: approve (publish the comment), unapprove (return it to the pending queue), spam (mark as spam), or trash (move to the Trash).', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'comment_id', 'action' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'status' => array( 'type' => 'string' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_moderate_comment',
+		'permission_callback' => 'aafm_perm_moderate_comment_obj',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/moderate-comment: moderate_comments, then per-object edit.
+ *
+ * The site-wide moderate_comments cap is the floor; on top of it the caller must
+ * be able to edit the specific comment (edit_comment maps through the post's
+ * edit caps), so a moderator can't act on a comment they couldn't touch in the
+ * dashboard. Every denial is audited by the registration wrapper.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_moderate_comment_obj( array $input ): bool {
+	if ( ! current_user_can( 'moderate_comments' ) ) {
+		return false;
+	}
+	$id = isset( $input['comment_id'] ) ? absint( $input['comment_id'] ) : 0;
+	return $id > 0 && aafm_exact_object_chain( 'comment', $id ) instanceof WP_Comment && aafm_user_can_checked( 'edit_comment', $id );
+}
+
+/**
+ * Execute aafm/moderate-comment.
+ *
+ * Applies one moderation action from the closed allowlist. Destructive actions
+ * are trash/spam only - both recoverable - never a permanent wp_delete_comment.
+ * The action is re-validated here so the switch's default branch hard-fails any
+ * value that somehow bypassed the schema.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_moderate_comment( array $input ) {
+	$id     = isset( $input['comment_id'] ) ? absint( $input['comment_id'] ) : 0;
+	$action = isset( $input['action'] ) ? sanitize_key( (string) $input['action'] ) : '';
+
+	if ( ! aafm_exact_object( 'comment', $id ) instanceof WP_Comment ) {
+		return aafm_generic_error();
+	}
+
+	switch ( $action ) {
+		case 'approve':
+			wp_set_comment_status( $id, 'approve' );
+			$target_approved = '1';
+			break;
+		case 'unapprove':
+			wp_set_comment_status( $id, 'hold' );
+			$target_approved = '0';
+			break;
+		case 'spam':
+			wp_spam_comment( $id );
+			$target_approved = 'spam';
+			break;
+		case 'trash':
+			if ( ! aafm_trash_is_enabled() ) {
+				// wp_trash_comment() force-deletes when the Trash is disabled;
+				// refuse rather than permanently destroy the comment.
+				return aafm_trash_disabled_error();
+			}
+			wp_trash_comment( $id );
+			$target_approved = 'trash';
+			break;
+		default:
+			return new WP_Error(
+				'aafm_invalid_action',
+				__( 'Unsupported moderation action.', 'agent-abilities-for-mcp' )
+			);
+	}
+
+	// This used to branch on each call's own return value ($ok) - true only
+	// proves wp_set_comment_status()'s (or wp_spam_comment()'s/wp_trash_comment()'s, both thin
+	// wrappers around it) OWN $wpdb->update() call landed. It fires the 'wp_set_comment_status'
+	// action synchronously, AFTER that update succeeds but BEFORE returning, so a hook on that
+	// action (an anti-spam plugin, a second moderation rule, a plugin that hard-deletes the row)
+	// can move or remove the comment again before control returns here - leaving the discarded
+	// return value true while the actual stored status is something else entirely. The only signal
+	// this function can trust is a fresh read taken after every hook has already run, compared
+	// against what was actually requested - never a return value from mid-pipeline.
+	$comment = aafm_comment_readback( $id );
+	if ( null === $comment ) {
+		return aafm_generic_error();
+	}
+
+	// A same-value request (moderating a comment already in the requested state) is a legitimate
+	// no-op, not an error: the final read already matches $target_approved either way, so it is
+	// reported as success without needing to know whether the underlying UPDATE actually changed a
+	// row (MySQL reports 0 affected rows for a same-value UPDATE, WordPress does not set
+	// CLIENT_FOUND_ROWS, and that path is indistinguishable from a real failure by row count alone).
+	if ( $comment->comment_approved !== $target_approved ) {
+		return aafm_generic_error();
+	}
+
+	// aafm_comment_status_string(), not wp_get_comment_status() raw: the output schema declares
+	// 'status' => type:string, but wp_get_comment_status() falls through to boolean false whenever
+	// get_comment() can't resolve the id at read time - the 'post-trashed' value is one such case
+	// and is mapped by the helper.
+	return array( 'status' => aafm_comment_status_string( $comment ) );
+}
+
+/**
+ * Args for aafm/update-comment.
+ *
+ * Edits ONLY the comment body. The closed schema accepts comment_id + content; it
+ * never accepts comment_post_ID, email, IP, or author fields, so an edit can't be
+ * used to re-target, re-author, or de-redact a comment. Content is sanitized before
+ * the update. The moderate_comments floor plus per-object edit_comment is the gate.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_update_comment(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/update-comment' ),
+		'description'         => aafm_ability_description( 'aafm/update-comment' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'comment_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the comment to edit. Requires moderate-comments plus edit access to this specific comment.', 'agent-abilities-for-mcp' ),
+				),
+				'content'    => array(
+					'type'        => 'string',
+					'minLength'   => 1,
+					// Character cap, not a byte cap: WordPress stores comment_content in a TEXT
+					// column (~65,535 BYTES). A comment of multi-byte (UTF-8) characters can still
+					// exceed the byte limit even under this length, so the DB write is the final
+					// guard; this bound just rejects the obviously-oversized payload up front.
+					'maxLength'   => 65525,
+					'description' => __( 'New comment body. Sanitized with wp_kses_post. Only the body changes here; the parent post, author, email, and IP can never be altered through this ability.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'comment_id', 'content' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'comment' => array( 'type' => 'object' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_update_comment',
+		'permission_callback' => 'aafm_perm_edit_comment_obj',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Per-object edit gate shared by update-comment and delete-comment.
+ *
+ * The site-wide moderate_comments cap is the floor - the same posture as
+ * aafm_perm_moderate_comment_obj() - so a low-cap user who happens to be able to
+ * edit their own comment can never reach these writes. On top of the floor the caller
+ * must be able to edit the specific comment (edit_comment maps through the parent
+ * post's edit caps), so a moderator can't touch a comment they couldn't edit in the
+ * dashboard. A missing id denies. Every denial is audited by the registration wrapper.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return bool
+ */
+function aafm_perm_edit_comment_obj( array $input ): bool {
+	if ( ! current_user_can( 'moderate_comments' ) ) {
+		return false;
+	}
+	$id = isset( $input['comment_id'] ) ? absint( $input['comment_id'] ) : 0;
+	return $id > 0 && aafm_exact_object_chain( 'comment', $id ) instanceof WP_Comment && aafm_user_can_checked( 'edit_comment', $id );
+}
+
+/**
+ * Execute aafm/update-comment.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_update_comment( array $input ) {
+	$id      = isset( $input['comment_id'] ) ? absint( $input['comment_id'] ) : 0;
+	$content = isset( $input['content'] ) ? wp_kses_post( (string) $input['content'] ) : '';
+
+	if ( ! aafm_exact_object( 'comment', $id ) instanceof WP_Comment ) {
+		return aafm_generic_error();
+	}
+	if ( '' === trim( $content ) ) {
+		return aafm_generic_error();
+	}
+
+	// wp_update_comment() unslashes internally, so the content is slashed on the way in
+	// to match the post-writer convention. Only comment_content is written - never the
+	// post id, author, email, or IP.
+	$ok = wp_update_comment(
+		array(
+			'comment_ID'      => $id,
+			'comment_content' => wp_slash( $content ),
+		)
+	);
+
+	// wp_update_comment() returns 1 on success, 0 when unchanged, false/WP_Error on failure.
+	if ( false === $ok || is_wp_error( $ok ) ) {
+		return aafm_generic_error();
+	}
+
+	// The comment was confirmed to exist above and the update did not fail, so the re-fetch is
+	// expected to be the fresh, post-update record. But if it comes back null anyway (a hook
+	// deleted the comment, or a cache race), aafm_redact_comment() falls back to array(), which
+	// encodes as [] against the declared object schema, not the {} an empty object needs -
+	// surface a generic error instead of redacting null into a schema-violating empty shape.
+	$saved = aafm_comment_readback( $id );
+	if ( null === $saved ) {
+		return aafm_generic_error();
+	}
+
+	// wp_update_comment() returning a non-false, non-WP_Error value only means the write did not
+	// hard-fail - not that the requested content is what actually landed. A `wp_update_comment_data`
+	// filter can veto the change by rewriting comment_content back to its prior value, and that
+	// return value is exactly what a genuine already-equal no-op also produces,
+	// so the two are indistinguishable without comparing what was actually stored. Compare
+	// the fresh row against the requested content directly: a match covers both a real update and
+	// a true no-op, and only a real divergence is an error.
+	if ( $saved->comment_content !== $content ) {
+		return aafm_generic_error();
+	}
+
+	return array( 'comment' => aafm_redact_comment( $saved ) );
+}
+
+/**
+ * Args for aafm/delete-comment.
+ *
+ * PERMANENT delete (wp_delete_comment with force=true) - this bypasses the Trash and
+ * cannot be undone. It is deliberately distinct from aafm/moderate-comment's 'trash'
+ * action, which is recoverable. risk=destructive, destructive:true, and the disclosure
+ * states the permanence plainly. The moderate_comments floor plus per-object
+ * edit_comment is the gate.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_delete_comment(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/delete-comment' ),
+		'description'         => aafm_ability_description( 'aafm/delete-comment' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'comment_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the comment to permanently delete. This bypasses the Trash and cannot be undone; use moderate-comment\'s trash action instead for a recoverable delete.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'comment_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'deleted'    => array( 'type' => 'boolean' ),
+				'comment_id' => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_delete_comment',
+		'permission_callback' => 'aafm_perm_edit_comment_obj',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/delete-comment.
+ *
+ * Force-deletes via wp_delete_comment( $id, true ): the row is removed, not trashed,
+ * and cannot be recovered. We resolve the comment first (so a missing id is an honest
+ * error, not a silent no-op), then honor the bool return.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_delete_comment( array $input ) {
+	$id = isset( $input['comment_id'] ) ? absint( $input['comment_id'] ) : 0;
+
+	if ( ! aafm_exact_object( 'comment', $id ) instanceof WP_Comment ) {
+		return aafm_generic_error();
+	}
+
+	$deleted = wp_delete_comment( $id, true );
+	if ( ! $deleted ) {
+		return aafm_generic_error();
+	}
+
+	return array(
+		'deleted'    => true,
+		'comment_id' => $id,
+	);
+}

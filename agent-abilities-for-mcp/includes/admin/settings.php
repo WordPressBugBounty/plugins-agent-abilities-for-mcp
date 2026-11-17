@@ -1,0 +1,1391 @@
+<?php
+/**
+ * Settings tab: optional safety controls (rate limit, IP allowlist, force-draft, max title).
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Upper bound shared by the two numeric settings. Both are clamped to this ceiling so a
+ * pasted-in absurd value can never be stored, and both floor at 0 (off) by casting to int
+ * and clamping negatives to zero (absint would flip the sign, so it is not used).
+ */
+const AAFM_SETTINGS_NUMERIC_MAX = 100000;
+
+/**
+ * Sanitize the posted Settings form into a clean, bounded, validated array.
+ *
+ * Every value is coerced to a safe shape regardless of what was posted:
+ * - aafm_rate_limit_per_min, aafm_max_title_len: floored at 0 (negative/garbage -> 0) and
+ *   capped at AAFM_SETTINGS_NUMERIC_MAX. Note max( 0, (int) ) rather than absint(), so a
+ *   negative value clamps down to 0 instead of flipping to its positive magnitude.
+ * - aafm_force_draft, aafm_high_risk_abilities_unlocked, aafm_read_only_mode: a plain bool from
+ *   presence of the field (unchecked checkbox -> false). Every reader defaults off on a missing
+ *   option, so unlike the OAuth pair below there is nothing to work around: a stored false reads as
+ *   off either way.
+ * - aafm_oauth_enabled: the STRING '1' when the checkbox is present, '0' when absent. The OAuth
+ *   reader treats every falsy stored form as off, so the off state must be the literal '0' string -
+ *   a PHP bool false would not store as false on a never-created option, leaving the toggle stuck
+ *   on. Dynamic client registration is not part of this form: it is saved by the Connection tab's
+ *   lifetimes card, so an absent field here can never turn it off.
+ * - aafm_ip_allowlist: split on newlines, trimmed, blanks dropped, and every surviving line
+ *   must clear aafm_is_valid_ip_or_cidr(). Invalid lines are dropped (fail-closed), so a
+ *   stored non-empty list is always made up entirely of usable entries.
+ *
+ * @param array<string,mixed> $posted Raw $_POST payload (slashes handled by the caller).
+ * @return array{aafm_rate_limit_per_min:int,aafm_max_title_len:int,aafm_log_retention_days:int,aafm_force_draft:bool,aafm_block_guard_strict:bool,aafm_delete_data_on_uninstall:bool,aafm_high_risk_abilities_unlocked:bool,aafm_read_only_mode:bool,aafm_oauth_enabled:string,aafm_site_brief:string,aafm_default_server_mode:string,aafm_notifications:array{mode:string,email:string,triggers:array<string,bool>},aafm_ip_allowlist:list<string>,aafm_oauth_connect_roles:?array<int,string>,aafm_trusted_proxy:?array{mode:string,header:string,ranges:list<string>}}
+ */
+function aafm_sanitize_settings_input( array $posted ): array {
+	$rate  = min( AAFM_SETTINGS_NUMERIC_MAX, max( 0, (int) ( $posted['aafm_rate_limit_per_min'] ?? 0 ) ) );
+	$title = min( AAFM_SETTINGS_NUMERIC_MAX, max( 0, (int) ( $posted['aafm_max_title_len'] ?? 0 ) ) );
+	// Retention has its own tighter ceiling (ten years); 0 keeps every entry forever.
+	$retention   = min( 3650, max( 0, (int) ( $posted['aafm_log_retention_days'] ?? 30 ) ) );
+	$draft       = ! empty( $posted['aafm_force_draft'] );
+	$block_guard = ! empty( $posted['aafm_block_guard_strict'] );
+	$delete_on   = ! empty( $posted['aafm_delete_data_on_uninstall'] );
+	$high_risk   = ! empty( $posted['aafm_high_risk_abilities_unlocked'] );
+	$read_only   = ! empty( $posted['aafm_read_only_mode'] );
+
+	$oauth = empty( $posted['aafm_oauth_enabled'] ) ? '0' : '1';
+
+	$raw   = isset( $posted['aafm_ip_allowlist'] ) ? (string) $posted['aafm_ip_allowlist'] : '';
+	$lines = array_values( array_filter( aafm_split_and_trim_lines( $raw ), 'aafm_is_valid_ip_or_cidr' ) );
+
+	$brief_raw = isset( $posted['aafm_site_brief'] ) && is_scalar( $posted['aafm_site_brief'] ) ? (string) $posted['aafm_site_brief'] : '';
+
+	$mode_raw = isset( $posted['aafm_default_server_mode'] ) && is_string( $posted['aafm_default_server_mode'] ) ? $posted['aafm_default_server_mode'] : 'auto';
+	$mode     = in_array( $mode_raw, aafm_default_server_modes(), true ) ? $mode_raw : 'auto';
+
+	return array(
+		'aafm_rate_limit_per_min'           => $rate,
+		'aafm_max_title_len'                => $title,
+		'aafm_log_retention_days'           => $retention,
+		'aafm_force_draft'                  => $draft,
+		'aafm_block_guard_strict'           => $block_guard,
+		'aafm_delete_data_on_uninstall'     => $delete_on,
+		'aafm_high_risk_abilities_unlocked' => $high_risk,
+		'aafm_read_only_mode'               => $read_only,
+		'aafm_oauth_enabled'                => $oauth,
+		'aafm_site_brief'                   => aafm_clean_site_brief( $brief_raw ),
+		'aafm_default_server_mode'          => $mode,
+		'aafm_notifications'                => aafm_notifications_sanitize( $posted ),
+		'aafm_ip_allowlist'                 => array_values( array_unique( $lines ) ),
+		'aafm_oauth_connect_roles'          => aafm_sanitize_connect_roles_input( $posted ),
+		'aafm_trusted_proxy'                => aafm_sanitize_proxy_input( $posted ),
+	);
+}
+
+/**
+ * Count how many submitted allowlist lines are invalid and would be dropped on save.
+ *
+ * Mirrors the sanitizer's line handling - split on newlines, trim, drop blanks - then counts
+ * the non-blank lines that fail aafm_is_valid_ip_or_cidr(). Counting invalid lines explicitly
+ * (rather than diffing submitted vs. kept counts) keeps a duplicate-but-valid line from being
+ * miscounted as a drop. The result drives the save-time warning so an admin who pastes only
+ * garbage - collapsing the list to empty, which means allow-all - is told instead of seeing a
+ * bare "Saved".
+ *
+ * @param string $raw Raw newline-separated allowlist text as posted.
+ * @return int Number of non-blank lines that are not a valid IP or CIDR range.
+ */
+function aafm_count_dropped_ip_lines( string $raw ): int {
+	$invalid = array_filter(
+		aafm_split_and_trim_lines( $raw ),
+		static function ( string $line ): bool {
+			return ! aafm_is_valid_ip_or_cidr( $line );
+		}
+	);
+	return count( $invalid );
+}
+
+/**
+ * Split a raw newline-separated textarea value into cleaned, non-blank lines: split on any
+ * line ending, run each through sanitize_text_field(), trim it (invisible and non-ASCII spaces
+ * included, aafm_trim_unicode()), and drop anything left blank.
+ * Shared by aafm_sanitize_settings_input() and aafm_count_dropped_ip_lines(), which each then
+ * decide what to do with the result (keep the valid ones vs. count the invalid ones).
+ *
+ * @param string $raw Raw textarea value as posted.
+ * @return list<string> Cleaned, non-blank lines in their original order.
+ */
+function aafm_split_and_trim_lines( string $raw ): array {
+	$lines = array();
+	foreach ( (array) preg_split( '/\r\n|\r|\n/', $raw ) as $line ) {
+		$line = aafm_trim_unicode( sanitize_text_field( (string) $line ) );
+		if ( '' !== $line ) {
+			$lines[] = $line;
+		}
+	}
+	return $lines;
+}
+
+/**
+ * The roles the Settings form ticks for an install that never saved the list: today's edit_posts
+ * floor, plus Administrators. The render and the sanitizer share it so the two cannot drift.
+ *
+ * @return array<int,string>
+ */
+function aafm_oauth_legacy_default_roles(): array {
+	$slugs = array( 'administrator' );
+	foreach ( wp_roles()->role_objects as $slug => $role ) {
+		if ( $role->has_cap( 'edit_posts' ) ) {
+			$slugs[] = (string) $slug;
+		}
+	}
+	return array_values( array_unique( $slugs ) );
+}
+
+/**
+ * Validate the shape of the posted roles list before anything is written.
+ *
+ * @param array<string,mixed> $posted Raw posted fields.
+ * @return string|null A message, or null when the shape is valid or the list is not part of this save.
+ */
+function aafm_connect_roles_input_error( array $posted ): ?string {
+	if ( empty( $posted['aafm_oauth_connect_roles_present'] ) || ! isset( $posted['aafm_oauth_connect_roles'] ) ) {
+		return null; // Not part of this save, or no box ticked (Administrators only): nothing to validate.
+	}
+	$sent = $posted['aafm_oauth_connect_roles'];
+	$ok   = is_array( $sent ) && count( $sent ) <= count( wp_roles()->role_names );
+	if ( $ok ) {
+		foreach ( $sent as $slug ) {
+			if ( ! is_string( $slug ) || strlen( $slug ) > 64 ) {
+				$ok = false;
+				break;
+			}
+		}
+	}
+	return $ok ? null : __( 'The roles list could not be read. Reload this page and try again.', 'agent-abilities-for-mcp' );
+}
+
+/**
+ * The posted roles that can connect, or null when nothing should be written.
+ *
+ * Null when the marker is absent (a stale script), or when the option was never saved and the
+ * submitted list equals the legacy default the form shows: the form always posts the marker, so an
+ * unrelated save must not create the option (and switch on the use-time role check) on an existing
+ * install.
+ *
+ * @param array<string,mixed> $posted Raw posted fields.
+ * @return array<int,string>|null
+ */
+function aafm_sanitize_connect_roles_input( array $posted ): ?array {
+	if ( empty( $posted['aafm_oauth_connect_roles_present'] ) ) {
+		return null;
+	}
+	// aafm_connect_roles_input_error() validated the shape first; this filtering is a second line.
+	$known = array_keys( wp_roles()->role_names );
+	$sent  = isset( $posted['aafm_oauth_connect_roles'] ) && is_array( $posted['aafm_oauth_connect_roles'] ) ? $posted['aafm_oauth_connect_roles'] : array();
+	$roles = array( 'administrator' );
+	foreach ( $sent as $slug ) {
+		if ( is_string( $slug ) && in_array( $slug, $known, true ) ) {
+			$roles[] = $slug;
+		}
+	}
+	$roles = array_values( array_unique( $roles ) );
+	if ( null === aafm_oauth_connect_roles() ) {
+		$default = aafm_oauth_legacy_default_roles();
+		sort( $default );
+		$check = $roles;
+		sort( $check );
+		if ( $check === $default ) {
+			return null;
+		}
+	}
+	return $roles;
+}
+
+/**
+ * The posted trusted-proxy setting, or null when the form did not carry it.
+ *
+ * @param array<string,mixed> $posted Raw posted fields.
+ * @return array{mode:string,header:string,ranges:list<string>}|null
+ */
+function aafm_sanitize_proxy_input( array $posted ): ?array {
+	if ( ! isset( $posted['aafm_proxy_mode'] ) || ! is_string( $posted['aafm_proxy_mode'] ) ) {
+		return null;
+	}
+	$mode = in_array( $posted['aafm_proxy_mode'], array( 'cloudflare', 'custom' ), true ) ? $posted['aafm_proxy_mode'] : 'off';
+	$out  = array(
+		'mode'   => $mode,
+		'header' => '',
+		'ranges' => array(),
+	);
+	if ( 'custom' === $mode ) {
+		$header        = isset( $posted['aafm_proxy_header'] ) && is_string( $posted['aafm_proxy_header'] ) ? $posted['aafm_proxy_header'] : '';
+		$out['header'] = in_array( $header, aafm_proxy_headers(), true ) ? $header : '';
+		$raw           = isset( $posted['aafm_proxy_ranges'] ) && is_string( $posted['aafm_proxy_ranges'] ) ? $posted['aafm_proxy_ranges'] : '';
+		$out['ranges'] = array_values( array_unique( array_filter( aafm_split_and_trim_lines( $raw ), 'aafm_proxy_range_ok' ) ) );
+	}
+	return $out;
+}
+
+/**
+ * Why the posted trusted-proxy setting cannot be saved, or null when it can.
+ *
+ * @param array<string,mixed> $posted Raw posted fields.
+ * @return string|null
+ */
+function aafm_proxy_input_error( array $posted ): ?string {
+	if ( isset( $posted['aafm_proxy_mode'] ) && ! is_string( $posted['aafm_proxy_mode'] ) ) {
+		return __( 'The proxy setting could not be read. Reload this page and try again.', 'agent-abilities-for-mcp' );
+	}
+	$clean = aafm_sanitize_proxy_input( $posted );
+	if ( null === $clean || 'custom' !== $clean['mode'] ) {
+		return null;
+	}
+	if ( '' === $clean['header'] ) {
+		return __( 'Choose which header your proxy sends the visitor address in.', 'agent-abilities-for-mcp' );
+	}
+	if ( array() === $clean['ranges'] ) {
+		return __( 'Add at least one address or range your proxy connects from. A range wider than /8 (IPv4) or /16 (IPv6) is not accepted.', 'agent-abilities-for-mcp' );
+	}
+	return null;
+}
+
+/**
+ * The connection address of this request (REMOTE_ADDR), validated, or ''.
+ *
+ * @return string
+ */
+function aafm_settings_remote_addr(): string {
+	$remote = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '';
+	return false === filter_var( $remote, FILTER_VALIDATE_IP ) ? '' : $remote;
+}
+
+/**
+ * The sentence that says how a proxy setting reads this request against the allowlist.
+ *
+ * @param array{mode:string,header:string,ranges:list<string>} $proxy     Proxy config to test.
+ * @param array<int,string>                                    $allowlist IP allowlist.
+ * @return string '' when the allowlist is empty.
+ */
+function aafm_proxy_allowlist_sentence( array $proxy, array $allowlist ): string {
+	if ( array() === $allowlist ) {
+		return '';
+	}
+	$seen = aafm_trusted_proxy_visitor( aafm_settings_remote_addr(), aafm_trusted_proxy_normalize( $proxy ) );
+	return aafm_ip_in_ranges( $seen, $allowlist )
+		/* translators: %s: an IP address. */
+		? sprintf( __( 'With this setting the plugin reads this request as %s, which your IP allowlist admits.', 'agent-abilities-for-mcp' ), $seen )
+		/* translators: %s: an IP address. */
+		: sprintf( __( 'With this setting the plugin reads this request as %s, which your IP allowlist does not admit. This setting may lock your agents out.', 'agent-abilities-for-mcp' ), $seen );
+}
+
+/**
+ * AJAX: save the safety settings.
+ *
+ * Nonce + manage_options gated. The sanitizer bounds every value, so the stored options are
+ * always safe. The cleaned values (with the allowlist as both an array and a newline string
+ * for the textarea) are echoed back, along with a count of dropped invalid IP lines, so the UI
+ * can warn when lines were silently removed - including the dangerous case where every line is
+ * invalid and the list collapses to empty (allow-all).
+ *
+ * @return void
+ */
+function aafm_ajax_save_settings(): void {
+	check_ajax_referer( 'aafm_admin', 'nonce' );
+	if ( ! current_user_can( 'manage_options' ) ) {
+		wp_send_json_error( array( 'message' => __( 'You are not allowed to do this.', 'agent-abilities-for-mcp' ) ), 403 );
+	}
+	$posted = wp_unslash( $_POST ); // phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+	$clean  = aafm_sanitize_settings_input( $posted );
+
+	// Notifications are posted-only, like the Site Brief: a save that does not carry the mode (a stale
+	// cached script) leaves them alone. A bad address or an empty trigger list is refused HERE, before
+	// any write, so one bad field never half-saves the form.
+	$ntf_posted = isset( $posted['aafm_notify_mode'] ) && is_string( $posted['aafm_notify_mode'] );
+	$ntf_before = aafm_notifications_settings();
+	if ( $ntf_posted ) {
+		$ntf_raw   = isset( $posted['aafm_notify_email'] ) && is_string( $posted['aafm_notify_email'] ) ? trim( $posted['aafm_notify_email'] ) : '';
+		$ntf_error = aafm_notifications_validate( $clean['aafm_notifications'], $ntf_raw );
+		if ( null !== $ntf_error ) {
+			wp_send_json_error( array( 'message' => $ntf_error ) );
+		}
+	}
+	// Roles and proxy are refused here too, before any write.
+	$access_error = aafm_connect_roles_input_error( $posted ) ?? aafm_proxy_input_error( $posted );
+	if ( null !== $access_error ) {
+		wp_send_json_error( array( 'message' => $access_error ) );
+	}
+	$roles_before = aafm_oauth_connect_roles();
+	$proxy_before = aafm_trusted_proxy_config();
+
+	// Free-text field: a save that does not carry it (a stale cached admin.js, a script) leaves the
+	// stored brief alone instead of clearing it, and so does a value that is not text (an array).
+	// Checkboxes in this form read "absent" as off; this is not a checkbox. The default-server mode
+	// is a select with the same rule: no field, or a field that is not text, leaves it alone.
+	$brief_posted = isset( $posted['aafm_site_brief'] ) && is_scalar( $posted['aafm_site_brief'] );
+	$brief_before = aafm_site_brief();
+	$mode_posted  = isset( $posted['aafm_default_server_mode'] ) && is_string( $posted['aafm_default_server_mode'] );
+	$mode_before  = aafm_default_server_mode();
+
+	$raw_allowlist = isset( $posted['aafm_ip_allowlist'] ) ? (string) $posted['aafm_ip_allowlist'] : '';
+	$dropped       = aafm_count_dropped_ip_lines( $raw_allowlist );
+
+	// Read the stored master switch before anything is written, so the audit row below compares
+	// against what was actually in place. The raw option, not aafm_high_risk_unlocked(), because a
+	// site that hard-blocks the category through the filter still has an operator setting to record.
+	$high_risk_before = (bool) get_option( 'aafm_high_risk_abilities_unlocked', false );
+	// Same again for read-only mode. The raw option, not aafm_read_only_mode(), so a site that
+	// forces the mode on through the filter still records what the operator actually changed.
+	$read_only_before = (bool) get_option( 'aafm_read_only_mode', false );
+
+	// Delete rather than store false: locked is the option's out-of-the-box (row-absent) state, and
+	// both readers (this file's checked() call and aafm_high_risk_unlocked()) already default to
+	// off on a missing row, so a stored false and an absent row behave identically today. But an
+	// explicit false is a state a fresh install can never be in, and it is the one state the UI
+	// itself cannot restore to once the switch has been touched once. Deleting on "off" keeps a
+	// site that never unlocks the category, or that unlocks then re-locks it, in the same absent
+	// row either way.
+	//
+	// The two switches are applied restrictive direction first, and BEFORE anything else in this
+	// save touches the database: locking high-risk abilities and turning read-only mode on both
+	// narrow what an agent can reach, so either one that was requested persists before the ordinary
+	// settings loop below gets a chance to fail and cut the save short. A verified-settings failure
+	// used to abort the whole handler above this point, which could leave a requested lock or
+	// read-only-on never even attempted while everything else the operator posted had already
+	// changed - narrower than intended is tolerable, wider than intended or wider than requested is
+	// not. A switch whose requested direction is itself restrictive, or that was not touched by this
+	// save at all, has nothing to defer and is simply left at $high_risk_persisted / a bool true.
+	// A permissive transition (unlock high-risk, turn read-only off) is deferred to the permissive
+	// block further down and is represented here only by a placeholder `true` - no write has been
+	// attempted for it yet. Track that separately from $high_risk_persisted / $read_only_persisted so
+	// an early exit below can tell "attempted, and this is its real result" apart from "not attempted
+	// yet, this is only a placeholder". Logging a deferred transition here would record a write that
+	// never ran as a success.
+	$high_risk_attempted = ! $clean['aafm_high_risk_abilities_unlocked'];
+	$read_only_attempted = $clean['aafm_read_only_mode'];
+
+	$high_risk_persisted = $clean['aafm_high_risk_abilities_unlocked'] ? true : aafm_set_high_risk_unlocked( false );
+	$read_only_persisted = $clean['aafm_read_only_mode'] ? aafm_set_read_only_mode( true ) : true;
+
+	if ( ! $high_risk_persisted || ! $read_only_persisted ) {
+		if ( $high_risk_attempted ) {
+			aafm_log_high_risk_switch_change( $high_risk_before, $clean['aafm_high_risk_abilities_unlocked'], $high_risk_persisted );
+		}
+		if ( $read_only_attempted ) {
+			aafm_log_read_only_switch_change( $read_only_before, $clean['aafm_read_only_mode'], $read_only_persisted );
+		}
+		if ( ! $high_risk_persisted ) {
+			wp_send_json_error( array( 'message' => aafm_switch_not_persisted_message( __( 'The high-risk abilities switch', 'agent-abilities-for-mcp' ) ) ) );
+		}
+		wp_send_json_error( array( 'message' => aafm_switch_not_persisted_message( __( 'Read-only mode', 'agent-abilities-for-mcp' ) ) ) );
+	}
+
+	// OAuth gets the same restrictive-first treatment as the two switches above: turning it OFF
+	// closes an attack surface, so that direction is written now, before the ordinary settings loop -
+	// including the IP allowlist - below. Turning it ON is the permissive direction and is deferred until every
+	// restrictive write, including a narrowed IP allowlist, has certified: an
+	// operator asking for "OAuth on, restricted to these IPs" must never end up with OAuth on and
+	// the old, wider allowlist because the allowlist write failed after OAuth had already been
+	// flipped on.
+	$oauth_persisted = ( '1' === $clean['aafm_oauth_enabled'] ) ? true : aafm_update_option_verified( 'aafm_oauth_enabled', '0' );
+
+	if ( ! $oauth_persisted ) {
+		// The high-risk / read-only switches above already certified by this point (their own
+		// failure branch already returned above if either had failed), so an attempted one has no
+		// audit row yet - it is only written on failure there, or unconditionally much further down
+		// once every write in this handler has succeeded. Without this, an OAuth OFF failure
+		// here would return before either log call ever ran, leaving an applied restrictive change
+		// with no activity-log row at all.
+		if ( $high_risk_attempted ) {
+			aafm_log_high_risk_switch_change( $high_risk_before, $clean['aafm_high_risk_abilities_unlocked'], $high_risk_persisted );
+		}
+		if ( $read_only_attempted ) {
+			aafm_log_read_only_switch_change( $read_only_before, $clean['aafm_read_only_mode'], $read_only_persisted );
+		}
+		wp_send_json_error( array( 'message' => aafm_switch_not_persisted_message( __( 'Enable OAuth', 'agent-abilities-for-mcp' ) ) ) );
+	}
+
+	// Every value below only takes effect once it reads back from the database as what was just
+	// written (aafm_update_option_verified()), not merely once update_option() has been called. A
+	// persistent object cache that still disagrees with the database can make a plain
+	// update_option() silently no-op, or write against a row that no longer exists and return
+	// false without touching anything (see that function's docblock) - a save must not tell the
+	// operator a setting changed when the database still holds the old value. This runs only once
+	// the requested restrictive posture above is safely in place.
+	$verified_settings = array(
+		'aafm_rate_limit_per_min'       => array( $clean['aafm_rate_limit_per_min'], __( 'The rate limit', 'agent-abilities-for-mcp' ) ),
+		'aafm_max_title_len'            => array( $clean['aafm_max_title_len'], __( 'The maximum title length', 'agent-abilities-for-mcp' ) ),
+		'aafm_log_retention_days'       => array( $clean['aafm_log_retention_days'], __( 'The activity log retention setting', 'agent-abilities-for-mcp' ) ),
+		'aafm_force_draft'              => array( $clean['aafm_force_draft'], __( 'Force draft on create', 'agent-abilities-for-mcp' ) ),
+		'aafm_block_guard_strict'       => array( $clean['aafm_block_guard_strict'], __( 'Strict block validation', 'agent-abilities-for-mcp' ) ),
+		'aafm_delete_data_on_uninstall' => array( $clean['aafm_delete_data_on_uninstall'], __( 'Delete data on uninstall', 'agent-abilities-for-mcp' ) ),
+		// aafm_oauth_enabled is NOT here: its OFF direction already persisted above and its ON
+		// direction is deferred below, restrictive-first. The IP allowlist
+		// stays in this ordinary loop, which runs before that deferred ON write, so a narrowed
+		// allowlist is always in place before OAuth can turn on.
+		'aafm_ip_allowlist'             => array( $clean['aafm_ip_allowlist'], __( 'The IP allowlist', 'agent-abilities-for-mcp' ) ),
+	);
+	// After the allowlist entry, so a narrowed allowlist is in place before a proxy turns on.
+	if ( null !== $clean['aafm_oauth_connect_roles'] ) {
+		$verified_settings['aafm_oauth_connect_roles'] = array( $clean['aafm_oauth_connect_roles'], __( 'Roles that can connect', 'agent-abilities-for-mcp' ) );
+	}
+	if ( null !== $clean['aafm_trusted_proxy'] ) {
+		$verified_settings['aafm_trusted_proxy'] = array( $clean['aafm_trusted_proxy'], __( 'The visitor address setting', 'agent-abilities-for-mcp' ) );
+	}
+	if ( $brief_posted ) {
+		// Never autoloaded: the text is read when the MCP server is built, not on every request.
+		$verified_settings['aafm_site_brief'] = array( $clean['aafm_site_brief'], __( 'The site brief', 'agent-abilities-for-mcp' ), false );
+	}
+	if ( $mode_posted ) {
+		$verified_settings['aafm_default_server_mode'] = array( $clean['aafm_default_server_mode'], __( 'The default server setting', 'agent-abilities-for-mcp' ) );
+	}
+	foreach ( $verified_settings as $verified_option => $verified_pair ) {
+		list( $verified_value, $verified_label ) = $verified_pair;
+		if ( ! aafm_update_option_verified( $verified_option, $verified_value, $verified_pair[2] ?? null ) ) {
+			// The requested restrictive posture above already persisted and is not being undone by
+			// this failure, so it still needs its own audit row before the save reports the error - but
+			// only for a switch that was actually attempted. A deferred permissive transition (see the
+			// $high_risk_attempted / $read_only_attempted comment above) must not be logged here: it was
+			// never written, so logging it now would claim a success that never happened.
+			if ( $high_risk_attempted ) {
+				aafm_log_high_risk_switch_change( $high_risk_before, $clean['aafm_high_risk_abilities_unlocked'], $high_risk_persisted );
+			}
+			if ( $read_only_attempted ) {
+				aafm_log_read_only_switch_change( $read_only_before, $clean['aafm_read_only_mode'], $read_only_persisted );
+			}
+			wp_send_json_error( array( 'message' => aafm_switch_not_persisted_message( $verified_label ) ) );
+		}
+	}
+
+	if ( null !== $clean['aafm_oauth_connect_roles'] && $roles_before !== $clean['aafm_oauth_connect_roles'] ) {
+		$names = wp_roles()->get_names();
+		aafm_log_setting_change(
+			'aafm/oauth-connect-roles',
+			sprintf(
+				/* translators: %s: comma-separated role names. */
+				__( 'Roles that can connect changed to: %s', 'agent-abilities-for-mcp' ),
+				implode( ', ', array_map( static fn( string $slug ): string => isset( $names[ $slug ] ) ? translate_user_role( $names[ $slug ] ) : $slug, $clean['aafm_oauth_connect_roles'] ) )
+			)
+		);
+	}
+	if ( null !== $clean['aafm_trusted_proxy'] && $proxy_before['mode'] !== $clean['aafm_trusted_proxy']['mode'] ) {
+		aafm_log_setting_change(
+			'aafm/trusted-proxy',
+			sprintf(
+				/* translators: 1: off, cloudflare or custom, 2: number of trusted ranges. */
+				__( 'Visitor address behind a proxy set to %1$s (%2$d ranges)', 'agent-abilities-for-mcp' ),
+				$clean['aafm_trusted_proxy']['mode'],
+				count( $clean['aafm_trusted_proxy']['ranges'] )
+			)
+		);
+	}
+	if ( $brief_posted ) {
+		aafm_log_site_brief_change( $brief_before, $clean['aafm_site_brief'] );
+	} else {
+		$clean['aafm_site_brief'] = $brief_before; // The response reports what is stored, not the empty default.
+	}
+	if ( $mode_posted ) {
+		aafm_log_default_server_mode_change( $mode_before, $clean['aafm_default_server_mode'] );
+	} else {
+		$clean['aafm_default_server_mode'] = $mode_before;
+	}
+
+	// Change history. Posted-only through a marker field, like the Site Brief, so a save that does not
+	// carry the control leaves the switch alone. It follows the read-only switch's path: the off-switch
+	// row is written through aafm_persist_operator_switch(), never the verified-settings map, because
+	// that map would store a row for the on state. A turn-off or turn-on that did not take is logged
+	// as an error and answered, never reported as done.
+	$undo_posted = isset( $posted['aafm_undo_capture_shown'] );
+	if ( $undo_posted ) {
+		$undo_was_off = aafm_stored_switch_on( 'aafm_undo_capture_off' );
+		$undo_to_off  = empty( $posted['aafm_undo_capture'] );
+		if ( $undo_was_off !== $undo_to_off ) {
+			$undo_persisted = aafm_persist_operator_switch( 'aafm_undo_capture_off', $undo_to_off );
+			$undo_user      = wp_get_current_user();
+			if ( $undo_persisted ) {
+				$undo_detail = $undo_to_off ? __( 'Change history turned off', 'agent-abilities-for-mcp' ) : __( 'Change history turned on', 'agent-abilities-for-mcp' );
+			} else {
+				$undo_detail = $undo_to_off ? __( 'Change history could not be turned off', 'agent-abilities-for-mcp' ) : __( 'Change history could not be turned on', 'agent-abilities-for-mcp' );
+			}
+			aafm_log_activity(
+				array(
+					'ability'           => 'aafm/change-history',
+					'principal_user_id' => (int) $undo_user->ID,
+					'principal_login'   => $undo_user->user_login ? (string) $undo_user->user_login : '',
+					'status'            => $undo_persisted ? 'success' : 'error',
+					'event_type'        => 'setting_changed',
+					'detail'            => $undo_detail,
+				)
+			);
+			if ( ! $undo_persisted ) {
+				wp_send_json_error( array( 'message' => aafm_switch_not_persisted_message( __( 'Change history', 'agent-abilities-for-mcp' ) ) ) );
+			}
+		}
+	}
+
+	// Every requested restrictive change is safely in place and every ordinary setting verified, so
+	// only now is either governance switch allowed to move in the permissive direction.
+	if ( $clean['aafm_high_risk_abilities_unlocked'] ) {
+		$high_risk_persisted = aafm_set_high_risk_unlocked( true );
+	}
+	if ( ! $clean['aafm_read_only_mode'] ) {
+		// Off deletes the row here too, for the reason spelled out above the high-risk branch.
+		$read_only_persisted = aafm_set_read_only_mode( false );
+	}
+	// Same deferred-permissive rule for OAuth (see the restrictive-first block above): the IP
+	// allowlist and every other ordinary setting are already verified by this point, so turning it
+	// on now can never leave a wider surface than requested.
+	if ( '1' === $clean['aafm_oauth_enabled'] ) {
+		$oauth_persisted = aafm_update_option_verified( 'aafm_oauth_enabled', '1' );
+	}
+
+	aafm_log_high_risk_switch_change( $high_risk_before, $clean['aafm_high_risk_abilities_unlocked'], $high_risk_persisted );
+	aafm_log_read_only_switch_change( $read_only_before, $clean['aafm_read_only_mode'], $read_only_persisted );
+
+	// Every other setting above is already stored. These two are the governance switches, and a
+	// save that reports success while one of them silently kept its old value is exactly the
+	// failure seen live behind a host Redis drop-in. Say what happened instead.
+	if ( ! $high_risk_persisted ) {
+		wp_send_json_error( array( 'message' => aafm_switch_not_persisted_message( __( 'The high-risk abilities switch', 'agent-abilities-for-mcp' ) ) ) );
+	}
+	if ( ! $read_only_persisted ) {
+		wp_send_json_error( array( 'message' => aafm_switch_not_persisted_message( __( 'Read-only mode', 'agent-abilities-for-mcp' ) ) ) );
+	}
+	// Reached here only once every other governance switch, and every ordinary setting including
+	// the IP allowlist, has already certified above - so a failure at this point is a genuine
+	// partial save where everything else took and only this one permissive write did not, leaving
+	// the site correctly stricter (not wider) than requested. aafm_paired_write_partial_failure_message()'s
+	// claim holds here, unlike the mixed-direction OFF-write pair earlier in this function.
+	if ( ! $oauth_persisted ) {
+		wp_send_json_error(
+			array(
+				'message' => aafm_paired_write_partial_failure_message( __( 'Every other setting', 'agent-abilities-for-mcp' ), __( 'Enable OAuth', 'agent-abilities-for-mcp' ) ),
+			)
+		);
+	}
+
+	// Notification settings are written last. The flip alerts above (the two aafm_log_*_switch_change()
+	// calls) read the settings that were stored when this request ARRIVED, so a save that flips read-only
+	// mode and turns alerts off at once still tells the owner about the flip. A save that returned an
+	// error earlier never reaches this point and leaves the notification settings as they were.
+	if ( $ntf_posted ) {
+		if ( ! aafm_update_option_verified( 'aafm_notifications', $clean['aafm_notifications'], true ) ) {
+			wp_send_json_error( array( 'message' => aafm_switch_not_persisted_message( __( 'The notification settings', 'agent-abilities-for-mcp' ) ) ) );
+		}
+		aafm_log_notifications_change( $ntf_before, $clean['aafm_notifications'] );
+		aafm_notify_sync_schedule();
+		aafm_notify_settle_queue( $ntf_before, $clean['aafm_notifications'] );
+		aafm_notify_settings_weakened( $ntf_before, $clean['aafm_notifications'] );
+	} else {
+		$clean['aafm_notifications'] = $ntf_before;
+	}
+
+	wp_send_json_success(
+		array_merge(
+			$clean,
+			array(
+				'aafm_ip_allowlist_text'    => implode( "\n", $clean['aafm_ip_allowlist'] ),
+				'aafm_ip_dropped'           => $dropped,
+				// Plain text for the "Currently running" line beside the select; reflects the saved mode.
+				'aafm_default_server_state' => aafm_default_server_state_label(),
+				'warning'                   => null === $clean['aafm_trusted_proxy'] || 'off' === $clean['aafm_trusted_proxy']['mode'] ? '' : aafm_proxy_allowlist_sentence( $clean['aafm_trusted_proxy'], $clean['aafm_ip_allowlist'] ),
+			)
+		)
+	);
+}
+
+/**
+ * Record a change to the high-risk abilities master switch.
+ *
+ * Unlocking this category is the single highest-consequence setting in the plugin: it is what
+ * makes refunds, gateway settings, and account creation reachable at all. It gets the same
+ * treatment as an ability toggle, for the same reason, so an incident timeline shows who opened
+ * the category and when, not only which call fired afterwards.
+ *
+ * @param bool $before    Previous value.
+ * @param bool $after     New value.
+ * @param bool $persisted Whether the write actually took (aafm_persist_operator_switch()).
+ * @return void
+ */
+function aafm_log_high_risk_switch_change( bool $before, bool $after, bool $persisted = true ): void {
+	if ( $before === $after && $persisted ) {
+		return;
+	}
+	$user = wp_get_current_user();
+	if ( $persisted ) {
+		$detail = $after
+			? __( 'High-risk abilities unlocked', 'agent-abilities-for-mcp' )
+			: __( 'High-risk abilities locked', 'agent-abilities-for-mcp' );
+	} else {
+		// The write did not take (a stale persistent object cache, see
+		// aafm_persist_operator_switch()). A "locked" row over a category that is still open would
+		// be the worst possible lie in this log, so the row says what actually happened.
+		$detail = $after
+			? __( 'High-risk abilities could not be unlocked: object cache stale', 'agent-abilities-for-mcp' )
+			: __( 'High-risk abilities could not be locked: object cache stale', 'agent-abilities-for-mcp' );
+	}
+	$row_id = aafm_log_activity(
+		array(
+			// Both the admin table (page.php's Event column) and the AJAX-paginated re-render put
+			// the raw `ability` value straight into the Event cell - neither reads `event_type` at
+			// all. A blank ability therefore rendered as a blank Event cell for every master-switch
+			// row, while every other non-call event (log_cleared) already carries a synthetic
+			// ability-like name for exactly this reason. Mirrors aafm_log_activity_cleared_marker()'s
+			// 'aafm/activity-log-cleared'; the direction (locked/unlocked) stays in detail below.
+			'ability'           => 'aafm/high-risk-abilities-unlocked',
+			'principal_user_id' => (int) $user->ID,
+			'principal_login'   => $user->user_login ? (string) $user->user_login : '',
+			'status'            => $persisted ? 'success' : 'error',
+			'event_type'        => 'setting_changed',
+			'detail'            => $detail,
+		)
+	);
+	if ( $persisted && $before !== $after ) {
+		aafm_notify_switch_flip( $after ? 'high_risk_unlocked' : 'high_risk_locked', $row_id );
+	}
+}
+
+/**
+ * Every option key that a plugin reset clears.
+ *
+ * This is the single source of truth for "what a reset clears" - the enabled abilities, the
+ * exposed post types and meta keys, and the safety controls. It deliberately excludes the
+ * activity log (its own table) and anything outside the plugin's own option namespace, and it
+ * never lists users or content.
+ *
+ * One configuration option is intentionally NOT listed here: `aafm_delete_data_on_uninstall`.
+ * That flag governs whether uninstall wipes the site's data, so a "reset to defaults" must not
+ * silently flip the operator's data-retention choice - it is preserved across a reset by design.
+ * Because of that omission this is the reset set, not literally every stored option. Keep it in
+ * sync when a new resettable configuration option is introduced.
+ *
+ * @return list<string> Option names a reset clears, in a stable order.
+ */
+function aafm_config_option_names(): array {
+	return array(
+		'aafm_enabled_abilities',
+		'aafm_enabled_bridged_abilities',
+		'aafm_bridge_review',
+		'aafm_allowed_post_types',
+		'aafm_allowed_meta_keys',
+		'aafm_rate_limit_per_min',
+		'aafm_max_title_len',
+		'aafm_log_retention_days',
+		'aafm_force_draft',
+		'aafm_block_guard_strict',
+		'aafm_oauth_enabled',
+		'aafm_oauth_dcr_enabled',
+		'aafm_oauth_access_ttl',
+		'aafm_oauth_refresh_ttl',
+		'aafm_ip_allowlist',
+		'aafm_denied_meta_keys',
+		'aafm_exposed_user_meta_keys',
+		'aafm_denied_user_meta_keys',
+		'aafm_exposed_term_meta_keys',
+		'aafm_denied_term_meta_keys',
+		// Per-tool role limits set on the Abilities tab, read by includes/allowlist.php.
+		'aafm_ability_allowlist_overrides',
+		// First-run onboarding state. Clearing these on reset returns the site to first-run, so the
+		// Quick Connect wizard opens again; the menu-pointer flag is included so uninstall cleans it too.
+		'aafm_quickconnect_finished',
+		'aafm_quickconnect_dismissed',
+		'aafm_menu_pointer_active',
+		// The review-request notice's whole state (status, first-success stamp, snooze bookkeeping).
+		// Clearing it on reset re-arms the ask, but only after a fresh 7 days plus 10 new successful
+		// calls, because reset also empties the activity log; uninstall-with-delete-data removes it.
+		'aafm_review_request',
+		// The one-time agent-user marker backfill guard. Listed so a reset clears it (letting the
+		// backfill re-run against a legacy install) and uninstall-with-delete-data removes the row
+		// rather than orphaning it. The marker USER META is intentionally NOT touched here - uninstall
+		// keeps the agent user, so its marker travels with the account.
+		'aafm_agent_user_marker_backfilled',
+		// The durable "first agent call happened" flag behind the Dashboard's third setup step.
+		// Cleared so a reset returns the checklist to first-run; uninstall-with-delete-data removes it.
+		'aafm_first_call_recorded',
+		// The high-risk unlock switch. Locked is the safe default, so a reset must land the
+		// money-moving abilities back behind the floor rather than leave them reachable because
+		// someone unlocked the category once; uninstall-with-delete-data removes the row outright.
+		'aafm_high_risk_abilities_unlocked',
+		// Change history (undo): the capture off-switch (absent means on, so a reset turns capture back on)
+		// and the one-time upgrade notice's dismissed flag.
+		'aafm_undo_capture_off',
+		'aafm_undo_notice_dismissed',
+		// Read-only mode. Cleared for the same reason the switch above is, from the other side: a
+		// reset returns the site to out-of-the-box, and out of the box the mode is off. Nothing is
+		// exposed by that on its own, because a reset also clears every enabled ability.
+		'aafm_read_only_mode',
+		// Derived state, not user config: the set of abilities the registration-time preflight left
+		// out of the server (schema over the bounds, or over the tool cap). It is regenerated on the
+		// next MCP request, so clearing it here is safe and correct - a reset wipes the enabled set
+		// that produced any breach, and a delete-data uninstall must not leak the row. Listed here
+		// (rather than deleted ad hoc) so it travels with the canonical cleanup like every sibling.
+		// The literal is AAFM_OMITTED_ABILITIES_OPTION (includes/server.php); it is spelled out here
+		// because uninstall.php loads this file but NOT server.php, so the constant is not defined in
+		// the uninstall context. A drift guard in OmittedAbilitiesPreflightTest keeps the two in step.
+		'aafm_omitted_abilities',
+		// The owner's standing rules for every agent; reset and delete-data uninstall clear it.
+		'aafm_site_brief',
+		// The owner's playbooks; reset and delete-data uninstall clear them.
+		'aafm_playbooks',
+		// The adapter default-server mode; a reset returns it to Automatic (the absent row).
+		'aafm_default_server_mode',
+		// The once-only marker for the "started automatically" log row; a reset logs it afresh.
+		'aafm_default_server_auto_noted',
+		// Owner notification settings; off is the absent row.
+		'aafm_notifications',
+		// Digest events waiting to be sent.
+		'aafm_notify_queue',
+		// Admin-notice entries for the Notifications card.
+		'aafm_notify_pending',
+		// 1.10.0 access controls: pause-all, roles that can connect, trusted proxy, consent default preset.
+		'aafm_pause_all',
+		'aafm_oauth_connect_roles',
+		'aafm_trusted_proxy',
+		'aafm_oauth_default_preset',
+	);
+}
+
+/**
+ * Whether the current blog's options TABLE - not the object cache - actually stores a truthy
+ * delete-on-uninstall flag.
+ *
+ * `get_option()` trusts the `alloptions` cache blob without ever consulting the database
+ * (wp-includes/option.php), so a persistent object cache that still disagrees with the database
+ * would let a stale cached "true" authorize `aafm_uninstall_site()` and the OAuth table drops
+ * below, even with the flag's own row absent or false. A decision this destructive has to be as
+ * good as the row actually on disk, not whatever the cache still remembers, so this reads the
+ * table directly rather than going through get_option(). This is the one read in the whole plugin
+ * that is allowed to cost a query it would not otherwise need, because what it gates cannot be
+ * undone.
+ *
+ * A bare $wpdb->get_var() returns the PREVIOUS query's row when the current
+ * query itself fails - $wpdb->query() returns false, without ever touching last_result, on some
+ * failure paths (see aafm_wpdb_scalar()'s docblock) - so a failed read here could inherit a
+ * leftover non-null value from whatever query ran just before it and authorize deletion on data
+ * that says nothing about this flag. Routed through aafm_wpdb_scalar() so a failed read is
+ * detected and refused rather than certified as permission to delete.
+ *
+ * @return bool
+ */
+function aafm_uninstall_should_delete_data(): bool {
+	global $wpdb;
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching -- deliberately bypassing the object cache; see the docblock above.
+	$view = aafm_wpdb_scalar(
+		$wpdb->prepare(
+			"SELECT option_value FROM $wpdb->options WHERE option_name = %s LIMIT 1",
+			'aafm_delete_data_on_uninstall'
+		)
+	);
+	if ( ! $view['ok'] || null === $view['value'] ) {
+		return false;
+	}
+	return (bool) maybe_unserialize( $view['value'] );
+}
+
+/**
+ * Remove this plugin's data for the current blog.
+ *
+ * Clears this site's cron registrations (prune, OAuth cleanup, notification digest) FIRST, unconditionally - cron registrations are
+ * executable plugin machinery, not retained user data, so they go regardless of the
+ * data-retention choice below them. Without this, a default (retain-data) uninstall left both
+ * daily events behind: their callbacks no longer exist once the plugin is gone, so WordPress
+ * reschedules and examines two orphaned hooks on every site forever. The plugin's own
+ * deactivation callbacks (agent-abilities-for-mcp.php) clear both correctly, but only in the
+ * CURRENT blog context - they cannot reach every site on a multisite network the way
+ * aafm_run_uninstall() (uninstall.php) does by switching through each one.
+ *
+ * Reads the per-site data-retention flag next - straight off the database
+ * (aafm_uninstall_should_delete_data()), not through get_option(), because a stale persistent
+ * object cache must never be able to authorize this. When the stored value is not truthy (the
+ * default: no row, or a row holding false), data is kept and the function returns before touching
+ * anything else. When it is explicitly turned on by the site admin, the full teardown runs: every
+ * configuration option, the activity-log table, and the four OAuth tables are all removed. The
+ * flag itself is deleted last, cache-safely, so it cannot leak after uninstall.
+ *
+ * Called once per site by aafm_run_uninstall() in uninstall.php. Declared here (settings.php)
+ * so the PHPUnit suite can call it directly without bootstrapping the uninstall context.
+ *
+ * @return void
+ */
+function aafm_uninstall_site_data(): void {
+	wp_clear_scheduled_hook( 'aafm_prune_activity_log_daily' );
+	wp_clear_scheduled_hook( 'aafm_oauth_cleanup' );
+	wp_clear_scheduled_hook( 'aafm_notifications_digest' );
+	wp_unschedule_hook( 'aafm_notify_send_scheduled' ); // Alert mail handed to cron; every event carries its own arguments.
+	delete_transient( 'aafm_ntf_overdue_seen' ); // The alert-mail self-heal's sighting record.
+
+	// Before-values are content, so change history goes on every uninstall, whatever the flag says.
+	aafm_drop_changes_table();
+
+	if ( ! aafm_uninstall_should_delete_data() ) {
+		return;
+	}
+
+	// The write-outcome observer stays detached for the whole teardown: with the plugin loaded (how
+	// the test suite calls this function), the six deletes below would otherwise insert into the
+	// activity-log table this same teardown just dropped, and wpdb would print its own error. In
+	// production this function only ever runs from uninstall.php, which never loads the helper file
+	// that attaches the observer, so nothing would have emitted there either way.
+	$observer_priority = has_action( 'aafm_write_completed', 'aafm_activity_log_write_outcome' );
+	if ( false !== $observer_priority ) {
+		remove_action( 'aafm_write_completed', 'aafm_activity_log_write_outcome', $observer_priority );
+	}
+
+	$failed = aafm_uninstall_site();
+	aafm_drop_oauth_tables();
+	// The schema versions; the one-time OAuth upgrade-preserve guard and the DCR default-on adoption
+	// guard (both written by the plugins_loaded migrations), cleared so a delete-data uninstall leaves
+	// nothing behind but deliberately NOT in the reset set, since clearing a guard on reset would let
+	// its migration re-run and could flip a toggle back on; the second, independently keyed DCR
+	// migration signal (see aafm_oauth_dcr_adopt_on_by_default()'s docblock), treated the same way;
+	// and the uninstall flag itself, last.
+	foreach ( array( 'aafm_oauth_schema_version', 'aafm_activity_log_schema_version', 'aafm_oauth_toggle_migrated', 'aafm_oauth_dcr_default_on_migrated', 'aafm_oauth_dcr_default_on_touched', 'aafm_delete_data_on_uninstall' ) as $option ) {
+		if ( ! aafm_delete_option_cache_safe( $option ) ) {
+			$failed[] = $option;
+		}
+	}
+	if ( array() !== $failed ) {
+		// Uninstall has no screen to report to, so the server's error log is the only place a
+		// leftover option can be named. Option names only, never a value.
+		error_log( 'Agent Abilities for MCP: uninstall could not delete these options: ' . implode( ', ', $failed ) ); // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- uninstall has no other surface; option names only.
+	}
+
+	if ( false !== $observer_priority ) {
+		add_action( 'aafm_write_completed', 'aafm_activity_log_write_outcome', $observer_priority, 2 );
+	}
+}
+
+/**
+ * Reset the plugin to its out-of-the-box state.
+ *
+ * Deletes every configuration option (so each setting falls back to its safe default), empties the
+ * activity log, and empties the four OAuth data tables (clients, codes, access tokens, consents).
+ * It deliberately does NOT touch the agent user, its Application Passwords, or any content the
+ * agent created (posts, terms, media, etc.) - this clears the plugin's own configuration, audit
+ * trail, and OAuth state only. The activity-log and OAuth tables themselves are kept (rows cleared)
+ * so the plugin keeps working immediately afterwards. This cannot be undone.
+ *
+ * The old notification address is warned before anything is deleted (aafm_notify_reset_warning()), and the
+ * two governance switches a reset moves back are logged after the clear so their rows survive it.
+ *
+ * Wiping the activity log is itself security-relevant, so a tamper-evident marker is written
+ * after the clear (L4, shared with the direct "Clear log" action in
+ * aafm_ajax_clear_log()) - the emptied log always shows who reset the plugin and when.
+ *
+ * Every step now reports its own real outcome instead of being fired and forgotten:
+ * a delete that silently failed used to leave a stale option live - most dangerously
+ * aafm_enabled_abilities, which reset deliberately leaves the agent user and its application
+ * passwords able to reach - while the caller still told the operator everything was cleared.
+ *
+ * @return bool True when every configuration option, the activity log (plus its marker), and
+ *              all four OAuth tables are confirmed cleared.
+ */
+function aafm_reset_plugin(): bool {
+	$ok = true;
+
+	// A reset quietly weakens the alerts: it deletes the notification settings and the queue, empties the
+	// log, and moves the two governance switches back to their defaults. Capture what is about to go and
+	// warn the old address first, while the settings that name it still exist.
+	$ntf_before    = aafm_notifications_settings();
+	$was_read_only = aafm_read_only_mode_stored();
+	$was_unlocked  = aafm_high_risk_unlocked();
+	aafm_notify_reset_warning( $ntf_before, $was_read_only, $was_unlocked, aafm_notify_queue_list() );
+
+	// Cache-safe on purpose: reset is what an operator reaches for when a setting looks stuck, and
+	// a stale persistent object cache is one way a setting gets stuck (aafm_forget_option_caches()).
+	foreach ( aafm_config_option_names() as $option ) {
+		if ( ! aafm_delete_option_cache_safe( $option ) ) {
+			$ok = false;
+		}
+	}
+
+	// The Connection Doctor's header-seen memo is configuration-adjacent state; reset clears it too.
+	delete_transient( 'aafm_doctor_header_seen' );
+
+	if ( ! aafm_clear_activity_log() ) {
+		$ok = false;
+	} elseif ( ! aafm_log_activity_cleared_marker() ) {
+		$ok = false;
+	}
+
+	// Reset also empties change history. A missing table counts as empty.
+	if ( ! aafm_undo_clear() ) {
+		$ok = false;
+	}
+
+	// Written after the clear so these rows survive it: the log shows the reset and what it changed.
+	if ( $was_read_only && ! aafm_read_only_mode_stored() ) {
+		aafm_log_read_only_switch_change( true, false );
+	}
+	if ( $was_unlocked && ! aafm_high_risk_unlocked() ) {
+		aafm_log_high_risk_switch_change( true, false );
+	}
+
+	if ( ! aafm_truncate_oauth_tables() ) {
+		$ok = false;
+	}
+
+	return $ok;
+}
+
+/**
+ * AJAX: reset the plugin to defaults.
+ *
+ * Nonce + manage_options gated, mirroring the other admin actions. The destructive scope is fixed
+ * server-side (config options + activity log only) - there is no client-supplied target, so a
+ * tampered request can never widen what gets deleted. The browser confirms intent before calling.
+ *
+ * @return void
+ */
+function aafm_ajax_reset_plugin(): void {
+	check_ajax_referer( 'aafm_admin', 'nonce' );
+	if ( ! current_user_can( 'manage_options' ) ) {
+		wp_send_json_error( array( 'message' => __( 'You are not allowed to do this.', 'agent-abilities-for-mcp' ) ), 403 );
+	}
+	if ( ! aafm_reset_plugin() ) {
+		wp_send_json_error(
+			array(
+				'message' => __( 'Reset did not fully complete. Some settings, the activity log, or OAuth data may still hold their old state - please try again.', 'agent-abilities-for-mcp' ),
+			)
+		);
+	}
+	wp_send_json_success(
+		array(
+			'message' => __( 'Plugin reset. Every setting and the activity log were cleared; your agent user and its content were left alone.', 'agent-abilities-for-mcp' ),
+		)
+	);
+}
+
+/**
+ * Render the Settings tab: an OAuth card with its enable toggle (and a note that dynamic client
+ * registration follows it), then one Safety controls card of
+ * labelled rows - the two governance switches first, then the optional per-behaviour controls -
+ * and the Danger zone last. Both cards sit inside #aafm-settings-form and share the one sticky
+ * save bar at its foot.
+ *
+ * Each control reads its current value through its safety.php getter (filterable, bounded,
+ * default off) and writes via the aafm_save_settings AJAX action. Everything is escaped on
+ * output; the IP-lockout caution is rendered through the shared warning notice next to the
+ * field it warns about.
+ *
+ * @return void
+ */
+function aafm_render_settings_tab(): void {
+	echo '<div class="aafm-settings">';
+	wp_nonce_field( 'aafm_admin', 'aafm_settings_nonce' );
+
+	echo '<form id="aafm-settings-form">';
+
+	// OAuth: one switch row plus a note. Same .aafm-switch / .aafm-set-row markup as the
+	// force-draft row below; the <input> name/value/checked() contract is what the save
+	// handler binds to, not this markup. The OAuth reader defaults off (discovery.php), and
+	// dynamic client registration now follows it rather than carrying its own toggle.
+	//
+	// This card leads the tab because connecting an agent is the first thing an operator does
+	// here, and the safety controls below only start mattering once something is connected.
+	ob_start();
+
+	echo '<p class="aafm-card-desc">' . wp_kses(
+		sprintf(
+			/* translators: %s: link to the Connection tab. */
+			__( 'Token lifetimes and dynamic client registration are on the %s.', 'agent-abilities-for-mcp' ),
+			'<a href="' . esc_url(
+				add_query_arg(
+					array(
+						'page' => 'agent-abilities-for-mcp',
+						'tab'  => 'connection',
+					),
+					admin_url( 'admin.php' )
+				)
+			) . '">' . esc_html__( 'Connection tab', 'agent-abilities-for-mcp' ) . '</a>'
+		),
+		array( 'a' => array( 'href' => true ) )
+	) . '</p>';
+
+	// Scope-is-not-a-boundary note. A connecting app can request an OAuth scope, and the consent
+	// screen tells the approving human the app acts with their full capabilities either way - but
+	// nothing said that on the admin side until now. Stated once, here, next to the two switches.
+	echo '<p class="aafm-card-desc">' . esc_html__( 'If a connecting app requests a narrower OAuth scope, this plugin does not use it to limit what the resulting token can do. Every grant acts with the full capabilities of the account that approved it, unless a developer has wired the aafm_oauth_token_capabilities filter to narrow it.', 'agent-abilities-for-mcp' ) . '</p>';
+
+	// Enable OAuth. The row title and the sentence label each carry an id, and the checkbox
+	// points at both with aria-labelledby, so the toggle's accessible name is the title plus the
+	// descriptive sentence. The sentence <label for> stays put - it is the existing single
+	// association, not a second one, so the redundant-`for` defect cannot recur. The set-row
+	// label carries the title id here so the existing aria-labelledby reference resolves.
+	echo '<div class="aafm-set-row">';
+	echo '<div class="aafm-set-label" id="aafm-oauth-enabled-title">' . esc_html__( 'Enable OAuth', 'agent-abilities-for-mcp' ) . '</div>';
+	echo '<div class="aafm-set-control">';
+	echo '<label class="aafm-switch"><input type="checkbox" id="aafm-oauth-enabled" name="aafm_oauth_enabled" value="1" aria-labelledby="aafm-oauth-enabled-title aafm-oauth-enabled-desc" ' . checked( aafm_oauth_enabled(), true, false ) . '><span class="aafm-switch-track"></span></label> ';
+	echo '<label for="aafm-oauth-enabled" id="aafm-oauth-enabled-desc">' . esc_html__( 'Let agents connect by pasting your site URL.', 'agent-abilities-for-mcp' ) . '</label>';
+	echo '<p class="help">' . esc_html__( 'Application Passwords keep working either way.', 'agent-abilities-for-mcp' ) . '</p>';
+	echo '</div></div>';
+
+	// Roles that can connect. With nothing stored the boxes show today's floor; the marker tells the
+	// save handler this list was part of the form.
+	$connect_roles = aafm_oauth_connect_roles() ?? aafm_oauth_legacy_default_roles();
+	$role_boxes    = '<input type="hidden" name="aafm_oauth_connect_roles_present" value="1"><span class="aafm-role-list">';
+	foreach ( wp_roles()->get_names() as $role_slug => $role_name ) {
+		$is_admin    = 'administrator' === $role_slug;
+		$role_boxes .= sprintf(
+			'<label><input type="checkbox" name="aafm_oauth_connect_roles[]" value="%1$s"%2$s%3$s> %4$s</label> ',
+			esc_attr( (string) $role_slug ),
+			checked( $is_admin || in_array( $role_slug, $connect_roles, true ), true, false ),
+			$is_admin ? ' disabled' : '',
+			esc_html( translate_user_role( $role_name ) )
+		);
+	}
+	$role_boxes .= '</span>';
+	$role_help   = __( 'A connected app never does more than the person who approved it can. While a role is off this list, the connections of users who only have that role stop working. Adding the role back lets them work again, though an app that was already refused may need to reconnect.', 'agent-abilities-for-mcp' );
+	if ( has_filter( 'aafm_oauth_min_capability' ) ) {
+		$role_help .= ' ' . __( 'A setting in this site\'s code also controls this and takes priority.', 'agent-abilities-for-mcp' );
+	}
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Roles that can connect', 'agent-abilities-for-mcp' ),
+			'control' => $role_boxes,
+			'help'    => $role_help,
+		)
+	);
+
+	$oauth_body = (string) ob_get_clean();
+	aafm_render_section(
+		array(
+			'icon'  => 'connection',
+			'title' => __( 'OAuth', 'agent-abilities-for-mcp' ),
+			'body'  => $oauth_body,
+		)
+	);
+
+	aafm_render_site_brief_section();
+	aafm_render_notifications_section();
+
+	// Safety controls section. Each labelled control is a pre-built row passed to the shared
+	// aafm_render_section() component; the <input> name/value/checked() contracts are unchanged,
+	// only the surrounding wrapper moved onto the shared .aafm-section component.
+	ob_start();
+
+	// Read-only mode. The first row of the card, because it is the widest ceiling on this tab:
+	// while it is on, every write is held, including the ones the high-risk row below it governs.
+	// Same .aafm-switch / .aafm-set-row contract as every other row, and inside #aafm-settings-form
+	// so admin.js reads it.
+	$read_only_control  = '<label class="aafm-switch"><input type="checkbox" id="aafm-read-only-mode" name="aafm_read_only_mode" value="1" ' . checked( aafm_read_only_mode_stored(), true, false ) . '><span class="aafm-switch-track"></span></label> ';
+	$read_only_control .= '<label for="aafm-read-only-mode">' . esc_html__( 'Let agents read this site, and nothing else.', 'agent-abilities-for-mcp' ) . '</label>';
+	$read_only_control .= '<p class="help">' . esc_html__( 'While this is on, no ability that creates, changes, or deletes anything can be switched on, and none that is already switched on is reachable.', 'agent-abilities-for-mcp' ) . '</p>';
+
+	// The rest of the explanation sits behind a "See more" so this row reads at the same length as
+	// the plain ones above it. Collapsed, not cut: every sentence is still in the markup.
+	$read_only_more  = '<p class="help">' . esc_html__( 'That covers this plugin\'s own abilities and any bridged in from other plugins. It never turns anything on for you: your selections are kept exactly as they are, so switching this back off restores them.', 'agent-abilities-for-mcp' ) . '</p>';
+	$read_only_more .= '<p class="help">' . esc_html__( 'A bridged ability counts as a read only when the plugin that wrote it says so. That is the same declaration this plugin already trusts elsewhere, but it is the other plugin making it, not this one.', 'agent-abilities-for-mcp' ) . '</p>';
+	$read_only_more .= '<p class="help">' . esc_html__( 'Every flip of this switch is recorded in the activity log, and those entries expire on the same retention schedule as everything else in it.', 'agent-abilities-for-mcp' ) . '</p>';
+
+	$read_only_control .= aafm_get_set_more_html(
+		__( 'See more about read-only mode', 'agent-abilities-for-mcp' ),
+		$read_only_more
+	);
+
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Read-only mode', 'agent-abilities-for-mcp' ),
+			'opt'     => __( 'Off by default', 'agent-abilities-for-mcp' ),
+			'control' => $read_only_control,
+		)
+	);
+
+	// The high-risk master switch, directly beneath the switch that can hold it. It is a normal
+	// setting an operator is expected to reach on purpose, not a destructive action, so it stays
+	// here rather than in the Danger zone.
+	//
+	// While read-only mode is on this switch is moot: all eight high-risk abilities are writes, so
+	// the read-only floor already has them. Say so, and dim the row, rather than leaving it looking
+	// live while flipping it changes nothing. The checkbox itself stays enabled so its current value
+	// still rides along on every save - disabling it would post nothing, and the sanitizer reads a
+	// missing field as off, which would quietly re-lock the category behind the operator's back.
+	$read_only_on = aafm_read_only_mode();
+
+	$high_risk_control = $read_only_on
+		? aafm_get_notice_html(
+			'info',
+			__( 'Read-only mode is on, so this does nothing right now. Every high-risk ability writes, and read-only mode is already holding all of them. Turn read-only mode off above to use this switch.', 'agent-abilities-for-mcp' ),
+			array( 'inline' => true )
+		)
+		: '';
+
+	// Only a scalar is a stored switch. A cache copy that disagrees with the row, or an unreadable
+	// row, renders the box unchecked (locked).
+	$high_risk_checked = get_option( 'aafm_high_risk_abilities_unlocked', false );
+	$high_risk_checked = is_scalar( $high_risk_checked ) && (bool) $high_risk_checked;
+	$high_risk_row     = aafm_policy_row_if_stale( 'aafm_high_risk_abilities_unlocked' );
+	if ( null !== $high_risk_row ) {
+		$high_risk_checked = $high_risk_checked && $high_risk_row['ok'] && $high_risk_row['found'] && is_scalar( $high_risk_row['value'] ) && (bool) $high_risk_row['value'];
+	}
+	$high_risk_control .= '<label class="aafm-switch"><input type="checkbox" id="aafm-high-risk-unlocked" name="aafm_high_risk_abilities_unlocked" value="1" ' . checked( $high_risk_checked, true, false ) . '><span class="aafm-switch-track"></span></label> ';
+	$high_risk_control .= '<label for="aafm-high-risk-unlocked">' . esc_html__( 'Allow refunds, creating and changing orders, payment gateway settings, coupons and tax rates to be switched on individually.', 'agent-abilities-for-mcp' ) . '</label>';
+	$high_risk_control .= '<p class="help">' . esc_html__( "While this is off, no agent can issue a refund, create or change an order, change a payment gateway setting, or create or change a coupon or a tax rate through this plugin's own tools. WooCommerce's own order status and order update tools on the Plugins' own tools tab are held too, and so are the Secure Custom Fields tools that can store a callback name. Order notes stay available.", 'agent-abilities-for-mcp' ) . '</p>';
+	$high_risk_control .= '<p class="help">' . esc_html__( 'One switch covers every tool listed here. Turning it on also reopens every high-risk tool you had already switched on.', 'agent-abilities-for-mcp' ) . '</p>';
+	if ( aafm_high_risk_forced() ) {
+		$high_risk_control .= aafm_get_notice_html( 'info', __( 'Your host or a site setting keeps this locked, whatever this switch says.', 'agent-abilities-for-mcp' ), array( 'inline' => true ) );
+	}
+
+	$high_risk_more  = '<p class="help">' . esc_html__( 'Turn it on and each of those becomes an ordinary checkbox you switch on one at a time, still badged high-risk so you can always tell them apart.', 'agent-abilities-for-mcp' ) . '</p>';
+	$high_risk_more .= '<p class="help">' . esc_html__( "Other plugins' tools are held only if listed here or named with the aafm_high_risk_abilities filter, so check the rest yourself.", 'agent-abilities-for-mcp' ) . '</p>';
+	$high_risk_more .= '<p class="help">' . esc_html__( 'The plugin logs every flip of this switch, and those entries are kept for the same number of days as everything else in the activity log. Raise the retention setting below if you want a longer record of when the category was opened.', 'agent-abilities-for-mcp' ) . '</p>';
+
+	$high_risk_control .= aafm_get_set_more_html(
+		__( 'See more about the high-risk category', 'agent-abilities-for-mcp' ),
+		$high_risk_more
+	);
+
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Unlock the category', 'agent-abilities-for-mcp' ),
+			'opt'     => __( 'Off by default', 'agent-abilities-for-mcp' ),
+			'class'   => $read_only_on ? 'is-inactive' : '',
+			'pill'    => $read_only_on
+				? '<span class="aafm-pill aafm-pill-neutral">' . esc_html__( 'Held by read-only mode', 'agent-abilities-for-mcp' ) . '</span>'
+				: '',
+			'control' => $high_risk_control,
+		)
+	);
+
+	// Rate limit. Ships off (0) by default, same as every other optional control on this tab, but
+	// this one is easy to miss because a 0 in a number field does not read as "off" the way an
+	// unchecked switch does - so the help text says so plainly, suggests a concrete starting
+	// value, and names the filter a developer can set it with instead.
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Rate limit', 'agent-abilities-for-mcp' ),
+			'opt'     => __( 'Per minute', 'agent-abilities-for-mcp' ),
+			'control' => sprintf(
+				'<input type="number" id="aafm-rate-limit" name="aafm_rate_limit_per_min" class="small-text" min="0" step="1" value="%1$s" aria-label="%2$s">',
+				esc_attr( (string) aafm_rate_limit_per_min() ),
+				esc_attr__( 'Rate limit, per minute', 'agent-abilities-for-mcp' )
+			),
+			'help'    => __( 'How many agent calls one connection can make per minute. Off by default (0), so nothing is capped until you set a number here. If you are not sure where to start, 60 is a reasonable limit for a single connected agent. Developers can also set this with the aafm_rate_limit_per_min filter.', 'agent-abilities-for-mcp' ),
+		)
+	);
+
+	// IP allowlist - the control bundles the textarea plus the lockout warning notice.
+	ob_start();
+	aafm_render_notice(
+		'warning',
+		__( 'Before you save a list with anything in it, add the IP address your AI client connects from. As soon as this list has one entry, any request from an address that is not on it is blocked, including your own agent. Get it wrong and every agent call stops.', 'agent-abilities-for-mcp' )
+	);
+	$ip_notice = (string) ob_get_clean();
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'IP allowlist', 'agent-abilities-for-mcp' ),
+			'opt'     => __( 'One per line', 'agent-abilities-for-mcp' ),
+			'control' => sprintf(
+				'<textarea id="aafm-ip-allowlist" name="aafm_ip_allowlist" rows="5" class="large-text code" aria-label="%2$s">%1$s</textarea>',
+				esc_textarea( implode( "\n", aafm_ip_allowlist() ) ),
+				esc_attr__( 'IP allowlist, one per line', 'agent-abilities-for-mcp' )
+			) . '<p class="help">' . esc_html__( 'One IP address or CIDR range per line. Leave it empty to allow connections from anywhere. When you save, any line that is not a valid IP or range is dropped. A blocked client is refused before it signs in. Claude shows that as a firewall or sign-in error, and ChatGPT shows the reason.', 'agent-abilities-for-mcp' ) . '</p>'
+				. '<p class="help">' . sprintf(
+					/* translators: %s: link to the Ability allowlist card on the Connection tab. */
+					esc_html__( 'To limit which abilities a role or a connection can use, see the %s on the Connection tab.', 'agent-abilities-for-mcp' ),
+					'<a href="' . esc_url( admin_url( 'admin.php?page=agent-abilities-for-mcp&tab=connection' ) . '#aafm-card-allowlist' ) . '">' . esc_html__( 'Ability allowlist', 'agent-abilities-for-mcp' ) . '</a>'
+				) . '</p>' . $ip_notice,
+		)
+	);
+
+	// Real visitor address behind a proxy. Off by default; the custom header and ranges show only
+	// for Custom (a wrapper with no display rule, so the hidden attribute works).
+	$proxy   = aafm_trusted_proxy_config();
+	$options = '';
+	foreach ( array(
+		'off'        => __( 'Off', 'agent-abilities-for-mcp' ),
+		'cloudflare' => __( 'Cloudflare', 'agent-abilities-for-mcp' ),
+		'custom'     => __( 'Custom', 'agent-abilities-for-mcp' ),
+	) as $proxy_mode => $proxy_label ) {
+		$options .= sprintf( '<option value="%1$s"%2$s>%3$s</option>', esc_attr( $proxy_mode ), selected( $proxy_mode, $proxy['mode'], false ), esc_html( $proxy_label ) );
+	}
+	$headers = '';
+	foreach ( aafm_proxy_headers() as $proxy_header ) {
+		$headers .= sprintf( '<option value="%1$s"%2$s>%1$s</option>', esc_attr( $proxy_header ), selected( $proxy_header, $proxy['header'], false ) );
+	}
+	$seen_now = sprintf(
+		/* translators: 1: the address the plugin uses, 2: the connection address. */
+		__( 'As this plugin sees it now: %1$s. Connection address: %2$s.', 'agent-abilities-for-mcp' ),
+		'' !== aafm_source_ip() ? aafm_source_ip() : __( 'unknown', 'agent-abilities-for-mcp' ),
+		'' !== aafm_settings_remote_addr() ? aafm_settings_remote_addr() : __( 'unknown', 'agent-abilities-for-mcp' )
+	);
+	$against = aafm_proxy_allowlist_sentence( $proxy, aafm_ip_allowlist() );
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Real visitor address behind a proxy or CDN', 'agent-abilities-for-mcp' ),
+			'opt'     => __( 'Off by default', 'agent-abilities-for-mcp' ),
+			'control' => sprintf(
+				'<select id="aafm-proxy-mode" name="aafm_proxy_mode" aria-label="%1$s">%2$s</select><div class="aafm-proxy-custom"%3$s><p><label for="aafm-proxy-header">%4$s</label> <select id="aafm-proxy-header" name="aafm_proxy_header">%5$s</select></p><textarea id="aafm-proxy-ranges" name="aafm_proxy_ranges" rows="3" class="large-text code" aria-label="%6$s">%7$s</textarea></div><p class="help aafm-proxy-seen">%8$s</p>%9$s',
+				esc_attr__( 'Real visitor address behind a proxy or CDN', 'agent-abilities-for-mcp' ),
+				$options,
+				'custom' === $proxy['mode'] ? '' : ' hidden',
+				esc_html__( 'Header', 'agent-abilities-for-mcp' ),
+				$headers,
+				esc_attr__( 'Proxy addresses or ranges, one per line', 'agent-abilities-for-mcp' ),
+				esc_textarea( 'custom' === $proxy['mode'] ? implode( "\n", $proxy['ranges'] ) : '' ),
+				esc_html( $seen_now ),
+				'' === $against ? '' : '<p class="help aafm-proxy-against">' . esc_html( $against ) . '</p>'
+			),
+			'help'    => __( 'Off by default. Turn it on only if this site sits behind Cloudflare or another proxy, so the IP allowlist, the Activity Log and the abuse limits see the visitor and not the proxy. The header is believed only when the request really comes from the proxy\'s own addresses, so ranges must be no wider than /8 (IPv4) or /16 (IPv6). Cloudflare\'s address list is built into the plugin and refreshed with each release; if it falls behind, a new Cloudflare address is not trusted and the proxy\'s own address is used. To keep other Cloudflare customers from reaching your server directly, use Authenticated Origin Pulls or accept connections only from the proxy\'s addresses.', 'agent-abilities-for-mcp' ),
+		)
+	);
+
+	// Force draft. The toggle switch wraps the checkbox; the <input> keeps its exact
+	// name/value/checked() contract - the save handler and its tests bind to that, not this markup.
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Force draft on create', 'agent-abilities-for-mcp' ),
+			'control' => '<label class="aafm-switch"><input type="checkbox" id="aafm-force-draft" name="aafm_force_draft" value="1" ' . checked( aafm_force_draft(), true, false ) . '><span class="aafm-switch-track"></span></label> '
+				. '<label for="aafm-force-draft">' . esc_html__( 'Save the content an agent creates as a draft, no matter what status the request asked for.', 'agent-abilities-for-mcp' ) . '</label>',
+			'help'    => __( 'Turn this on if you want to look over agent-created content before it goes live. Covers posts, pages, custom content items, reusable blocks, and WooCommerce products. Product variations save as disabled instead, because a draft variation disappears from WooCommerce\'s editor. Things without a draft state (media, menus, terms, comments, users, coupons, orders) are not affected.', 'agent-abilities-for-mcp' ),
+		)
+	);
+
+	// Change history. admin.js sends a marker field when this control is on the page, since an
+	// unchecked box posts nothing.
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Keep change history', 'agent-abilities-for-mcp' ),
+			'control' => '<label class="aafm-switch"><input type="checkbox" id="aafm-undo-capture" name="aafm_undo_capture" value="1" ' . checked( ! aafm_stored_switch_on( 'aafm_undo_capture_off' ), true, false ) . '><span class="aafm-switch-track"></span></label> '
+				. '<label for="aafm-undo-capture">' . esc_html__( 'Record what agents change so you can revert it from the Changes tab.', 'agent-abilities-for-mcp' ) . '</label>',
+			'help'    => __( 'History is kept for 30 days while the plugin is active, because the clean-up needs the plugin loaded. The before-values stay in this site\'s database and its backups, and they are dropped when the plugin is uninstalled. Turning this off does not delete history that is already kept.', 'agent-abilities-for-mcp' ),
+		)
+	);
+
+	// Strict block validation. Same toggle-switch contract as force draft; the <input>
+	// name/value/checked() is what the save handler and its tests bind to, not this markup.
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Strict block validation', 'agent-abilities-for-mcp' ),
+			'control' => '<label class="aafm-switch"><input type="checkbox" id="aafm-block-guard-strict" name="aafm_block_guard_strict" value="1" ' . checked( aafm_block_guard_is_strict(), true, false ) . '><span class="aafm-switch-track"></span></label> '
+				. '<label for="aafm-block-guard-strict">' . esc_html__( 'Reject an agent write when its block markup would show as invalid content in the editor.', 'agent-abilities-for-mcp' ) . '</label>',
+			'help'    => __( 'When this is off (the default), a write with questionable block markup still saves, and the agent is sent a warning so it can fix its next attempt. Turn it on to refuse the write instead, so nothing that could look broken in the editor is ever stored.', 'agent-abilities-for-mcp' ),
+		)
+	);
+
+	// Max title length.
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Maximum title length', 'agent-abilities-for-mcp' ),
+			'opt'     => __( 'Characters', 'agent-abilities-for-mcp' ),
+			'control' => sprintf(
+				'<input type="number" id="aafm-max-title" name="aafm_max_title_len" class="small-text" min="0" step="1" value="%1$s" aria-label="%2$s">',
+				esc_attr( (string) aafm_max_title_len() ),
+				esc_attr__( 'Maximum title length, in characters', 'agent-abilities-for-mcp' )
+			),
+			'help'    => __( 'The longest title, in characters, an agent can set. Set it to 0 to leave the limit off.', 'agent-abilities-for-mcp' ),
+		)
+	);
+
+	// Activity-log retention. A daily job removes entries older than this many days.
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Keep activity log for', 'agent-abilities-for-mcp' ),
+			'opt'     => __( 'Days', 'agent-abilities-for-mcp' ),
+			'control' => sprintf(
+				'<input type="number" id="aafm-log-retention" name="aafm_log_retention_days" class="small-text" min="0" max="3650" step="1" value="%1$s" aria-label="%2$s">',
+				esc_attr( (string) aafm_log_retention_days() ),
+				esc_attr__( 'Keep activity log for, in days', 'agent-abilities-for-mcp' )
+			),
+			'help'    => __( 'How many days of activity to keep. A daily cleanup removes anything older. Set it to 0 to keep every entry.', 'agent-abilities-for-mcp' ),
+		)
+	);
+
+	// The adapter's default server. Three-way select, not a switch: Automatic is the default and
+	// the only mode that needs explaining. Our own tools are never on it in any mode.
+	$default_server_mode    = aafm_default_server_mode();
+	$default_server_options = array(
+		'auto' => __( 'Automatic (on only when another plugin publishes tools there)', 'agent-abilities-for-mcp' ),
+		'on'   => __( 'Always on', 'agent-abilities-for-mcp' ),
+		'off'  => __( 'Always off', 'agent-abilities-for-mcp' ),
+	);
+	$default_server_select  = '<select id="aafm-default-server-mode" name="aafm_default_server_mode" aria-label="' . esc_attr__( 'Allow the MCP Adapter default server', 'agent-abilities-for-mcp' ) . '">';
+	foreach ( $default_server_options as $value => $label ) {
+		$default_server_select .= '<option value="' . esc_attr( $value ) . '"' . selected( $default_server_mode, $value, false ) . '>' . esc_html( $label ) . '</option>';
+	}
+	$default_server_select .= '</select> <span id="aafm-default-server-state" class="aafm-pill aafm-pill-neutral aafm-default-server-state" role="status">' . esc_html( aafm_default_server_state_label() ) . '</span>';
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Allow the MCP Adapter\'s default server', 'agent-abilities-for-mcp' ),
+			'opt'     => __( 'Other plugins\' tools', 'agent-abilities-for-mcp' ),
+			'control' => $default_server_select,
+			'help'    => __( 'The MCP Adapter has a built-in server that other plugins can publish their tools to. Tools served there are not governed by this plugin: no allowlist, read-only mode or audit log applies to them, and WordPress core\'s own public abilities are reachable there too. Agent Abilities for MCP\'s own tools are never on that server, whatever you choose.', 'agent-abilities-for-mcp' ),
+		)
+	);
+
+	// Delete data on uninstall. Same toggle-switch contract as force draft; the <input>
+	// name/value/checked() is what the save handler and uninstall.php bind to, not this markup.
+	// The second, distinct caution - that uninstalling never revokes an agent's access on its own,
+	// whichever way this switch is set - is long enough to break the rhythm of the card, so it sits
+	// behind the row's "See more" as its own paragraph rather than getting run together with the
+	// first one.
+	// Only a scalar is a stored switch. A cache copy that disagrees with the row, or an unreadable
+	// row, renders the box unchecked (keep data).
+	$delete_checked = get_option( 'aafm_delete_data_on_uninstall', false );
+	$delete_checked = is_scalar( $delete_checked ) && (bool) $delete_checked;
+	$delete_row     = aafm_policy_row_if_stale( 'aafm_delete_data_on_uninstall' );
+	if ( null !== $delete_row ) {
+		$delete_checked = $delete_checked && $delete_row['ok'] && $delete_row['found'] && is_scalar( $delete_row['value'] ) && (bool) $delete_row['value'];
+	}
+	$delete_on_uninstall_control  = '<label class="aafm-switch"><input type="checkbox" id="aafm-delete-data-on-uninstall" name="aafm_delete_data_on_uninstall" value="1" ' . checked( $delete_checked, true, false ) . '><span class="aafm-switch-track"></span></label> '
+		. '<label for="aafm-delete-data-on-uninstall">' . esc_html__( 'Permanently remove all plugin data when the plugin is deleted.', 'agent-abilities-for-mcp' ) . '</label>';
+	$delete_on_uninstall_control .= '<p class="help">' . esc_html__( 'When this is off (the default), your settings, activity log, and OAuth data are kept if you delete the plugin, so a reinstall picks up your configuration. Change history is the exception: it is removed on every uninstall, whatever this says. Turn this on only if you want everything else removed too. This cannot be undone.', 'agent-abilities-for-mcp' ) . '</p>';
+	$delete_on_uninstall_control .= aafm_get_set_more_html(
+		__( 'See more about deleting data on uninstall', 'agent-abilities-for-mcp' ),
+		'<p class="help">' . esc_html__( "Either way, uninstalling this plugin never revokes an agent's access on its own. It never removes the dedicated agent user or any Application Password issued to it, since those are ordinary WordPress account credentials the plugin does not own. To cut off an agent, revoke its OAuth grant on the Connection tab, or delete its Application Password or user account from the Users screen, before or after you remove the plugin.", 'agent-abilities-for-mcp' ) . '</p>'
+	);
+
+	aafm_render_set_row(
+		array(
+			'label'   => __( 'Delete data on uninstall', 'agent-abilities-for-mcp' ),
+			'control' => $delete_on_uninstall_control,
+		)
+	);
+
+	$safety_body = (string) ob_get_clean();
+	// Both callouts live inside the card they describe: the caption as its description, the
+	// lockout warning at the top of its body.
+	ob_start();
+	aafm_render_notice(
+		'warning',
+		__( 'These controls change how agent requests behave. Test a connection after you change anything here so you do not lock yourself out or quietly drop valid requests.', 'agent-abilities-for-mcp' )
+	);
+	aafm_render_section(
+		array(
+			'icon'        => 'shield',
+			'title'       => __( 'Safety controls', 'agent-abilities-for-mcp' ),
+			'description' => __( 'These safety controls are optional. They all start off, and the plugin runs fine without any of them. Turn on only what you need.', 'agent-abilities-for-mcp' ),
+			'body'        => (string) ob_get_clean() . $safety_body,
+		)
+	);
+
+	// One Save, in the shared .aafm-savebar the Abilities, Integrations and Bridge tabs already
+	// use: it sticks to the foot of the viewport while the tab is scrolled, so the operator never
+	// has to travel the whole tab to reach it, and it settles into flow at the end of the form.
+	// It is the only save control on the tab on purpose - a second one would mean a second binding
+	// and a second status element to keep in step. The button classes and the .aafm-save-status
+	// span are unchanged; admin.js binds to those.
+	//
+	// The bar's sticky range ends where the form does, so it can never ride over the Danger zone,
+	// which renders after </form>.
+	echo '<div class="aafm-savebar"><button type="submit" class="aafm-btn aafm-btn-primary">' . esc_html__( 'Save settings', 'agent-abilities-for-mcp' ) . '</button> <span class="aafm-save-status" aria-live="polite"></span></div>';
+	echo '</form>';
+
+	// Danger zone - a destructive, irreversible reset. Sits outside the settings <form> so the
+	// button (type=button, wired in admin.js with a confirm step) never submits the form. It uses
+	// the shared .aafm-section .aafm-card classes for spacing parity, plus the .aafm-danger
+	// red-accent modifier the component does not emit, so the markup is hand-rolled rather than
+	// run through aafm_render_section(). Same .aafm-card-head/.aafm-card-pad structure the
+	// component produces, so the spacing matches the other two sections.
+	echo '<section class="aafm-section aafm-card aafm-danger">';
+	echo '<div class="aafm-card-head">' . wp_kses( aafm_card_head_html( 'warning', __( 'Danger zone', 'agent-abilities-for-mcp' ) ), aafm_admin_allowed_html() ) . '</div>';
+	echo '<div class="aafm-card-pad aafm-section-body">';
+	echo '<div class="aafm-set-row">';
+	echo '<div class="aafm-set-label">' . esc_html__( 'Reset plugin', 'agent-abilities-for-mcp' ) . '<span class="opt">' . esc_html__( 'Cannot be undone', 'agent-abilities-for-mcp' ) . '</span></div>';
+	echo '<div class="aafm-set-control">';
+	echo '<button type="button" id="aafm-reset-plugin" class="aafm-btn aafm-btn-danger">' . esc_html__( 'Reset plugin to defaults', 'agent-abilities-for-mcp' ) . '</button> <span class="aafm-reset-status" aria-live="polite"></span>';
+	echo '<p class="help">' . esc_html__( 'Clears every plugin setting - enabled abilities, exposed content types and meta keys, and all safety controls - and empties the activity log and the change history. Your agent user and anything it created (posts and other content) are left untouched. This cannot be undone.', 'agent-abilities-for-mcp' ) . '</p>';
+	echo '</div></div>';
+
+	echo '</div>';
+	echo '</section>';
+
+	echo '</div>';
+}

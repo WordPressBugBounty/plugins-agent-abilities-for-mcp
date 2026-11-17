@@ -1,0 +1,184 @@
+<?php
+/**
+ * Read-only activity-log ability.
+ *
+ * Surfaces the plugin's OWN audit table (every ability execute + denial) to an agent,
+ * gated on manage_options - the same bar the admin Dashboard activity panel sits behind.
+ * It returns each row's id, ability name, status, acting user id + login, the argument
+ * KEYS that were passed (never their values), a short identifier-only detail, and the timestamp. It
+ * deliberately OMITS source_ip: a network address is PII the admin panel does not show, so
+ * it is never handed to an agent. Read-only: there is no write/clear ability here.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter( 'aafm_abilities_registry', 'aafm_register_activity_log_definitions' );
+
+/**
+ * Contribute the activity-log definition to the registry.
+ *
+ * @param array<string,array<string,mixed>> $registry Registry.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_activity_log_definitions( array $registry ): array {
+	$registry['aafm/get-activity-log'] = array(
+		'label'        => __( 'Get activity log', 'agent-abilities-for-mcp' ),
+		'description'  => __( "Reads this plugin's own audit log: each row's ability name, status (started, success, error, denied), acting user id and login, whether the caller is flagged as an agent identity, the argument keys passed, the timestamp, and a short identifier-only detail (an object id or slug, a WP_Error code, or a crashed call's exception class and throw site; a code returned by another plugin's bridged ability is prefixed with foreign:). Most recent first. Response includes total (the count for the status filter). Never free-text argument content or network addresses. Requires the manage-options capability.", 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'site',
+		'args_builder' => 'aafm_args_get_activity_log',
+	);
+	return $registry;
+}
+
+/**
+ * Args for aafm/get-activity-log.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_activity_log(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-activity-log' ),
+		'description'         => aafm_ability_description( 'aafm/get-activity-log' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				array(
+					'status'  => array(
+						'type'        => 'string',
+						'enum'        => array( 'started', 'success', 'error', 'denied' ),
+						'description' => __( 'Filter to entries with exactly this outcome: started, success, error, or denied. Omit to return every status.', 'agent-abilities-for-mcp' ),
+					),
+					'ability' => array(
+						'type'        => 'string',
+						'description' => __( 'Filter to entries for exactly this ability name, for example aafm/create-post. Omit to return every ability. The reported total still reflects only the status filter, not this one, and may exceed the number of entries returned.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_pagination_schema_props(
+					200,
+					__( 'Number of entries per page, clamped to the 1-200 range regardless of the value requested. Defaults to 50 when omitted.', 'agent-abilities-for-mcp' ),
+					__( '1-based page number for pagination. Defaults to 1.', 'agent-abilities-for-mcp' )
+				)
+			),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'entries' => array(
+					'type'  => 'array',
+					'items' => array(
+						'type'       => 'object',
+						'properties' => array(
+							'id'                => array( 'type' => 'integer' ),
+							'ability'           => array( 'type' => 'string' ),
+							'status'            => array( 'type' => 'string' ),
+							'principal_user_id' => array( 'type' => 'integer' ),
+							'principal_login'   => array( 'type' => 'string' ),
+							'arg_keys'          => array( 'type' => 'string' ),
+							'created_at'        => array( 'type' => 'string' ),
+							'is_agent_identity' => array(
+								'type'        => 'boolean',
+								'description' => __( 'Whether the acting user or the OAuth client this call is attributed to is flagged as an agent identity, distinct from an ordinary human connection.', 'agent-abilities-for-mcp' ),
+							),
+							'detail'            => array(
+								'type'        => array( 'string', 'null' ),
+								'description' => __( 'Identifier-only note about what the call touched or why it failed, or null when the call recorded none. It is one of an allowlisted identifier (an object id or slug), a WP_Error code (prefixed with foreign: when another plugin\'s bridged ability returned it), or a crash\'s exception class and throw site, for example "WC_Data_Exception at abstract-wc-data.php:1001". It never contains free text or file paths, and a code a plugin builds from its input can carry a short fragment of that input.', 'agent-abilities-for-mcp' ),
+							),
+						),
+					),
+				),
+				'total'   => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_activity_log',
+		'permission_callback' => 'aafm_perm_manage_options',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/get-activity-log.
+ *
+ * Passes the (validated) filters straight to aafm_query_activity(), which caps per_page at
+ * 200 and orders most-recent-first, then redacts each row to the safe field set - never
+ * source_ip. Rows about the owner's notification settings (ability aafm/notifications, including the
+ * rows for an alert that failed to send, and the write-outcome rows for any aafm_notif* option) are left
+ * out, from the entries and from the total. The
+ * refusal reason a denied row carries is not returned either: any manage_options principal can call
+ * this, including an agent, and the reason would let it map the allowlist and deny list that every
+ * other path keeps opaque.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>
+ */
+function aafm_exec_get_activity_log( array $input ): array {
+	// The rows that record the owner's alert settings, and alerts failing to send, are for the people who
+	// read the screen: an agent holding an administrator credential could learn how loud it can be.
+	$args = array( 'hide_notifications' => 1 );
+	if ( ! empty( $input['status'] ) ) {
+		$args['status'] = (string) $input['status'];
+	}
+	if ( ! empty( $input['ability'] ) ) {
+		$args['ability'] = (string) $input['ability'];
+	}
+	if ( isset( $input['page'] ) ) {
+		$args['page'] = (int) $input['page'];
+	}
+	if ( isset( $input['per_page'] ) ) {
+		$args['per_page'] = (int) $input['per_page'];
+	}
+
+	$entries = array();
+	foreach ( aafm_query_activity( $args ) as $row ) {
+		$entries[] = array(
+			'id'                => isset( $row['id'] ) ? (int) $row['id'] : 0,
+			'ability'           => isset( $row['ability'] ) ? (string) $row['ability'] : '',
+			'status'            => isset( $row['status'] ) ? (string) $row['status'] : '',
+			'principal_user_id' => isset( $row['principal_user_id'] ) ? (int) $row['principal_user_id'] : 0,
+			'principal_login'   => isset( $row['principal_login'] ) ? (string) $row['principal_login'] : '',
+			'arg_keys'          => isset( $row['arg_keys'] ) ? (string) $row['arg_keys'] : '',
+			'created_at'        => isset( $row['created_at'] ) ? (string) $row['created_at'] : '',
+			'is_agent_identity' => aafm_principal_is_agent_identity(
+				isset( $row['principal_user_id'] ) ? (int) $row['principal_user_id'] : 0,
+				! empty( $row['client_id'] ) ? (string) $row['client_id'] : null
+			),
+			// Null rather than '' for an unset detail, so the wire carries "detail":null and a
+			// consumer can tell "this call recorded nothing" from "this call recorded an empty
+			// string". Safe to expose only because includes/audit/detail.php constrains every
+			// writer to identifiers.
+			'detail'            => isset( $row['detail'] ) ? aafm_redact_denial_reason( (string) $row['detail'] ) : null,
+			// source_ip is deliberately NOT returned: it is network PII, and the agent-readable ability does not need it. The admin table and CSV show it.
+		);
+	}
+
+	// total counts the set narrowed by the optional status filter (the count helper supports
+	// status only); when an ability filter is also supplied, total still reflects the status
+	// scope and may exceed the per-ability entries shown. See the output_schema note.
+	$total = aafm_activity_count_matching(
+		array_intersect_key(
+			$args,
+			array(
+				'status'             => true,
+				'hide_notifications' => true,
+			)
+		)
+	);
+
+	return array(
+		'entries' => $entries,
+		'total'   => $total,
+	);
+}

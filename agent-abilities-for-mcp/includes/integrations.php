@@ -1,0 +1,544 @@
+<?php
+/**
+ * Third-party-integration detection layer (Wave 4).
+ *
+ * Every integration ability registers and is discoverable ONLY when its host plugin is
+ * active. Detection is centralised here and is FILTERABLE per slug
+ * (aafm_integration_active_<slug>) so the PHPUnit suite can force an integration on
+ * WITHOUT installing the host plugin, then stub the host API in the fixture. SEO is
+ * detected per plugin: yoast (defined WPSEO_VERSION), rankmath (class RankMath),
+ * aioseo (function aioseo). Each per-plugin set registers on its own predicate, so a
+ * site running two SEO plugins genuinely contributes both surfaces (no first-match-wins
+ * exclusivity). The shared SEO permission gates and the recursive JSON-LD sanitizer also
+ * live here so the per-plugin ability files can reuse them.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Whether a given integration's host plugin is active (so its abilities should
+ * register / discover).
+ *
+ * @param string $slug One of 'yoast' | 'rankmath' | 'aioseo' | 'acf' | 'woocommerce' | 'slim_seo' | 'tec' | 'event_tickets' | 'avada' | 'wpbakery' | 'geodirectory'.
+ * @return bool
+ */
+function aafm_integration_active( string $slug ): bool {
+	switch ( $slug ) {
+		case 'yoast':
+			$active = aafm_yoast_active();
+			break;
+		case 'rankmath':
+			$active = aafm_rankmath_active();
+			break;
+		case 'aioseo':
+			$active = aafm_aioseo_active();
+			break;
+		case 'acf':
+			$active = aafm_acf_active();
+			break;
+		case 'woocommerce':
+			$active = aafm_woocommerce_active();
+			break;
+		case 'slim_seo':
+			$active = aafm_slim_seo_active();
+			break;
+		case 'tec':
+			$active = aafm_tec_active();
+			break;
+		case 'event_tickets':
+			$active = aafm_event_tickets_active();
+			break;
+		case 'avada':
+			$active = aafm_avada_active();
+			break;
+		case 'wpbakery':
+			$active = aafm_wpbakery_active();
+			break;
+		case 'geodirectory':
+			$active = aafm_geodirectory_active();
+			break;
+		default:
+			return false;
+	}
+
+	/**
+	 * Filters whether an integration is active. Used by the test suite to force-enable an
+	 * integration without installing the host plugin. Production passes the real detection
+	 * through unchanged.
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_integration_active_' . $slug, $active );
+}
+
+/**
+ * Whether Yoast SEO is active, behind a filterable seam.
+ *
+ * Real detection is defined('WPSEO_VERSION'). Wrapped in its own filter so the PHPUnit suite can
+ * pin it deterministically: the suite stubs Yoast by defining WPSEO_VERSION process-wide, and a
+ * defined constant can never be undefined, so the host-inactive registry test cannot flip detection
+ * back off by removing the aafm_integration_active_yoast force filter alone. Driving this seam to
+ * false through aafm_yoast_active lets that test force detection OFF deterministically. Production
+ * passes the real detection through unchanged.
+ *
+ * @return bool
+ */
+function aafm_yoast_active(): bool {
+	$active = defined( 'WPSEO_VERSION' );
+
+	/**
+	 * Filters whether Yoast SEO is reported active.
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_yoast_active', $active );
+}
+
+/**
+ * Whether Rank Math is active, behind a filterable seam (see aafm_yoast_active for the rationale;
+ * Rank Math is stubbed with a process-wide RankMath marker class).
+ *
+ * @return bool
+ */
+function aafm_rankmath_active(): bool {
+	$active = class_exists( 'RankMath' );
+
+	/**
+	 * Filters whether Rank Math is reported active.
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_rankmath_active', $active );
+}
+
+/**
+ * The minimum AIOSEO version aafm/aioseo-update-post requires.
+ *
+ * AIOSEO's own docblock
+ * at Post.php:908-910 dates its patch-aware partial-save behavior ("only syncs meta for keys
+ * present in $data, so partial saves ... don't warn on, or wipe, fields they didn't touch") to
+ * this exact version. Before 4.9.8, per the vendor's own words, a partial save through
+ * Post::savePost() could wipe fields the caller never touched. This plugin's delegation to
+ * savePost() depends on that patch-aware behavior being present.
+ */
+if ( ! defined( 'AAFM_AIOSEO_MIN_VERSION' ) ) {
+	define( 'AAFM_AIOSEO_MIN_VERSION', '4.9.8' );
+}
+
+/**
+ * The AIOSEO version this site reports, or null when undetectable.
+ *
+ * Wrapped in its own filter, mirroring aafm_woocommerce_version() and for the same reason: the
+ * PHPUnit suite can pin an arbitrary version for the floor check without ever defining the real
+ * AIOSEO_VERSION constant, since a PHP constant can never be undefined once defined and would
+ * otherwise leak one test's pinned version into every later test in the same process. Production
+ * passes the real AIOSEO_VERSION through unchanged.
+ *
+ * @return string|null
+ */
+function aafm_aioseo_version(): ?string {
+	$version = defined( 'AIOSEO_VERSION' ) ? (string) AIOSEO_VERSION : null;
+
+	/**
+	 * Filters the AIOSEO version reported for the ability floor check.
+	 *
+	 * @param string|null $version Detected version, or null when AIOSEO_VERSION is undefined.
+	 */
+	return apply_filters( 'aafm_aioseo_version', $version );
+}
+
+/**
+ * Whether All in One SEO is active AND at or above the abilities' required version floor, behind
+ * a filterable seam (see aafm_yoast_active for the rationale; AIOSEO is stubbed with a
+ * process-wide aioseo() marker function).
+ *
+ * Fail-closed by deliberate choice, unlike aafm_woocommerce_active()'s fail-open when its version
+ * is undetectable. The two floors protect different things: the WooCommerce floor exists so a
+ * detection quirk never disables a working store's abilities (fail-open is the safer default
+ * there). This floor exists specifically because the vendor's own patch-aware partial-save
+ * behavior is dated to 4.9.8 (see AAFM_AIOSEO_MIN_VERSION above) - registering the write ability
+ * against an AIOSEO whose version this plugin cannot confirm risks the exact silent field-wipe
+ * this floor exists to prevent, so an undetectable version is treated as NOT meeting the floor.
+ * In practice AIOSEO always defines AIOSEO_VERSION once loaded (confirmed in vendor source,
+ * app/AIOSEO.php: derived from the plugin's own header on every load), so this only bites a
+ * hypothetical fork that omits the constant - the same narrow theoretical case the WooCommerce
+ * floor already tolerates in the other direction.
+ *
+ * @return bool
+ */
+function aafm_aioseo_active(): bool {
+	$active = function_exists( 'aioseo' );
+	if ( $active ) {
+		$version = aafm_aioseo_version();
+		$active  = null !== $version && version_compare( $version, AAFM_AIOSEO_MIN_VERSION, '>=' );
+	}
+
+	/**
+	 * Filters whether AIOSEO is reported active.
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_aioseo_active', $active );
+}
+
+/**
+ * Whether Slim SEO is active, behind a filterable seam (see aafm_yoast_active() for the
+ * rationale). No version floor: Slim SEO's single-serialized-meta-key shape
+ * (`slim_seo`, six fields) has shown no breaking-change history worth gating on, unlike AIOSEO's
+ * partial-save fix - a deliberate choice, not an oversight.
+ *
+ * SLIM_SEO_VER (not SLIM_SEO_VERSION) is the constant Slim SEO actually defines, confirmed
+ * 2026-09-03 against plugins.svn.wordpress.org/slim-seo/trunk/slim-seo.php.
+ *
+ * @return bool
+ */
+function aafm_slim_seo_active(): bool {
+	$active = defined( 'SLIM_SEO_VER' );
+
+	/**
+	 * Filters whether Slim SEO is reported active.
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_slim_seo_active', $active );
+}
+
+/**
+ * The Events Calendar's minimum required version.
+ *
+ * Pinned to the version verified locally when this integration was built
+ * (wp/wp-content/plugins/the-events-calendar/src/Tribe/Main.php:43); raise only with a stated
+ * reason.
+ */
+if ( ! defined( 'AAFM_TEC_MIN_VERSION' ) ) {
+	define( 'AAFM_TEC_MIN_VERSION', '6.17.3.1' );
+}
+
+/**
+ * The TEC version this site reports, or null when undetectable. Filterable, mirroring
+ * aafm_aioseo_version() so the test suite can pin an arbitrary version without defining the real
+ * Tribe__Events__Main::VERSION constant.
+ *
+ * @return string|null
+ */
+function aafm_tec_version(): ?string {
+	$version = class_exists( 'Tribe__Events__Main' ) && defined( 'Tribe__Events__Main::VERSION' )
+		? (string) Tribe__Events__Main::VERSION
+		: null;
+
+	/**
+	 * Filters the TEC version reported for the ability floor check.
+	 *
+	 * @param string|null $version Detected version, or null when undetectable.
+	 */
+	return apply_filters( 'aafm_tec_version', $version );
+}
+
+/**
+ * Whether The Events Calendar is active AND at or above AAFM_TEC_MIN_VERSION, behind a
+ * filterable seam.
+ *
+ * @return bool
+ */
+function aafm_tec_active(): bool {
+	$active = class_exists( 'Tribe__Events__Main' ) && function_exists( 'tribe_events' );
+	if ( $active ) {
+		$version = aafm_tec_version();
+		$active  = null !== $version && version_compare( $version, AAFM_TEC_MIN_VERSION, '>=' );
+	}
+
+	/**
+	 * Filters whether TEC is reported active.
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_tec_active', $active );
+}
+
+/**
+ * Event Tickets' minimum required version.
+ *
+ * Pinned to the version verified locally when this integration was built
+ * (wp/wp-content/plugins/event-tickets/src/Tribe/Main.php:21); raise only with a stated reason.
+ */
+if ( ! defined( 'AAFM_EVENT_TICKETS_MIN_VERSION' ) ) {
+	define( 'AAFM_EVENT_TICKETS_MIN_VERSION', '5.29.3.1' );
+}
+
+/**
+ * The Event Tickets version this site reports, or null when undetectable.
+ *
+ * @return string|null
+ */
+function aafm_event_tickets_version(): ?string {
+	$version = class_exists( 'Tribe__Tickets__Main' ) && defined( 'Tribe__Tickets__Main::VERSION' )
+		? (string) Tribe__Tickets__Main::VERSION
+		: null;
+
+	/**
+	 * Filters the Event Tickets version reported for the ability floor check.
+	 *
+	 * @param string|null $version Detected version, or null when undetectable.
+	 */
+	return apply_filters( 'aafm_event_tickets_version', $version );
+}
+
+/**
+ * Whether Event Tickets is active AND at or above AAFM_EVENT_TICKETS_MIN_VERSION, behind a
+ * filterable seam. A distinct slug from 'tec': Event Tickets is a separate plugin that can
+ * theoretically be absent while The Events Calendar is present.
+ *
+ * @return bool
+ */
+function aafm_event_tickets_active(): bool {
+	$active = class_exists( 'Tribe__Tickets__Main' ) && function_exists( 'tribe_tickets' );
+	if ( $active ) {
+		$version = aafm_event_tickets_version();
+		$active  = null !== $version && version_compare( $version, AAFM_EVENT_TICKETS_MIN_VERSION, '>=' );
+	}
+
+	/**
+	 * Filters whether Event Tickets is reported active.
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_event_tickets_active', $active );
+}
+
+/**
+ * Whether Avada/Fusion Builder is active, behind a filterable seam.
+ *
+ * Avada is a theme, not a plugin, and Fusion Builder ships as the bundled
+ * fusion-builder plugin - detection keys on the plugin's own runtime, confirmed
+ * (2026-09-05) against a real installed copy (Fusion Builder 3.16.1): the class
+ * FusionBuilder always exists once the plugin has loaded, and fusion_builder_map()
+ * is one of its own core registration functions. No version floor is imposed - unlike
+ * TEC/Event Tickets, this plan pins no minimum Avada/Fusion Builder version.
+ *
+ * @return bool
+ */
+function aafm_avada_active(): bool {
+	$active = class_exists( 'FusionBuilder' ) && function_exists( 'fusion_builder_map' );
+
+	/**
+	 * Filters whether Avada/Fusion Builder is reported active.
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_avada_active', $active );
+}
+
+/**
+ * Whether WPBakery Page Builder (plugin folder js_composer) is active: it defines
+ * WPB_VC_VERSION as soon as it loads. No version floor is imposed; 9.1 is the tested version.
+ *
+ * @return bool
+ */
+function aafm_wpbakery_active(): bool {
+	$active = defined( 'WPB_VC_VERSION' );
+
+	/**
+	 * Filters whether WPBakery Page Builder is reported active.
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_wpbakery_active', $active );
+}
+
+/**
+ * Whether GeoDirectory is active, behind a filterable seam.
+ *
+ * Real detection is the same pairing Task 22's own research used to confirm the plugin's
+ * runtime: the geodir_get_post_info() function (includes/post-functions.php) plus the gd_place
+ * post type it registers (includes/class-geodir-post-types.php) both being present, so a partial
+ * or mid-activation state does not falsely report active.
+ *
+ * @return bool
+ */
+function aafm_geodirectory_active(): bool {
+	$active = function_exists( 'geodir_get_post_info' ) && post_type_exists( 'gd_place' );
+
+	/**
+	 * Filters whether GeoDirectory is reported active.
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_geodirectory_active', $active );
+}
+
+/**
+ * Per-object permission shared by every per-plugin SEO read/write: the caller may edit THIS post
+ * (SEO meta is post content). Relocated here from the deleted unified seo.php so the yoast / rankmath
+ * / aioseo ability files reuse one gate.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return bool
+ */
+function aafm_perm_seo_post_object( array $input ): bool {
+	$id   = absint( $input['post_id'] ?? 0 );
+	$post = $id > 0 ? aafm_exact_object( 'post', $id ) : null;
+	// Delegate to the shared content-edit gate (not a bare edit_post): it enforces the operator's
+	// post-type exposure allowlist AND the map_meta_cap===true fail-open guard, so SEO meta on a
+	// non-exposed or non-mapped type is refused exactly as the core content writes are.
+	return $post instanceof WP_Post && aafm_can_edit_post_object( $post );
+}
+
+/**
+ * Object-independent floor for the per-plugin *-get-head abilities: the caller can author posts at
+ * all. The per-object edit_post($id) refinement runs inside execute. This floor lets discovery
+ * (empty input) advertise the tool to a capable user, mirroring the documented FSE/floor pattern.
+ *
+ * @return bool
+ */
+function aafm_perm_seo_get_head_floor(): bool {
+	return current_user_can( 'edit_posts' );
+}
+
+/**
+ * Recursively sanitize a JSON-LD schema array. Relocated here from the deleted unified seo.php so the
+ * Rank Math schema writer can reuse it; integrations.php loads before the ability files, so the
+ * function exists at registration time.
+ *
+ * At every depth: arrays recurse; a value under a url-ish key (url / image / logo / sameAs / @id,
+ * case-insensitive) is run through esc_url_raw so a javascript: scheme is dropped; every other scalar
+ * leaf is run through aafm_sanitize_plain_text, which strips <script> tags, control noise, and the
+ * invisible characters that survive the WordPress sanitizer; anything that
+ * is neither scalar nor array (objects, resources) is dropped. So script payloads cannot survive at
+ * any level.
+ *
+ * Recursion is depth-bounded (default 30 levels via AAFM_SCHEMA_MAX_DEPTH): a nested array deeper
+ * than the limit is dropped rather than recursed into, so a maliciously or accidentally deep
+ * payload cannot exhaust the stack. Real JSON-LD graphs are only a handful of levels deep, so the
+ * bound never clips legitimate input.
+ *
+ * @param array<int|string,mixed> $schema Schema array.
+ * @param int                     $depth  Current recursion depth (internal; callers pass 0).
+ * @return array<int|string,mixed>
+ */
+function aafm_sanitize_schema_array( array $schema, int $depth = 0 ): array {
+	$url_keys = array( 'url', 'image', 'logo', 'sameas', '@id', 'contenturl', 'thumbnailurl' );
+	$clean    = array();
+	foreach ( $schema as $key => $value ) {
+		$safe_key = is_string( $key ) ? aafm_sanitize_plain_text( $key ) : $key;
+		if ( is_array( $value ) ) {
+			// Past the depth bound, drop the sub-tree rather than recursing further.
+			if ( $depth >= AAFM_SCHEMA_MAX_DEPTH ) {
+				continue;
+			}
+			$clean[ $safe_key ] = aafm_sanitize_schema_array( $value, $depth + 1 );
+			continue;
+		}
+		if ( ! is_scalar( $value ) ) {
+			continue; // Drop objects / resources / null.
+		}
+		$as_string = is_bool( $value ) ? $value : (string) $value;
+		if ( is_string( $safe_key ) && in_array( strtolower( $safe_key ), $url_keys, true ) ) {
+			$clean[ $safe_key ] = esc_url_raw( (string) $as_string );
+		} else {
+			$clean[ $safe_key ] = is_bool( $as_string ) ? $as_string : aafm_sanitize_plain_text( (string) $as_string );
+		}
+	}
+	return $clean;
+}
+
+/**
+ * Whether ACF (or its fork SCF) is active, behind a filterable seam.
+ *
+ * Detection is class_exists('ACF'), which both ACF Pro and Secure Custom Fields define. A bare
+ * get_field() function is not enough: themes and other plugins define their own helper by that
+ * name, and the ACF tools need ACF itself. The filter lets a test pin detection either way;
+ * production passes the real detection through unchanged.
+ *
+ * @return bool
+ */
+function aafm_acf_active(): bool {
+	$active = class_exists( 'ACF' );
+
+	/**
+	 * Filters whether ACF/SCF is reported active. Production passes real detection through; the
+	 * test suite uses this to pin ACF on or off deterministically.
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_acf_active', $active );
+}
+
+/**
+ * The minimum WooCommerce version the store abilities require.
+ *
+ * 9.1.0 is a real behavioural cliff, not an arbitrary line: from that release
+ * wc_update_attribute() backfills any field a caller omits from its own current value, so a
+ * name-only update no longer wipes has_archives/order_by/type back to their defaults (M3). Below
+ * 9.1 the same call is destructive. Kept at the actual cliff (never raised past it) so a site
+ * running a working older-but-still-safe version is never disabled by a floor that outran the
+ * real requirement.
+ */
+if ( ! defined( 'AAFM_WOOCOMMERCE_MIN_VERSION' ) ) {
+	define( 'AAFM_WOOCOMMERCE_MIN_VERSION', '9.1' );
+}
+
+/**
+ * The WooCommerce version this site reports, or null when undetectable.
+ *
+ * Wrapped in its own filter, mirroring every detection seam in this file, so the PHPUnit suite can
+ * pin an arbitrary version for the floor check without ever defining the real WC_VERSION constant
+ * - a PHP constant can never be undefined once defined, so a bare constant read here would let one
+ * test's pinned version leak into every later test in the same process. Production passes the real
+ * WC_VERSION through unchanged.
+ *
+ * @return string|null
+ */
+function aafm_woocommerce_version(): ?string {
+	$version = defined( 'WC_VERSION' ) ? (string) WC_VERSION : null;
+
+	/**
+	 * Filters the WooCommerce version reported for the ability floor check.
+	 *
+	 * @param string|null $version Detected version, or null when WC_VERSION is undefined.
+	 */
+	return apply_filters( 'aafm_woocommerce_version', $version );
+}
+
+/**
+ * Whether WooCommerce is active AND at or above the abilities' required version floor, behind a
+ * filterable seam.
+ *
+ * Real detection is class_exists('WooCommerce') plus the AAFM_WOOCOMMERCE_MIN_VERSION floor
+ * (see aafm_woocommerce_version()). This is wrapped in its own filter for the same reason the ACF
+ * sub-detection is: the PHPUnit suite stubs the WooCommerce host API by defining a WooCommerce
+ * marker class process-wide, and a defined class can never be undefined. So a test that needs
+ * WooCommerce reported INACTIVE (the host-absent default, the tab "Not installed" state) cannot
+ * flip detection back off by removing the aafm_integration_active_woocommerce force filter alone -
+ * real detection would still see the stubbed class and report WooCommerce active. Driving this seam
+ * to false through aafm_woocommerce_active lets those tests force detection OFF deterministically,
+ * mirroring how aafm_acf_active and aafm_seo_active_plugin are pinned. Production passes the real
+ * detection through unchanged.
+ *
+ * Fail-safe: when WC_VERSION cannot be determined (aafm_woocommerce_version() returns null), the
+ * floor is treated as met rather than failing the site closed - a detection quirk must never
+ * disable a working store's WC abilities. Below the floor, the WC abilities simply do not
+ * register (see aafm_integration_status() for the Integrations-tab reason line); this never fatals
+ * and never touches another integration.
+ *
+ * @return bool
+ */
+function aafm_woocommerce_active(): bool {
+	$active = class_exists( 'WooCommerce' );
+	if ( $active ) {
+		$version = aafm_woocommerce_version();
+		$active  = null === $version || version_compare( $version, AAFM_WOOCOMMERCE_MIN_VERSION, '>=' );
+	}
+
+	/**
+	 * Filters whether WooCommerce is reported active. Production passes real detection through; the
+	 * test suite uses this to pin WooCommerce inactive deterministically (the WooCommerce marker
+	 * class the stub defines is process-permanent, so removing the force filter alone is not enough).
+	 *
+	 * @param bool $active Detected active state.
+	 */
+	return (bool) apply_filters( 'aafm_woocommerce_active', $active );
+}

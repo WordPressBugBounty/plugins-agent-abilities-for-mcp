@@ -1,0 +1,1239 @@
+<?php
+/**
+ * Abilities bridge engine: discover WordPress Abilities registered by OTHER plugins and
+ * register a governed aafm-bridge/<slug> wrapper for each one the operator opts into.
+ *
+ * The wrapper is registered through aafm_register_ability_with_log() so it inherits the full
+ * governance envelope (audit start/outcome rows, per-principal rate limit, denial auditing).
+ * Permission and execute both delegate to the LIVE foreign ability, re-resolved at call time.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Default a foreign ability's JSON schema to an object type, and otherwise leave it alone.
+ *
+ * A call's arguments are always a JSON object, so a foreign get_input_schema() that declares no
+ * type is advertised as one rather than typeless. Nothing else about the schema is rewritten.
+ *
+ * This function used to coerce every empty JSON-Schema container to stdClass so it would serialize
+ * as {} instead of []. That was removed in 1.6.1 because it could not work and was actively
+ * dangerous. The vendored MCP adapter routes every schema through
+ * SchemaTransformer::transform_to_object_schema(), whose normalize() pass recursively converts
+ * every stdClass at every depth back to an array and unsets an empty root properties outright, so
+ * the coercion never reached the wire. Meanwhile the same stdClass WAS handed to WordPress core,
+ * which reads schema nodes with array syntax - a fatal Error on PHP 8 against a non-ArrayAccess
+ * object, including inside isset(). Seven schema positions fataled inside
+ * rest_validate_value_from_schema(), three of them on the shipped 1.6.0.
+ *
+ * The residual (a nested empty subschema still emitting [] on the wire) is real, but the adapter
+ * produces it on the adapter's side of the boundary and it belongs upstream in
+ * WordPress/mcp-adapter, not here.
+ *
+ * @param mixed $schema Raw schema (array) or empty.
+ * @return array<string,mixed>
+ */
+function aafm_normalize_json_schema( $schema ): array {
+	if ( ! is_array( $schema ) || array() === $schema ) {
+		return array( 'type' => 'object' );
+	}
+	if ( empty( $schema['type'] ) ) {
+		$schema['type'] = 'object';
+	}
+	return $schema;
+}
+
+/**
+ * The maximum nesting depth a recursive walk over attacker-influenced data will descend into.
+ *
+ * Read by aafm_sanitize_schema_array() in includes/integrations.php, the recursive JSON-LD
+ * sanitizer, which falls back to 32 when this file has not defined it. That input is
+ * attacker-influenced: a self-referential or pathologically deep graph would otherwise recurse
+ * unbounded and exhaust the stack. Real JSON-LD graphs are only a handful of levels deep, so 30 is
+ * far above any legitimate need and the cap doubles as a cycle breaker (a reference loop
+ * terminates once it hits the depth).
+ */
+const AAFM_SCHEMA_MAX_DEPTH = 30;
+
+/**
+ * The maximum number of nodes a single ability's combined input+output schema may contain
+ * before the registration-time preflight (aafm_schema_bounds_violation() in includes/server.php)
+ * omits that ability from the server.
+ *
+ * A "node" is any value the bounded measurement walk visits - every scalar and every array
+ * container, across the input schema and the output schema together. This bounds the OTHER cost
+ * center a pathological schema drives: the adapter serializes every tool's schema when it builds
+ * tools/list, and that serialization is recursive with no depth or size cap of its own
+ * (SchemaTransformer::convert_objects_to_arrays()), so an ability carrying a schema with a
+ * runaway node count can exhaust memory or time there - an uncatchable fatal on a constrained
+ * host, no try/catch reaches it. This cap keeps that off the table before create_server() ever
+ * sees the ability.
+ *
+ * Chosen far above any real schema: on a heavy production clone (WooCommerce + ACF + LearnDash +
+ * BuddyBoss + three SEO plugins, 205 abilities) the single largest schema is
+ * woocommerce/product-update at 543 nodes, so 5000 is roughly nine times the worst real case and
+ * no normal install is ever trimmed. Only a pathological or malformed schema reaches it.
+ */
+const AAFM_SCHEMA_MAX_NODES = 5000;
+
+/**
+ * The maximum serialized size, in bytes, of a single ability's combined input+output schema
+ * before the registration-time preflight omits that ability from the server.
+ *
+ * Measured as strlen( wp_json_encode( [ input, output ] ) ), and only AFTER the node/depth walk
+ * has already proven the structure bounded - so the encode never runs on an oversized tree and
+ * cannot itself be the thing that fatals. A schema can be small in node count yet large in bytes
+ * (a single enormous default string, say), which is why size is bounded independently of nodes.
+ *
+ * 256 KB is roughly twenty-five times the largest real schema seen (woocommerce/product-update
+ * serializes to ~10 KB on the clone above), so no normal install is ever trimmed.
+ */
+const AAFM_SCHEMA_MAX_BYTES = 262144;
+
+/**
+ * The namespace every bridged wrapper is registered under.
+ *
+ * Single-sourced because this string appears in two different shapes and they have to stay in
+ * step. Ability names use `aafm-bridge/<slug>`, but the MCP adapter rewrites the slash to a
+ * hyphen (RegisterAbilityAsMcpTool, mirrored by aafm_mcp_tool_name()), so on the wire the same
+ * ability is `aafm-bridge-<slug>`. Anything matching the wire form must derive it from here
+ * rather than hardcode it: a prefix that stops matching does not raise an error, it just
+ * silently stops firing, which is the failure mode that looks exactly like success.
+ */
+const AAFM_BRIDGE_NAMESPACE = 'aafm-bridge';
+
+/**
+ * The error code of a bridged call whose result held something other than plain data.
+ *
+ * The Activity Log detail records it as it is when the error came from this plugin
+ * (aafm_bridge_own_error()), and behind AAFM_BRIDGE_FOREIGN_CODE_PREFIX when a foreign plugin returned
+ * the same string.
+ */
+const AAFM_BRIDGE_REFUSED_SHAPE = 'aafm_bridge_unsupported_result_shape';
+
+/**
+ * The error code of a bridged call whose result was exactly { success: false, error: "<text>" }.
+ *
+ * The adapter turns that shape into an error for the client, so the wrapper returns it as one and the
+ * Activity Log row says error as well.
+ */
+const AAFM_BRIDGE_REPORTED_FAILURE = 'aafm_bridge_reported_failure';
+
+/**
+ * What the Activity Log detail puts in front of an error code that a foreign plugin returned, so it
+ * can never read as one of this plugin's own codes.
+ */
+const AAFM_BRIDGE_FOREIGN_CODE_PREFIX = 'foreign:';
+
+/**
+ * Whether an array has sequential integer keys starting at 0 (a list / tuple).
+ *
+ * A stand-in for array_is_list() (8.1+) that also works on this plugin's PHP 7.4 floor. Its one
+ * production caller is aafm_filter_bridged_tool_call_result() below, which uses it to decide
+ * whether a bridged tool's result is a bare list that needs wrapping under `data`. (It used to
+ * also discriminate tuple-form JSON Schema `items` for the schema-coercion layer; that layer was
+ * deleted in 1.6.1.)
+ *
+ * @param array<int|string,mixed> $arr Array to test.
+ * @return bool
+ */
+function aafm_bridge_is_list( array $arr ): bool {
+	$expected = 0;
+	foreach ( $arr as $key => $unused ) {
+		unset( $unused );
+		if ( $key !== $expected ) {
+			return false;
+		}
+		++$expected;
+	}
+	return true;
+}
+
+/**
+ * Normalize a foreign slug to our wrapper ability name.
+ *
+ * Lowercase, every run of non-[a-z0-9] collapses to a single '-', trimmed. So
+ * "Elementor/Get_Pages" becomes "aafm-bridge/elementor-get-pages". The distinct
+ * aafm-bridge/ prefix keeps us clear of EasyMCP's wp_ability_ names.
+ *
+ * @param string $foreign_slug The foreign ability slug.
+ * @return string
+ */
+function aafm_bridge_tool_name( string $foreign_slug ): string {
+	$norm = strtolower( $foreign_slug );
+	$norm = (string) preg_replace( '/[^a-z0-9]+/', '-', $norm );
+	$norm = trim( $norm, '-' );
+	return AAFM_BRIDGE_NAMESPACE . '/' . $norm;
+}
+
+/**
+ * Classify a foreign ability's risk from its annotations.
+ *
+ * A foreign ability's annotations are OPTIONAL and self-declared, so an omission is not evidence
+ * of safety. We fail safe: an ability that neither declares itself read-only nor explicitly
+ * declares a destructive flag is treated as destructive, so the operator's "can delete data"
+ * confirm still shows and MCP clients are told destructive=true. Only an explicit, trusted
+ * annotation - readonly:true, or destructive:false on a write - downgrades it to non-destructive.
+ * Every case where the ability DOES declare its annotations keeps its previous classification.
+ *
+ * @param \WP_Ability $ability The foreign ability.
+ * @return array{risk:string,readonly:bool,destructive:bool,idempotent:bool,declared:bool} declared is
+ *                                                                                     false when destructive was inferred from silence.
+ */
+function aafm_bridge_risk( $ability ): array {
+	$ann = array();
+	if ( method_exists( $ability, 'get_meta_item' ) ) {
+		$ann = (array) ( $ability->get_meta_item( 'annotations' ) ?? array() );
+	}
+	$readonly = ! empty( $ann['readonly'] );
+
+	// The Abilities API always populates the 'destructive' annotation, defaulting it to null when the
+	// ability declares nothing. So array_key_exists() can never see "absent" - null IS the unstated
+	// case. Treat only an explicit boolean as trusted: an unstated (null) destructive on a non-readonly
+	// ability fails safe to destructive, so the operator's "can delete data" confirm still shows and
+	// MCP clients are told destructive=true. Only readonly:true or an explicit destructive:false
+	// downgrades it.
+	$declared    = $ann['destructive'] ?? null;
+	$destructive = ( null === $declared )
+		? ! $readonly
+		: ! empty( $declared );
+
+	$idempotent = ! empty( $ann['idempotent'] );
+	$risk       = $destructive ? 'destructive' : ( $readonly ? 'read' : 'write' );
+	return array(
+		'risk'        => $risk,
+		'readonly'    => $readonly,
+		'destructive' => $destructive,
+		'idempotent'  => $idempotent,
+		'declared'    => $readonly || null !== $declared,
+	);
+}
+
+/**
+ * Strip JSON-Schema keywords an MCP client is not guaranteed to understand from a FOREIGN
+ * ability's schema, before it is copied onto our wrapper's registration.
+ *
+ * Delegates to WP 7.1's wp_prepare_json_schema_for_client() (Rule 1 of the delegation audit: this
+ * plugin has no way to know every keyword a third-party ability's author might have used, and core
+ * already maintains the allow-listed keyword set its own REST API and Abilities API clients
+ * expect). A no-op on the WP 6.9/7.0 floor, where the function does not exist yet. Only ever called
+ * on a BRIDGED (third-party-authored) schema - a native aafm/* ability's own schema is authored by
+ * this plugin and already kept to a known-safe keyword set, so running it through this too would
+ * add a dependency for no benefit.
+ *
+ * @param array<string,mixed> $schema A normalized (type always present) JSON schema.
+ * @return array<string,mixed> The same schema, with unsupported keywords stripped where core
+ *                              provides the stripper; unchanged otherwise.
+ */
+function aafm_prepare_bridge_schema_for_client( array $schema ): array {
+	if ( ! function_exists( 'wp_prepare_json_schema_for_client' ) ) {
+		return $schema;
+	}
+	return wp_prepare_json_schema_for_client( $schema );
+}
+
+/**
+ * The foreign ability's input schema, normalized. Empty when none is exposed.
+ *
+ * @param \WP_Ability $ability The foreign ability.
+ * @return array<string,mixed>
+ */
+function aafm_bridge_input_schema( $ability ): array {
+	$schema = method_exists( $ability, 'get_input_schema' ) ? $ability->get_input_schema() : array();
+	return aafm_prepare_bridge_schema_for_client( aafm_flatten_schema_combinators( aafm_normalize_json_schema( $schema ) ) );
+}
+
+/**
+ * Merge two definitions of the same property from different branches of a flattened union.
+ *
+ * Definitions that differ only in their enum (and default) become one definition with the enum
+ * values combined. Any other difference means the branches disagree about the value, such as a
+ * string in one and an integer in another, so the merged definition keeps only the types the
+ * branches use (and the first description) and leaves the real check to the foreign ability, which still validates the original schema on execute. Keeping the first branch's
+ * constraints instead would reject a call the foreign ability accepts.
+ *
+ * @param array<string,mixed> $first  The definition kept so far.
+ * @param array<string,mixed> $second The definition from a later branch.
+ * @return array<string,mixed>
+ */
+function aafm_merge_branch_property( array $first, array $second ): array {
+	$strip = static function ( array $def ): array {
+		unset( $def['enum'], $def['default'] );
+		return $def;
+	};
+	if ( isset( $first['enum'], $second['enum'] ) && is_array( $first['enum'] ) && is_array( $second['enum'] ) && $strip( $first ) === $strip( $second ) ) {
+		// Strict uniqueness: SORT_REGULAR compares loosely before PHP 8, which would drop 'auto' next to 0.
+		$combined = array();
+		foreach ( array_merge( $first['enum'], $second['enum'] ) as $value ) {
+			if ( ! in_array( $value, $combined, true ) ) {
+				$combined[] = $value;
+			}
+		}
+		$first['enum'] = $combined;
+		return $first;
+	}
+
+	// Core's REST validator needs a type on every property, so the disagreement is expressed as the
+	// union of the types the branches use (a single type when they agree).
+	$types  = array_values( array_unique( array_merge( (array) ( $first['type'] ?? array() ), (array) ( $second['type'] ?? array() ) ) ) );
+	$merged = array();
+	if ( array() !== $types ) {
+		$merged['type'] = 1 === count( $types ) ? $types[0] : $types;
+	}
+	if ( isset( $first['description'] ) ) {
+		$merged['description'] = $first['description'];
+	}
+	return $merged;
+}
+
+/**
+ * Flatten a top-level oneOf/anyOf/allOf/not on a bridged input schema into one plain object schema.
+ *
+ * ChatGPT silently rejects a whole tools/list refresh when any tool's inputSchema carries one of
+ * these at the root (WooCommerce's product-create and product-update do), and keeps showing the
+ * stale list with no error. The advertised schema is only a hint: the foreign ability still
+ * validates the real input against its own original schema on execute, so nothing is loosened.
+ *
+ * Branch properties are merged (enum values are unioned; a property the branches define differently keeps
+ * only the type they agree on, so every branch's value still validates), `required` keeps only keys every branch requires (allOf: all of them),
+ * and the alternatives are spelled out in the description. `not` is dropped.
+ *
+ * @param array<string,mixed> $schema A normalized JSON schema.
+ * @return array<string,mixed> The schema with no top-level combinator.
+ */
+function aafm_flatten_schema_combinators( array $schema ): array {
+	$branches = array();
+	$required = null;
+	$notes    = array();
+	foreach ( array( 'oneOf', 'anyOf', 'allOf' ) as $keyword ) {
+		if ( ! isset( $schema[ $keyword ] ) ) {
+			continue;
+		}
+		$list = is_array( $schema[ $keyword ] ) ? array_values( array_filter( $schema[ $keyword ], 'is_array' ) ) : array();
+		unset( $schema[ $keyword ] );
+		foreach ( $list as $branch ) {
+			$branch_required = isset( $branch['required'] ) && is_array( $branch['required'] ) ? array_values( array_map( 'strval', $branch['required'] ) ) : array();
+			if ( 'allOf' === $keyword ) {
+				$schema['required'] = array_values( array_unique( array_merge( isset( $schema['required'] ) ? (array) $schema['required'] : array(), $branch_required ) ) );
+			} else {
+				$required = null === $required ? $branch_required : array_values( array_intersect( $required, $branch_required ) );
+				$notes[]  = $branch_required;
+			}
+			$branches[] = $branch;
+		}
+	}
+	unset( $schema['not'] );
+
+	if ( array() === $branches ) {
+		return $schema;
+	}
+
+	$properties = isset( $schema['properties'] ) && is_array( $schema['properties'] ) ? $schema['properties'] : array();
+	foreach ( $branches as $branch ) {
+		$branch_props = isset( $branch['properties'] ) && is_array( $branch['properties'] ) ? $branch['properties'] : array();
+		foreach ( $branch_props as $name => $prop ) {
+			if ( ! isset( $properties[ $name ] ) ) {
+				$properties[ $name ] = $prop;
+			} elseif ( $properties[ $name ] !== $prop ) {
+				$properties[ $name ] = aafm_merge_branch_property( (array) $properties[ $name ], (array) $prop );
+			}
+		}
+	}
+	if ( array() !== $properties ) {
+		$schema['properties'] = $properties;
+	}
+
+	if ( null !== $required ) {
+		$schema['required'] = array_values( array_unique( array_merge( isset( $schema['required'] ) ? (array) $schema['required'] : array(), $required ) ) );
+	}
+	if ( array() === ( $schema['required'] ?? null ) ) {
+		unset( $schema['required'] );
+	}
+
+	$notes = array_unique(
+		array_map(
+			static function ( array $keys ): string {
+				return implode( ', ', $keys );
+			},
+			array_filter( $notes )
+		)
+	);
+	if ( count( $notes ) > 1 ) {
+		$note = sprintf(
+			/* translators: %s: semicolon-separated groups of required field names, one group per accepted input shape. */
+			__( 'Accepted input shapes require: %s.', 'agent-abilities-for-mcp' ),
+			implode( '; ', $notes )
+		);
+		$schema['description'] = isset( $schema['description'] ) && '' !== $schema['description'] ? $schema['description'] . ' ' . $note : $note;
+	}
+	return $schema;
+}
+
+/**
+ * Decide what input to forward to a bridged foreign ability.
+ *
+ * Our wrapper advertises a NORMALIZED schema (aafm_bridge_input_schema stamps type:object onto a
+ * foreign ability that declares none), so the adapter always hands our wrapper an array - even when
+ * the foreign ability itself declares no schema, or a non-object schema. Forwarding that array
+ * verbatim to the foreign ability breaks two shapes:
+ *
+ *  - No input schema: core's WP_Ability::validate_input() accepts ONLY null for an empty schema
+ *    (returns ability_missing_input_schema for anything else), so passing array() fails 100% of
+ *    calls. Two of WordPress core's own abilities (core/get-user-info, core/get-environment-info)
+ *    declare no schema, so this needs no third-party plugin to hit.
+ *  - Non-object schema (e.g. {type:string}): the caller's scalar argument must reach the foreign
+ *    validator unchanged; substituting array() silently discards it.
+ *
+ * @param mixed $live  The resolved foreign ability (WP_Ability, loosely typed for PHP 7.4).
+ * @param mixed $input Input handed to our wrapper.
+ * @return mixed The value to pass to the foreign ability's execute()/check_permissions().
+ */
+function aafm_bridge_forward_input( $live, $input ) {
+	$schema = $live instanceof WP_Ability ? $live->get_input_schema() : array();
+
+	if ( array() === $schema ) {
+		return null; // Empty foreign schema: core's validate_input() accepts only null.
+	}
+
+	$type = isset( $schema['type'] ) ? $schema['type'] : '';
+	if ( 'object' === $type || '' === $type || isset( $schema['properties'] ) ) {
+		return is_array( $input ) ? $input : array();
+	}
+
+	// Non-object foreign schema: forward the caller's value unchanged.
+	return $input;
+}
+
+/**
+ * Remember which foreign ability a bridged wrapper fronts, so the id-free discovery probe can ask
+ * that ability directly.
+ *
+ * Same store shape as aafm_remember_raw_permission() in register.php: a slug writes, no slug reads.
+ * Written only by aafm_register_enabled_bridged_abilities(), at the moment the wrapper's own
+ * closures capture the same slug.
+ *
+ * @param string      $wrapper      Wrapper ability name, for example "aafm-bridge/demo-echo".
+ * @param string|null $foreign_slug Foreign slug to store, or null to read.
+ * @return string|null The stored slug on a read, null on a write or when nothing is stored.
+ */
+function aafm_remember_bridge_source( string $wrapper, ?string $foreign_slug = null ): ?string {
+	static $store = array();
+
+	if ( null !== $foreign_slug ) {
+		$store[ $wrapper ] = $foreign_slug;
+		return null;
+	}
+
+	return $store[ $wrapper ] ?? null;
+}
+
+/**
+ * Ask the live foreign ability whether $input is permitted, keeping the KIND of the answer.
+ *
+ * The wrapper's permission closure reduces this to a boolean. Discovery needs more: a permission
+ * callback that crashed must not be confused with one that said no because an object id was
+ * missing. On WP 7.0.6 and 7.1.2 core catches a throw inside a permission callback and returns
+ * WP_Error ability_callback_exception (WP_Ability::invoke_callback()); on 6.9.4 it does not, the
+ * throw escapes, and the caller's catch covers that.
+ *
+ * @param string $foreign_slug Foreign ability slug.
+ * @param mixed  $input        Input to check, before forwarding.
+ * @return string 'allow' when the plugin said yes, 'deny' for any other answer, 'crash' when core
+ *                reports the callback threw, 'gone' when the foreign ability is not registered.
+ */
+function aafm_bridge_permission_state( string $foreign_slug, $input ): string {
+	$live = wp_get_ability( $foreign_slug );
+	if ( ! $live instanceof WP_Ability ) {
+		return 'gone';
+	}
+
+	$answer = $live->check_permissions( aafm_bridge_forward_input( $live, $input ) );
+	if ( true === $answer ) {
+		return 'allow';
+	}
+	if ( aafm_bridge_is_core_callback_exception( $answer, $foreign_slug ) ) {
+		return 'crash';
+	}
+	return 'deny';
+}
+
+/**
+ * The foreign ability's output schema as it declared it, minus `format` keywords - or null when it exposes none.
+ *
+ * Every `format` keyword is stripped from the advertised copy (see aafm_strip_output_formats());
+ * nothing else is rewritten.
+ *
+ * Deliberately NOT routed through aafm_normalize_json_schema(). That function is INPUT-oriented:
+ * a call's arguments are always a JSON object, so it defaults a typeless schema to type:object. An
+ * output schema carries no such guarantee, because a foreign ability may legally declare a bare
+ * {description:'...'} or a oneOf/const schema and return a scalar. Stamping type:object onto it
+ * made OUR OWN wrapper's execute() reject the foreign ability's own result with
+ * ability_invalid_output (WP_Ability::execute() validates every result against output_schema),
+ * even though the same ability called directly succeeded against its real, typeless schema.
+ *
+ * Returns null (not a default object schema) when the foreign ability has no output schema, so the
+ * wrapper simply omits output_schema and inherits core's no-output-validation default.
+ *
+ * This is the schema a client is shown. The registration walk leaves it off the wrapper when the source
+ * skips its own output check (aafm_bridge_source_skips_output_check()), and the wrapper does not check a
+ * bridged result against it a second time (AAFM_Rate_Limited_Ability::validate_output()).
+ *
+ * One caveat worth naming rather than leaving as a silent side effect:
+ * SchemaTransformer::transform_to_object_schema() stamps type:object onto a typeless schema itself
+ * when building the advertised outputSchema, and McpTool::execute() wraps a scalar result under
+ * `result`. So for a bare oneOf schema returning a string the bridged call now EXECUTES instead of
+ * erroring, but the advertised schema still ends up {oneOf:[...], type:'object'} against a
+ * {"result":"..."} body, which does not validate either. That is an adapter-side shape.
+ *
+ * @param \WP_Ability $ability The foreign ability.
+ * @return array<string,mixed>|null
+ */
+function aafm_bridge_output_schema( $ability ): ?array {
+	$schema = method_exists( $ability, 'get_output_schema' ) ? $ability->get_output_schema() : array();
+	if ( ! is_array( $schema ) || array() === $schema ) {
+		return null;
+	}
+	return aafm_strip_output_formats( aafm_prepare_bridge_schema_for_client( $schema ) );
+}
+
+/**
+ * Drop every `format` keyword from a foreign OUTPUT schema, at any depth.
+ *
+ * Third-party abilities declare formats their own data does not honour: WooCommerce's order dates are
+ * Y-m-d\TH:i:s under format:date-time, and a product's external_url is format:uri yet may be empty, a
+ * relative path or a unicode URL. Core validates `format` leniently, so the call works in process, but
+ * strict MCP clients check structuredContent against the advertised outputSchema with a format-aware
+ * validator and reject the whole result over one field. We do not control that data and a format is only
+ * advisory on output, so none is advertised. Only the advertised copy is rewritten: the source ability
+ * keeps its schema, so core's server-side validation is unchanged, the values are not touched, and the
+ * input schema keeps its formats.
+ *
+ * A node left empty by the strip (it held only a format) cannot stay an empty PHP array, because
+ * json_encode() writes that as `[]`, which is not a schema and crashes validators such as Python
+ * jsonschema. It cannot be a stdClass either: the vendored adapter casts every object in a schema back to
+ * an array (SchemaTransformer::convert_objects_to_arrays()), so `{}` never reaches the wire, and core
+ * reads schema nodes with array syntax, which fatals on an object. So it becomes a node that holds only
+ * a description, which constrains nothing and survives as a JSON object. Maps that are not schemas
+ * themselves (`properties` and the like), enum values, defaults and boolean schemas are never converted.
+ *
+ * @param mixed $node A schema node, or any value found where one may sit (a boolean additionalProperties).
+ * @return mixed The node with its formats removed; a node left empty comes back as a description-only schema.
+ */
+function aafm_strip_output_formats( $node ) {
+	if ( ! is_array( $node ) ) {
+		return $node;
+	}
+	unset( $node['format'] );
+	// Keywords holding a map of subschemas keyed by name: strip each child, keep the map an array.
+	foreach ( array( 'properties', 'patternProperties', '$defs', 'definitions', 'dependentSchemas' ) as $key ) {
+		if ( isset( $node[ $key ] ) && is_array( $node[ $key ] ) ) {
+			$node[ $key ] = array_map( 'aafm_strip_output_formats', $node[ $key ] );
+		}
+	}
+	// draft-07 `dependencies`: each value is a subschema or a list of property names. Only a schema is walked.
+	if ( isset( $node['dependencies'] ) && is_array( $node['dependencies'] ) ) {
+		foreach ( $node['dependencies'] as $name => $dependency ) {
+			if ( is_array( $dependency ) && array() !== $dependency && ! isset( $dependency[0] ) ) {
+				$node['dependencies'][ $name ] = aafm_strip_output_formats( $dependency );
+			}
+		}
+	}
+	// Keywords holding a list of subschemas.
+	foreach ( array( 'anyOf', 'oneOf', 'allOf', 'prefixItems' ) as $key ) {
+		if ( isset( $node[ $key ] ) && is_array( $node[ $key ] ) ) {
+			$node[ $key ] = array_map( 'aafm_strip_output_formats', $node[ $key ] );
+		}
+	}
+	// `items` is one subschema, or a tuple-form list (a schema never has key 0).
+	if ( isset( $node['items'] ) && is_array( $node['items'] ) && isset( $node['items'][0] ) ) {
+		$node['items'] = array_map( 'aafm_strip_output_formats', $node['items'] );
+	} elseif ( isset( $node['items'] ) ) {
+		$node['items'] = aafm_strip_output_formats( $node['items'] );
+	}
+	// Keywords holding one subschema (or a boolean, which passes through).
+	foreach ( array( 'additionalProperties', 'unevaluatedProperties', 'unevaluatedItems', 'additionalItems', 'contentSchema', 'not', 'if', 'then', 'else', 'contains', 'propertyNames' ) as $key ) {
+		if ( isset( $node[ $key ] ) ) {
+			$node[ $key ] = aafm_strip_output_formats( $node[ $key ] );
+		}
+	}
+	return array() === $node ? array( 'description' => 'Any value.' ) : $node;
+}
+
+/**
+ * Build a WP_Error that this plugin raised for a bridged call, and remember it.
+ *
+ * The Activity Log records a bridged error's code as it is only for an error made here; any other
+ * bridged error carries a foreign plugin's code and is recorded behind a prefix. The memory is by
+ * object identity, so a foreign plugin cannot pass for the bridge by returning the same code string.
+ *
+ * @param string $code    Error code.
+ * @param string $message Static, translated message.
+ * @return \WP_Error
+ */
+function aafm_bridge_own_error( string $code, string $message ): \WP_Error {
+	$error = new \WP_Error( $code, $message );
+	aafm_bridge_is_own_error( $error, true );
+	return $error;
+}
+
+/**
+ * Whether an error was made by aafm_bridge_own_error() in this request.
+ *
+ * @param mixed $error The value to check.
+ * @param bool  $mark  True to remember $error as made here (only aafm_bridge_own_error() passes it).
+ * @return bool
+ */
+function aafm_bridge_is_own_error( $error, bool $mark = false ): bool {
+	static $own = array();
+
+	if ( ! $error instanceof \WP_Error ) {
+		return false;
+	}
+	$id = spl_object_id( $error );
+	if ( $mark ) {
+		$own[ $id ] = $error; // Held so the id cannot be reused by another object.
+	}
+	return isset( $own[ $id ] );
+}
+
+/**
+ * Whether an error is core's own report of a throw inside an ability callback.
+ *
+ * From WP 7.0 core's WP_Ability::invoke_callback() catches a throwing callback and returns
+ * WP_Error ability_callback_exception with the text 'Ability "<slug>" callback threw an exception:
+ * <the exception's own text>'. The 6.9 floor lets the throw escape instead. The error carries no
+ * data, so the only way to tell it from a foreign plugin that returns the same code on purpose is its
+ * message, which names the ability. A plugin that returns the code with a message that also names its
+ * own ability cannot be told apart; it is read as a crash, which fails closed. The message is
+ * translated by core, so only the slug is matched.
+ *
+ * @param mixed  $error        The value a foreign callback or check returned.
+ * @param string $foreign_slug The foreign ability's slug.
+ * @return bool
+ */
+function aafm_bridge_is_core_callback_exception( $error, string $foreign_slug ): bool {
+	return $error instanceof \WP_Error
+		&& 'ability_callback_exception' === $error->get_error_code()
+		&& false !== strpos( $error->get_error_message(), $foreign_slug );
+}
+
+/**
+ * Whether the source ability opted out of core's output check by overriding validate_output().
+ *
+ * ACF's REST abilities do this on purpose: a delete returns the trashed object, which its own output
+ * schema does not describe. Advertising that schema on the wrapper would promise clients a shape the
+ * data does not keep, and a client that validates structuredContent would reject a call that worked.
+ *
+ * @param mixed $ability The foreign ability.
+ * @return bool True when the declaring class of validate_output() is not core's WP_Ability.
+ */
+function aafm_bridge_source_skips_output_check( $ability ): bool {
+	if ( ! is_object( $ability ) || ! method_exists( $ability, 'validate_output' ) ) {
+		return false;
+	}
+	return 'WP_Ability' !== ( new \ReflectionMethod( $ability, 'validate_output' ) )->getDeclaringClass()->getName();
+}
+
+/**
+ * Discover foreign abilities grouped by namespace. Read-only - never registers or mutates.
+ *
+ * Bails to an empty array when the Abilities API is absent (WP < 6.9). Excludes our own
+ * aafm namespace and our aafm-bridge wrappers, so we never bridge ourselves or double-list.
+ *
+ * @return array<string,array{label:string,abilities:array<int,array<string,mixed>>}>
+ */
+function aafm_discover_foreign_abilities(): array {
+	// WP 7.1: wp_get_abilities() now runs through two new global filters
+	// (wp_get_abilities_item_include, wp_get_abilities_result) even on a zero-arg call, so a
+	// third-party filter could hide an ability from this admin governance screen. Read the
+	// registry directly instead: WP_Abilities_Registry::get_all_registered() is public since this
+	// plugin's WP 6.9.0 floor and bypasses both filters, giving the site owner ground truth about
+	// what is actually registered rather than whatever a rogue plugin lets through. Investigated
+	// (delegation audit, WP 7.1 findings): the new $args filter on wp_get_abilities() cannot
+	// express "every namespace except aafm and aafm-bridge", so it is not a substitute for this
+	// function's own exclusion loop below - this is a bypass of the filtering layer, not a
+	// delegation to it.
+	//
+	// Deliberate departure from core's documented contract: core documents wp_get_abilities_item_include as enforcing "universal inclusion
+	// rules" that every caller is expected to respect, and get_all_registered() skips it entirely.
+	// The cost: a vendor that hides an internal, deprecated, license-gated or feature-flagged
+	// ability from wp_get_abilities() on purpose will see it listed here anyway, and an operator
+	// could select it in the bridge directory even though the vendor never intended it to be
+	// offered. Accepted because this is an ADMIN-facing governance screen, not a public listing -
+	// the operator is deciding what to enable on their own site, and should be able to see what is
+	// genuinely registered rather than whatever a third party's filter lets through. Execution still
+	// reaches the foreign ability's own permission_callback regardless of what this function
+	// displays, so the bypass affects visibility only, never authorization.
+	if ( ! class_exists( 'WP_Abilities_Registry' ) ) {
+		return array();
+	}
+	$registry = \WP_Abilities_Registry::get_instance();
+	if ( null === $registry ) {
+		return array();
+	}
+	$groups = array();
+	foreach ( $registry->get_all_registered() as $slug => $ability ) {
+		$slug = (string) $slug;
+		$pos  = strpos( $slug, '/' );
+		$ns   = false !== $pos ? substr( $slug, 0, $pos ) : 'core';
+		// The adapter's own meta abilities (discover/get-info/execute) are skipped too: on 0.7.x
+		// they exist whenever the registries start in Automatic mode, even with no default server,
+		// and bridging the adapter's own executor makes no sense.
+		if ( 'aafm' === $ns || AAFM_BRIDGE_NAMESPACE === $ns || 'mcp-adapter' === $ns ) {
+			continue;
+		}
+		$risk                         = aafm_bridge_risk( $ability );
+		$groups[ $ns ]['label']       = $ns;
+		$groups[ $ns ]['abilities'][] = array(
+			'slug'         => $slug,
+			'label'        => method_exists( $ability, 'get_label' ) ? (string) $ability->get_label() : $slug,
+			'description'  => method_exists( $ability, 'get_description' ) ? (string) $ability->get_description() : '',
+			'risk'         => $risk['risk'],
+			'readonly'     => $risk['readonly'],
+			'destructive'  => $risk['destructive'],
+			'declared'     => $risk['declared'],
+			'input_schema' => aafm_bridge_input_schema( $ability ),
+			'tool_name'    => aafm_mcp_tool_name( aafm_bridge_tool_name( $slug ) ),
+		);
+	}
+	ksort( $groups );
+	foreach ( $groups as &$group ) {
+		// Duplicate labels are especially plausible here - these come from foreign plugins we
+		// do not control - so this needs a stable sort on this plugin's PHP 7.4 floor to
+		// reproduce PHP 8's current output byte-for-byte.
+		$group['abilities'] = aafm_stable_sort(
+			$group['abilities'],
+			static function ( array $a, array $b ): int {
+				return strcasecmp( (string) $a['label'], (string) $b['label'] );
+			}
+		);
+	}
+	unset( $group );
+	return $groups;
+}
+
+/**
+ * A stored bridge allow-list value as a clean list: strings only, never a native name, de-duplicated.
+ *
+ * @param mixed $stored The option value.
+ * @return array<int,string>
+ */
+function aafm_bridge_normalize_stored_slugs( $stored ): array {
+	if ( ! is_array( $stored ) ) {
+		return array();
+	}
+
+	$clean = array();
+	// Keep only non-empty strings. array_map('strval', ...) would FATAL on an object with no
+	// __toString, so filter to strings first rather than coercing arbitrary values.
+	foreach ( array_filter( $stored, 'is_string' ) as $slug ) {
+		if ( '' === $slug || aafm_bridge_is_native_namespace( $slug ) ) {
+			continue; // Never bridge our own aafm/* abilities or aafm-bridge/* wrappers.
+		}
+		$clean[] = $slug;
+	}
+
+	return array_values( array_unique( $clean ) );
+}
+
+/**
+ * The foreign slugs stored in the operator's bridge allow-list (sanitized, de-duplicated).
+ *
+ * Reads option aafm_enabled_bridged_abilities, kept SEPARATE from aafm_enabled_abilities so a
+ * foreign plugin deactivating can never corrupt the native enabled list. This is the RAW list: no
+ * floor is applied, so it is what the admin screen renders its switches from and what a save must
+ * carry forward. Anything deciding what actually registers wants
+ * aafm_get_enabled_bridged_abilities() instead.
+ *
+ * @return array<int,string>
+ */
+function aafm_get_stored_bridged_abilities_raw(): array {
+	$clean = aafm_bridge_normalize_stored_slugs( get_option( 'aafm_enabled_bridged_abilities', array() ) );
+	// A cache copy that disagrees with the row bridges only what both hold; an unreadable row
+	// bridges nothing.
+	$row = aafm_policy_row_if_stale( 'aafm_enabled_bridged_abilities' );
+	if ( null !== $row ) {
+		$clean = $row['ok'] ? array_values( array_intersect( $clean, aafm_bridge_normalize_stored_slugs( $row['value'] ) ) ) : array();
+	}
+
+	return $clean;
+}
+
+/**
+ * The foreign slugs that may actually be bridged right now.
+ *
+ * The stored list with the read-only floor applied. Read-only mode covers bridged abilities the
+ * same way it covers native ones, classified by the foreign ability's own annotations through
+ * aafm_bridge_risk() - the same annotation this plugin already trusts to decide the operator's
+ * "can delete data" confirm and what it reports to MCP clients, so filtering on it here is not a
+ * new trust assumption.
+ *
+ * Fails closed: a slug whose ability is not resolvable right now (host plugin inactive) is not a
+ * read, and neither is one that declares nothing, since aafm_bridge_risk() already treats an
+ * unannotated ability as destructive.
+ *
+ * The high-risk lock applies too: a held slug (aafm_ability_is_high_risk()) is left out while the
+ * category is locked, in both modes.
+ *
+ * The stored option is never rewritten by this, so turning the mode off or unlocking restores
+ * exactly what was enabled before.
+ *
+ * @return array<int,string>
+ */
+function aafm_get_enabled_bridged_abilities(): array {
+	$clean = aafm_get_stored_bridged_abilities_raw();
+	if ( ! aafm_high_risk_unlocked() ) {
+		$clean = array_values( array_filter( $clean, static fn( string $slug ): bool => ! aafm_ability_is_high_risk( $slug ) ) );
+	}
+
+	if ( ! aafm_read_only_mode() ) {
+		return $clean;
+	}
+
+	if ( ! function_exists( 'wp_get_ability' ) || ! function_exists( 'wp_has_ability' ) ) {
+		return array();
+	}
+
+	$reads = array();
+	foreach ( $clean as $slug ) {
+		// wp_has_ability() first: an enabled slug whose host plugin is currently inactive is an
+		// ordinary state here, and wp_get_ability() would raise a _doing_it_wrong notice for it on
+		// every request that asks what may register.
+		if ( ! wp_has_ability( $slug ) ) {
+			continue;
+		}
+		$ability = wp_get_ability( $slug );
+		if ( ! $ability instanceof WP_Ability ) {
+			continue;
+		}
+		if ( 'read' === aafm_bridge_risk( $ability )['risk'] ) {
+			$reads[] = $slug;
+		}
+	}
+
+	return $reads;
+}
+
+/**
+ * Whether a slug lives in one of our own namespaces (aafm or aafm-bridge).
+ *
+ * Guards the enabled-bridged list and the registration walk so a polluted option can never
+ * bridge one of our native abilities back onto itself as aafm-bridge/aafm-*.
+ *
+ * @param string $slug Ability slug, e.g. "woocommerce/list-products".
+ * @return bool
+ */
+function aafm_bridge_is_native_namespace( string $slug ): bool {
+	$pos = strpos( $slug, '/' );
+	$ns  = false !== $pos ? substr( $slug, 0, $pos ) : '';
+	return 'aafm' === $ns || AAFM_BRIDGE_NAMESPACE === $ns;
+}
+
+/**
+ * Record or read wrapper-name collisions from the last registration pass.
+ *
+ * Two distinct foreign slugs can normalize to the SAME aafm-bridge/<slug> wrapper (e.g.
+ * "foo/bar-baz" and "foo/bar_baz" both become "aafm-bridge/foo-bar-baz"). Only the first
+ * slug claims the wrapper; the loser is skipped and recorded here so the admin directory can
+ * flag it inline instead of losing it silently. Passing an array replaces the store (the
+ * registration pass writes its result once); calling with no argument reads it.
+ *
+ * @param array<string,array{wrapper:string,winner:string}>|null $collisions Map keyed by the
+ *        losing foreign slug, or null to read.
+ * @return array<string,array{wrapper:string,winner:string}>
+ */
+function aafm_bridge_collisions( ?array $collisions = null ): array {
+	static $store = array();
+	if ( null !== $collisions ) {
+		$store = $collisions;
+	}
+	return $store;
+}
+
+/**
+ * Register a governed wrapper for every enabled + currently-registered foreign ability.
+ *
+ * Runs on the abilities-init action, AFTER native registration. For each enabled foreign slug
+ * whose ability is live, registers aafm-bridge/<slug> through aafm_register_ability_with_log()
+ * so it inherits audit + rate-limit + gating. Permission and execute re-resolve the LIVE foreign
+ * ability at call time (never a captured object), so a re-registered foreign ability is honored.
+ * Idempotent: a wrapper already registered is skipped; an enabled-but-missing foreign slug (host
+ * plugin inactive) is skipped silently.
+ *
+ * @return void
+ */
+function aafm_register_enabled_bridged_abilities(): void {
+	if ( ! function_exists( 'wp_get_ability' ) ) {
+		return;
+	}
+	$claimed    = array();
+	$collisions = array();
+	foreach ( aafm_get_enabled_bridged_abilities() as $foreign_slug ) {
+		// Belt-and-suspenders: never register a wrapper for one of our own namespaces even if the
+		// option was polluted past the accessor's guard.
+		if ( aafm_bridge_is_native_namespace( $foreign_slug ) ) {
+			continue;
+		}
+		$wrapper = aafm_bridge_tool_name( $foreign_slug );
+
+		// A DIFFERENT foreign slug already mapped to this wrapper name this pass: the normalizer
+		// collapsed both to the same slug. Skip the loser and record it so the admin can surface
+		// the clash rather than losing it silently behind the idempotency guard below.
+		if ( isset( $claimed[ $wrapper ] ) ) {
+			$collisions[ $foreign_slug ] = array(
+				'wrapper' => $wrapper,
+				'winner'  => $claimed[ $wrapper ],
+			);
+			continue;
+		}
+
+		if ( function_exists( 'wp_has_ability' ) && wp_has_ability( $wrapper ) ) {
+			// Already registered (idempotent re-fire, or an earlier claimant). Remember the
+			// owner so a later same-pass slug mapping here is still flagged as a collision.
+			$claimed[ $wrapper ] = $foreign_slug;
+			continue;
+		}
+		// wp_has_ability() first: an enabled slug whose host plugin is currently inactive is an
+		// ordinary state here, and wp_get_ability() would raise a _doing_it_wrong notice for it on
+		// every request when read-only mode is off. aafm_get_enabled_bridged_abilities()'s
+		// read-only-mode branch already carries this exact guard; this is the same fix for the
+		// registration walk, which reaches wp_get_ability() on every enabled slug regardless of
+		// read-only mode.
+		if ( function_exists( 'wp_has_ability' ) && ! wp_has_ability( $foreign_slug ) ) {
+			continue;
+		}
+		$foreign = wp_get_ability( $foreign_slug );
+		if ( ! $foreign instanceof WP_Ability ) {
+			continue; // Belt-and-suspenders: still guard the return type.
+		}
+		$claimed[ $wrapper ] = $foreign_slug;
+		$risk                = aafm_bridge_risk( $foreign );
+
+		$label = (string) $foreign->get_label();
+
+		$args = array(
+			'label'               => '' !== $label ? $label : $foreign_slug,
+			'description'         => (string) $foreign->get_description() . ' (bridged: ' . $foreign_slug . ')',
+			'category'            => $risk['readonly'] ? 'aafm-reads' : 'aafm-writes',
+			'input_schema'        => aafm_bridge_input_schema( $foreign ),
+			'meta'                => array(
+				'annotations' => array(
+					'readonly'    => $risk['readonly'],
+					'destructive' => $risk['destructive'],
+					'idempotent'  => $risk['idempotent'],
+				),
+			),
+			'permission_callback' => static function ( $input = null ) use ( $foreign_slug ) {
+				$live = wp_get_ability( $foreign_slug );
+				if ( ! $live instanceof WP_Ability ) {
+					return false;
+				}
+				// check_permissions() runs the FOREIGN plugin's own callback, which can throw.
+				// Deliberately no try/catch here: every caller guards it already - the decorated
+				// closure in aafm_register_ability_with_log() on the tools/call path, and
+				// aafm_user_can_discover_bridged_ability() on the tools/list path. If a NEW caller
+				// ever invokes this closure directly, it must carry its own guard.
+				return true === $live->check_permissions( aafm_bridge_forward_input( $live, $input ) );
+			},
+			'execute_callback'    => static function ( $input = null ) use ( $foreign_slug ) {
+				$live = wp_get_ability( $foreign_slug );
+				if ( ! $live instanceof WP_Ability ) {
+					return new WP_Error( 'aafm_bridge_missing', __( 'The bridged ability is no longer available.', 'agent-abilities-for-mcp' ) );
+				}
+				// Our OWN abilities are contracted to return array|WP_Error, and
+				// aafm_register_ability_with_log() enforces that at runtime for native names
+				// only (see the malformed-result guard in register.php). A bridged ability is
+				// someone else's code: core documents WP_Ability::execute() as returning
+				// mixed|WP_Error, so a foreign ability legitimately returning e.g. true after a
+				// successful write is not a contract violation. An earlier revision of this
+				// closure wrapped that scalar into array( 'data' => $out ) so the guard would
+				// only ever see a shape legal under our own contract - but the output_schema
+				// copied from the foreign ability onto our wrapper's registration below still
+				// describes the UNWRAPPED value, so core's own output validation then rejected
+				// the wrapped array against that schema, turning a real success into a spurious
+				// ability_invalid_output error. Returning the foreign result unchanged avoids
+				// that collision; the guard downstream is scoped to skip bridged names instead.
+				$result = $live->execute( aafm_bridge_forward_input( $live, $input ) );
+				if ( is_wp_error( $result ) ) {
+					// Core's own report of a throw carries the exception's raw text. A client gets the same static
+					// error the choke point gives a throw that escapes the source on the 6.9 floor.
+					if ( aafm_bridge_is_core_callback_exception( $result, $foreign_slug ) ) {
+						return aafm_bridge_own_error( 'aafm_ability_exception', aafm_ability_exception_message() );
+					}
+					return aafm_bridge_attribute_error( $foreign_slug, $result );
+				}
+				// The verdict on raw objects lives here, not in the adapter's result filter: this
+				// closure's return value is what register.php turns into the Activity Log status, so
+				// a refusal is logged as an error. The foreign ability has already run by now.
+				if ( ! aafm_bridge_result_is_plain_data( $result ) ) {
+					return aafm_bridge_own_error(
+						AAFM_BRIDGE_REFUSED_SHAPE,
+						__( 'This bridged ability ran, but its result held a raw object that cannot be safely relayed over MCP. If it changes data, check the site before you repeat the call. Contact the site administrator.', 'agent-abilities-for-mcp' )
+					);
+				}
+				// The adapter tells the client this exact shape failed, so the wrapper reports it as an
+				// error too and the row agrees. Anything wider, such as { success: false } alone, is data.
+				if (
+					is_array( $result )
+					&& array_key_exists( 'success', $result )
+					&& false === $result['success']
+					&& isset( $result['error'] )
+					&& is_string( $result['error'] )
+					&& '' !== trim( $result['error'] )
+				) {
+					return aafm_bridge_own_error( AAFM_BRIDGE_REPORTED_FAILURE, $result['error'] );
+				}
+				return $result;
+			},
+		);
+
+		// Copy the foreign output schema only when it actually exposes one (see helper). It is advertised to
+		// clients; AAFM_Rate_Limited_Ability::validate_output() skips core's second check for bridged names,
+		// because the source validated its own result. A source that skips its own check (it overrides
+		// validate_output()) does not keep its schema, so none is advertised for it.
+		$output_schema = aafm_bridge_output_schema( $foreign );
+		if ( null !== $output_schema && ! aafm_bridge_source_skips_output_check( $foreign ) ) {
+			$args['output_schema'] = $output_schema;
+		}
+
+		aafm_remember_bridge_source( $wrapper, $foreign_slug );
+		aafm_register_ability_with_log( $wrapper, $args );
+	}
+
+	// Publish this pass's collisions so the admin directory can flag any losing slug.
+	aafm_bridge_collisions( $collisions );
+}
+
+/**
+ * Whether a bridged ability's result is plain data: something that cannot hide state the plugin
+ * has not examined.
+ *
+ * Plain data is null, a scalar, an array, an exact stdClass, and an exact WP_Term, with every
+ * member of an array or object plain in turn. An object's public properties are walked exactly like
+ * an array's, so a stdClass holding a stdClass holding a scalar is fine and a stdClass holding a
+ * WP_User is not. WP_Term is final but allows dynamic properties, so it is walked too rather than
+ * trusted. Everything else is refused: WP_User (its ->data carries the password hash), WP_Post,
+ * JsonSerializable objects, stdClass subclasses (the check is get_class() ===, because
+ * `instanceof stdClass` is also true for a subclass that can carry private state), closures,
+ * resources, WP_Error inside a result, and any array or object nested at AAFM_SCHEMA_MAX_DEPTH or
+ * deeper (null and scalars are plain at any depth: they cannot hide state), and a float that is NaN or
+ * infinite, which JSON cannot encode. The depth bound also
+ * stops a stdClass that references itself. This plugin cannot know a third-party object's fields
+ * well enough to redact them, so it refuses rather than shapes. An exact stdClass is relayed with
+ * every property it holds, so a raw database row (`$wpdb->get_row()`) or a bare `WP_User::$data`
+ * returned by a foreign ability reaches the client, the same as that row returned as an array. The
+ * bridge does not redact fields; this is a known limit.
+ *
+ * @param mixed $value Value to inspect.
+ * @param int   $depth Current depth (internal; callers pass 0).
+ * @return bool
+ */
+function aafm_bridge_result_is_plain_data( $value, int $depth = 0 ): bool {
+	if ( is_float( $value ) ) {
+		return is_finite( $value ); // NaN and infinity cannot be encoded as JSON.
+	}
+	if ( null === $value || is_scalar( $value ) ) {
+		return true;
+	}
+	if ( $depth >= AAFM_SCHEMA_MAX_DEPTH ) {
+		return false;
+	}
+
+	if ( is_array( $value ) ) {
+		$members = $value;
+	} elseif ( is_object( $value ) && in_array( get_class( $value ), array( 'stdClass', 'WP_Term' ), true ) ) {
+		$members = get_object_vars( $value );
+	} else {
+		return false;
+	}
+
+	foreach ( $members as $member ) {
+		if ( ! aafm_bridge_result_is_plain_data( $member, $depth + 1 ) ) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Name the plugin behind a bridged ability's own failure.
+ *
+ * The client sees only the error text, so a bare "No such customer" gives no hint which plugin said
+ * it. The source is the plugin name from aafm_bridge_provider_label(); without one the namespace is
+ * named as a namespace, never guessed into a plugin name. The error code and data are kept; only the
+ * first message gets the prefix. The core namespace, an error with no code, core's own ability_*
+ * errors and a message that already names the plugin or the namespace (as whole words, ignoring
+ * case) are returned as they are.
+ *
+ * @param string    $foreign_slug Foreign ability slug, for example "woocommerce/product-update".
+ * @param \WP_Error $error        The error the foreign ability returned.
+ * @return \WP_Error
+ */
+function aafm_bridge_attribute_error( string $foreign_slug, \WP_Error $error ): \WP_Error {
+	$source = aafm_bridge_namespace_of( $foreign_slug );
+	$code   = $error->get_error_code();
+	if ( '' === $source || 'core' === $source || '' === $code || str_starts_with( (string) $code, 'ability_' ) ) {
+		return $error;
+	}
+
+	$label   = aafm_bridge_provider_label( $source );
+	$message = $error->get_error_message();
+	// Whole-word match, so a short namespace such as "ai" is not found inside "failed" or "email".
+	foreach ( array( $source, $label ) as $name ) {
+		if ( '' !== $name && 1 === preg_match( '/(?<![a-z0-9])' . preg_quote( $name, '/' ) . '(?![a-z0-9])/i', $message ) ) {
+			return $error;
+		}
+	}
+
+	$text = '' !== $label
+		? sprintf(
+			/* translators: 1: the plugin's name, for example "WooCommerce". 2: the error text that plugin returned. */
+			__( 'The %1$s plugin returned an error: %2$s', 'agent-abilities-for-mcp' ),
+			$label,
+			$message
+		)
+		: sprintf(
+			/* translators: 1: an ability namespace, for example "writer". 2: the error text that plugin returned. */
+			__( 'A plugin that registers tools under the "%1$s" namespace returned an error: %2$s', 'agent-abilities-for-mcp' ),
+			$source,
+			$message
+		);
+
+	return new WP_Error( $code, $text, $error->get_error_data() );
+}
+
+/**
+ * Whether a tool_call_result belongs to a BRIDGED (aafm-bridge/*) ability, classified by the
+ * backing ability's own identity rather than by the wire tool name.
+ *
+ * The wire-name prefix test alone is bypassable both directions. The adapter
+ * applies the PUBLIC mcp_adapter_tool_name filter to rename a tool's wire name AFTER sanitizing
+ * the ability name (RegisterAbilityAsMcpTool::resolve_tool_name), so a site hooking that filter
+ * could rename a bridged wrapper OUT of the aafm-bridge- prefix (skipping the list wrap entirely) or
+ * a NATIVE tool INTO it (wrongly subjecting it to bridge shaping). includes/server.php's own
+ * aafm_filter_mcp_tools_list() already solved the identical hazard for tools/list by re-applying
+ * that same filter to a name it derives itself; this takes the more direct route available here -
+ * reading the backing ability's own canonical name straight off the McpTool instance the adapter
+ * now hands this filter (accepted_args bumped to 4 on the add_filter() call in server.php), which
+ * a wire-name rename never touches.
+ *
+ * The identity is read from McpTool::fromAbility()'s own observability_context, which stamps
+ * 'ability_name' => $ability->get_name() - the ability's raw registered name, untouched by any
+ * wire-name filter (vendor/wordpress/mcp-adapter/includes/Domain/Tools/McpTool.php:230-236).
+ *
+ * Correction, recorded because an earlier version of this comment claimed the opposite: the bundled
+ * adapter's get_adapter_meta() DOES also carry an 'ability' key
+ * (Domain/Tools/RegisterAbilityAsMcpTool.php:157-160 seeds it with the ability name before adding
+ * the schema-transform flags), so either source would work today. observability_context is kept
+ * because it is stamped in McpTool::fromAbility() itself rather than assembled by the registration
+ * path, so it is the narrower dependency of the two. Do not reintroduce the claim that adapter_meta
+ * lacks the ability; it does not lack it.
+ *
+ * Falls back to the wire-name prefix test when $mcp_tool is absent or its metadata is not in the
+ * expected shape (an older call site still registered at accepted_args=3, a non-ability-backed
+ * tool built via McpTool::fromArray() which never stamps 'ability_name', or a future adapter
+ * version) - fails toward treating the tool as bridged, so a bare list is still wrapped.
+ *
+ * @param string $tool_name The wire tool name (fallback only).
+ * @param mixed  $mcp_tool  The McpTool instance the adapter passes as the 4th filter argument;
+ *                          may be absent or an unexpected type.
+ * @return bool
+ */
+function aafm_bridge_result_is_for_a_bridged_tool( string $tool_name, $mcp_tool ): bool {
+	if ( is_object( $mcp_tool ) && method_exists( $mcp_tool, 'get_observability_context' ) ) {
+		$context = $mcp_tool->get_observability_context();
+		if ( is_array( $context ) && isset( $context['ability_name'] ) && is_string( $context['ability_name'] ) ) {
+			return str_starts_with( $context['ability_name'], AAFM_BRIDGE_NAMESPACE . '/' );
+		}
+	}
+
+	return str_starts_with( $tool_name, AAFM_BRIDGE_NAMESPACE . '-' );
+}
+
+/**
+ * Safety net for a bridged ability whose result is a bare top-level JSON list.
+ *
+ * When a foreign ability declares no output_schema, aafm_bridge_output_schema() returns null and
+ * our wrapper's own registration omits output_schema too (see
+ * aafm_register_enabled_bridged_abilities() above). Core's WP_Ability::execute() ->
+ * validate_output() then short-circuits true on an empty schema without checking anything, so
+ * whatever the foreign ability returns reaches structuredContent under our tool name unchecked.
+ * If that is a bare top-level array, strict MCP clients reject the response - upstream issue
+ * WordPress/mcp-adapter#253, reproduced there against real WooCommerce REST list/report
+ * endpoints, which we bridge. This hooks the adapter's mcp_adapter_tool_call_result filter
+ * (fired after $mcp_tool->execute() in ToolsHandler::handle_tool_call(), since 0.5.0) and wraps
+ * a bare list under a `data` key so the wire shape is always an object.
+ *
+ * The wrap is UNCONDITIONAL for every bare list, whether or not the foreign ability declared an
+ * output_schema. An earlier revision of this function tried to skip the wrap whenever a schema
+ * was declared, reasoning that the adapter advertises {type:object, properties:{result:<schema>},
+ * required:['result']} for a non-object-root schema (SchemaTransformer::
+ * transform_to_object_schema()) and that a {"data":[...]} body would then satisfy neither side.
+ * That reasoning does not survive contact with the adapter's actual call order: for a DECLARED
+ * non-object-root schema, McpTool::execute() (`wrap_output_if_needed()`,
+ * vendor/wordpress/mcp-adapter/includes/Domain/Tools/McpTool.php:329-341) already wraps the value
+ * under `result` BEFORE this filter ever runs (ToolsHandler.php:189/:205), so by the time we see
+ * it the result is string-keyed - aafm_bridge_is_list() is false, and the guard below returns
+ * early without ever reaching the schema question. The schema-aware gate this docblock used to
+ * describe was therefore dead code for the one case it existed to protect, and where it WAS
+ * reachable (a foreign ability declaring {type:object} but still returning a bare PHP list - WP
+ * core's rest_is_object() accepts any array, so validate_output() lets it through) it made things
+ * worse: it left a bare `[...]` in structuredContent against an advertised object schema, where
+ * the unconditional wrap at least produces a valid JSON object.
+ *
+ * Known, deliberately unfixed limitation: a foreign ability that declares
+ * {type:object, additionalProperties:false} and returns array() for "nothing found" still
+ * receives {"data":[]} from this filter, which its own schema forbids. The only alternative is to
+ * leave that one case as a bare [], which is a top-level JSON array and violates the MCP spec for
+ * EVERY consumer, not just that one foreign ability's self-declared schema. Contradicting one
+ * foreign ability's schema is strictly better than shipping a spec-invalid response to every
+ * client, so this is intentionally not special-cased. Do not reintroduce the array()===$result
+ * exclusion to "fix" this - it previously ran before any schema check at all, which meant a
+ * bridged NO-SCHEMA tool returning "nothing found" reached the wire as a bare [] instead of
+ * {"data":[]}, regressing exactly the class of bug this filter exists to close.
+ *
+ * Scoped to aafm-bridge-* tool names only, not applied to our own aafm-* results. Every native
+ * ability's result is already asserted object-shaped by tests/WireShapeTest.php against the
+ * exact same execute() call this filter would otherwise see, so a native list-shape defect is a
+ * bug to fix at the source, not to paper over here. A blanket wrap would also produce a
+ * `{data: [...]}` shape that matches neither a native ability's documented output_schema nor a
+ * hypothetical buggy shape, masking the defect instead of surfacing it.
+ *
+ * Uses aafm_bridge_is_list() (defined above in this file), a hand-rolled sequential-key check
+ * that never calls PHP 8.1's array_is_list() - this plugin's floor is PHP 7.4 - so no version
+ * branching is needed here. Cannot double-wrap: once wrapped, the result carries a string key
+ * and is no longer a list, so a second pass is a no-op by construction.
+ *
+ * @param mixed $result    The raw tool execution result (may be WP_Error).
+ * @param mixed $args      The tool arguments used (unused here).
+ * @param mixed $tool_name The MCP tool name that was called (fallback classification only - see
+ *                         aafm_bridge_result_is_for_a_bridged_tool()).
+ * @param mixed $mcp_tool  The McpTool instance the adapter passes (accepted_args=4 on the
+ *                         add_filter() call in server.php); used to classify by backing ability
+ *                         identity rather than by the (renamable) wire tool name.
+ * @return mixed The result, wrapped under `data` for every bridged, bare-list result (including
+ *               an empty one - see the M2 note above).
+ */
+function aafm_filter_bridged_tool_call_result( $result, $args, $tool_name, $mcp_tool = null ) {
+	unset( $args );
+
+	if ( ! is_string( $tool_name ) || ! aafm_bridge_result_is_for_a_bridged_tool( $tool_name, $mcp_tool ) ) {
+		return $result;
+	}
+
+	// A genuine vendor failure is not a shape to inspect - pass it through so
+	// ToolsHandler::handle_tool_call() turns it into a proper MCP error result.
+	if ( is_wp_error( $result ) ) {
+		return $result;
+	}
+
+	if ( ! is_array( $result ) || ! aafm_bridge_is_list( $result ) ) {
+		return $result;
+	}
+
+	return array( 'data' => $result );
+}

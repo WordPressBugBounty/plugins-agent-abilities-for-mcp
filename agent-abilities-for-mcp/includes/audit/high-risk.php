@@ -1,0 +1,175 @@
+<?php
+/**
+ * The high-risk floor: the abilities that stay unreachable until the operator says otherwise.
+ *
+ * Membership is a security decision, not a preference, so both filters here are one-directional:
+ * one can only widen the locked set, the other can only force it shut. Neither can open it. The
+ * settings screen is the only thing that unlocks the category, and it takes a second deliberate
+ * action in a second place to do it.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * The abilities that move money or grant authority, and are therefore locked until the operator
+ * deliberately unlocks the category.
+ *
+ * These are not ordinary write abilities. Every one of them was verified by reading its execute
+ * callback, and every one is otherwise gated by nothing but a capability check and the same
+ * checkbox that governs a read. The floor exists so that reaching this category takes two
+ * deliberate actions in two separate places rather than one tick among many.
+ *
+ * @return list<string>
+ */
+function aafm_high_risk_abilities_builtin(): array {
+	return array(
+		'aafm/wc-create-order',
+		'aafm/wc-create-order-refund',
+		'aafm/wc-update-order-status',
+		'aafm/wc-update-order',
+		'aafm/wc-update-customer',
+		'aafm/wc-update-payment-gateway',
+		'aafm/wc-create-coupon',
+		'aafm/wc-update-coupon',
+		'aafm/wc-create-tax-rate',
+		'aafm/wc-update-tax-rate',
+	);
+}
+
+/**
+ * Other plugins' abilities held by the high-risk lock, by their foreign slug.
+ *
+ * WooCommerce's own order status and order update tools change an order the way the native
+ * locked tools do. The Secure Custom Fields post type and taxonomy tools accept a callback name
+ * (register_meta_box_cb, meta_box_cb) that reaches call_user_func() on that type's edit screen.
+ *
+ * @return list<string>
+ */
+function aafm_high_risk_bridged_builtin(): array {
+	return array(
+		'woocommerce/order-update-status',
+		'woocommerce/orders-update',
+		'scf/create-post-type',
+		'scf/update-post-type',
+		'scf/import-post-type',
+		'scf/create-taxonomy',
+		'scf/update-taxonomy',
+		'scf/import-taxonomy',
+	);
+}
+
+/**
+ * The full high-risk set: the native and bridged built-ins, plus anything a filter adds.
+ *
+ * The built-ins are re-merged AFTER the filter runs, so a filter can only ever add an ability to
+ * the locked category, never remove one. Same asymmetry as aafm_hard_blocked_meta_key(), and for
+ * the same reason: a filter that could narrow this list would be a filter that could switch the
+ * floor off.
+ *
+ * @return list<string>
+ */
+function aafm_high_risk_abilities(): array {
+	$builtin = array_merge( aafm_high_risk_abilities_builtin(), aafm_high_risk_bridged_builtin() );
+
+	/**
+	 * Filters EXTRA ability names to treat as high-risk. Built-ins are re-merged after, so
+	 * this can only ADD abilities to the locked set, never remove one.
+	 *
+	 * Takes native aafm/* names and other plugins' slugs as they register them, such as
+	 * woocommerce/order-update-status. A held foreign slug is kept out of the Other plugins tab
+	 * while the lock is on. A wrapper name (aafm-bridge/*) has no effect: name the plugin's own slug.
+	 *
+	 * @param list<string> $extra Extra ability names.
+	 */
+	$extra = apply_filters( 'aafm_high_risk_abilities', array() );
+	$extra = is_array( $extra ) ? array_map( 'strval', array_filter( $extra, 'is_scalar' ) ) : array();
+
+	return array_values( array_unique( array_merge( $extra, $builtin ) ) );
+}
+
+/**
+ * Persist the high-risk unlock switch.
+ *
+ * Off deletes the row rather than storing a falsy value: locked is the option's out-of-the-box
+ * (row-absent) state, and an explicit false is a state a fresh install can never be in. The write
+ * goes through aafm_persist_operator_switch(), which also clears any stale persistent-cache copy
+ * and reads the value back, so a lock that a stale cache would otherwise swallow is caught.
+ *
+ * @param bool $unlocked Whether the category should be unlocked.
+ * @return bool True when the switch now reads back as $unlocked.
+ */
+function aafm_set_high_risk_unlocked( bool $unlocked ): bool {
+	return aafm_persist_operator_switch( 'aafm_high_risk_abilities_unlocked', $unlocked );
+}
+
+/**
+ * Whether the operator has unlocked the high-risk category.
+ *
+ * The code filter is checked AFTER the option and can only force the floor shut, never open it:
+ * an agency or managed host can guarantee the category stays unreachable regardless of what a
+ * site admin later flips in wp-admin, and no filter can grant what the settings screen refused.
+ *
+ * @return bool
+ */
+function aafm_high_risk_unlocked(): bool {
+	// Only a scalar is a stored switch; any other shape reads as locked.
+	$unlocked = get_option( 'aafm_high_risk_abilities_unlocked', false );
+	$unlocked = is_scalar( $unlocked ) && (bool) $unlocked;
+	// A cache copy that disagrees with the row unlocks only when the row does too.
+	$row = aafm_policy_row_if_stale( 'aafm_high_risk_abilities_unlocked' );
+	if ( null !== $row ) {
+		$unlocked = $unlocked && $row['ok'] && $row['found'] && is_scalar( $row['value'] ) && (bool) $row['value'];
+	}
+
+	if ( aafm_high_risk_forced() ) {
+		return false;
+	}
+
+	return $unlocked;
+}
+
+/**
+ * Whether a host or site filter forces the high-risk floor shut, whatever the switch says.
+ *
+ * @return bool
+ */
+function aafm_high_risk_forced(): bool {
+	/**
+	 * Force the high-risk floor shut regardless of the settings-screen value.
+	 *
+	 * @param bool $forced Whether to force the floor shut.
+	 */
+	return (bool) apply_filters( 'aafm_force_block_high_risk_abilities', false );
+}
+
+/**
+ * Whether an ability belongs to the high-risk category. Independent of the lock state: a
+ * high-risk ability stays high-risk (and stays badged) once unlocked and enabled.
+ *
+ * Takes a native aafm/* name or a foreign slug. An aafm-bridge/* wrapper name is always false.
+ *
+ * @param string $name Ability name.
+ * @return bool
+ */
+function aafm_ability_is_high_risk( string $name ): bool {
+	// A wrapper name is never on the list: the lock holds the foreign slug, and the bridge maps a
+	// wrapper back to its slug before asking.
+	if ( str_starts_with( $name, 'aafm-bridge/' ) ) {
+		return false;
+	}
+	return in_array( $name, aafm_high_risk_abilities(), true );
+}
+
+/**
+ * Whether an ability is currently locked: high-risk AND the category is not unlocked.
+ *
+ * @param string $name Ability name.
+ * @return bool
+ */
+function aafm_ability_is_locked( string $name ): bool {
+	return aafm_ability_is_high_risk( $name ) && ! aafm_high_risk_unlocked();
+}

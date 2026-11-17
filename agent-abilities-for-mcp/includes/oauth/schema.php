@@ -1,0 +1,738 @@
+<?php
+/**
+ * OAuth storage schema: table install and drop.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+if ( ! defined( 'AAFM_OAUTH_SCHEMA_VERSION' ) ) {
+	// v2 adds the refresh_parent_id index on the access-tokens table. v3 widens the
+	// resource (audience) column on the codes and access-tokens tables from VARCHAR(191)
+	// to VARCHAR(2048) so a long endpoint URL is not truncated, which would break the
+	// later audience check. v4 adds a client_id index on the access-tokens table so the
+	// admin client listing and the revoke-by-client queries do not scan the whole table.
+	// v5 adds index coverage for the GC and revoke scans: a composite (is_active,
+	// refresh_expires_at) on access-tokens for the daily token GC; a (wp_user_id,
+	// client_id) on access-tokens for the revoke-by-grant scan; an expires_at index plus
+	// a client_id and (wp_user_id, client_id) index on codes for the code GC and the
+	// revoke-by-client/grant code deletes; and a created_at index on clients for the
+	// abandoned-client reaper. v6 adds a `scope` column to the codes and access-tokens
+	// tables so the requested OAuth scope is persisted through code -> token and is
+	// recorded/auditable (it previously reached the code context but was discarded at mint).
+	// The column defaults to '' so existing rows and the current "acts as the approver's
+	// full account" behaviour are unchanged; a map that replaces the token's capabilities
+	// (listed ones set outright, every other one denied) is opt-in via the
+	// aafm_oauth_token_capabilities filter. Bumping the version makes
+	// aafm_maybe_upgrade_oauth_tables() re-run dbDelta so existing installs pick the change
+	// up (additive - one nullable-defaulted column per table, no data migration).
+	// v7 pins the lifecycle tables (codes, access-tokens) to ENGINE=InnoDB so the code-redemption
+	// and refresh-rotation transactions can actually roll back. New installs get InnoDB from the
+	// CREATE; dbDelta never changes an existing table's engine, so the bump re-runs the installer
+	// once, which converts a pre-existing MyISAM lifecycle table with a guarded one-time ALTER
+	// (aafm_oauth_enforce_lifecycle_engine()). The stored charset/collation is unchanged.
+	// v8 adds an `is_agent_identity` column to the clients table: an operator-settable flag,
+	// distinct from the existing user-level aafm_agent_user_marker_meta_key() marker, that marks
+	// an OAuth client itself as an agent connection. Defaults to 0 for every existing row, so a
+	// bump changes no client's flagged state. Additive, no data migration.
+	// v9 adds six nullable columns to the consents table (paused_at, expires_at, last_used_at,
+	// last_used_ip, preset, rate_per_min) for per-connection pause, end date, last use, access preset
+	// and rate limit. NULL in every column means today's behaviour, so no existing row changes meaning
+	// and there is no data migration.
+	define( 'AAFM_OAUTH_SCHEMA_VERSION', '9' );
+}
+
+/**
+ * The unprefixed suffixes of the four OAuth tables.
+ *
+ * @return string[]
+ */
+function aafm_oauth_table_suffixes(): array {
+	return array(
+		'aafm_oauth_clients',
+		'aafm_oauth_codes',
+		'aafm_oauth_access_tokens',
+		'aafm_oauth_consents',
+	);
+}
+
+/**
+ * Create (or upgrade) the four OAuth tables, then record the schema version.
+ *
+ * Idempotent: dbDelta() only applies the diff, so repeat calls are no-ops once the
+ * tables match. Mirrors aafm_install_activity_log() in includes/audit/log.php.
+ *
+ * @return bool True only when the schema version was stamped.
+ */
+function aafm_install_oauth_tables(): bool {
+	global $wpdb;
+	require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+	$prefix          = $wpdb->prefix;
+	$charset_collate = $wpdb->get_charset_collate();
+
+	$clients = "CREATE TABLE {$prefix}aafm_oauth_clients (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+		client_id VARCHAR(191) NOT NULL DEFAULT '',
+		client_name VARCHAR(191) NOT NULL DEFAULT '',
+		redirect_uris LONGTEXT NULL,
+		grant_types LONGTEXT NULL,
+		response_types LONGTEXT NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		created_by_ip VARCHAR(45) NOT NULL DEFAULT '',
+		is_active TINYINT(1) NOT NULL DEFAULT 1,
+		is_agent_identity TINYINT(1) NOT NULL DEFAULT 0,
+		PRIMARY KEY  (id),
+		UNIQUE KEY client_id (client_id),
+		KEY created_at (created_at)
+	) ENGINE=InnoDB {$charset_collate};";
+
+	$codes = "CREATE TABLE {$prefix}aafm_oauth_codes (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+		code_hash VARCHAR(191) NOT NULL DEFAULT '',
+		client_id VARCHAR(191) NOT NULL DEFAULT '',
+		wp_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		redirect_uri TEXT NULL,
+		code_challenge VARCHAR(191) NOT NULL DEFAULT '',
+		resource VARCHAR(2048) NOT NULL DEFAULT '',
+		scope VARCHAR(191) NOT NULL DEFAULT '',
+		expires_at DATETIME NULL,
+		used_at DATETIME NULL,
+		PRIMARY KEY  (id),
+		UNIQUE KEY code_hash (code_hash),
+		KEY expires_at (expires_at),
+		KEY client_id (client_id),
+		KEY user_client (wp_user_id, client_id)
+	) ENGINE=InnoDB {$charset_collate};";
+
+	$access_tokens = "CREATE TABLE {$prefix}aafm_oauth_access_tokens (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+		token_hash VARCHAR(191) NOT NULL DEFAULT '',
+		refresh_hash VARCHAR(191) NOT NULL DEFAULT '',
+		refresh_parent_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		client_id VARCHAR(191) NOT NULL DEFAULT '',
+		wp_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		resource VARCHAR(2048) NOT NULL DEFAULT '',
+		scope VARCHAR(191) NOT NULL DEFAULT '',
+		expires_at DATETIME NULL,
+		refresh_expires_at DATETIME NULL,
+		is_active TINYINT(1) NOT NULL DEFAULT 1,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY  (id),
+		UNIQUE KEY token_hash (token_hash),
+		UNIQUE KEY refresh_hash (refresh_hash),
+		KEY refresh_parent_id (refresh_parent_id),
+		KEY client_id (client_id),
+		KEY gc (is_active, refresh_expires_at),
+		KEY user_client (wp_user_id, client_id)
+	) ENGINE=InnoDB {$charset_collate};";
+
+	$consents = "CREATE TABLE {$prefix}aafm_oauth_consents (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+		wp_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		client_id VARCHAR(191) NOT NULL DEFAULT '',
+		granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		paused_at DATETIME NULL,
+		expires_at DATETIME NULL,
+		last_used_at DATETIME NULL,
+		last_used_ip VARCHAR(45) NULL,
+		preset VARCHAR(20) NULL,
+		rate_per_min INT UNSIGNED NULL,
+		PRIMARY KEY  (id),
+		UNIQUE KEY user_client (wp_user_id, client_id)
+	) ENGINE=InnoDB {$charset_collate};";
+
+	dbDelta( $clients );
+	dbDelta( $codes );
+	dbDelta( $access_tokens );
+	dbDelta( $consents );
+
+	$engine_ok = aafm_oauth_enforce_lifecycle_engine();
+	return aafm_oauth_finalize_schema( $engine_ok );
+}
+
+/**
+ * The lifecycle tables whose rows a multi-statement transaction spans.
+ *
+ * The code-redemption path (includes/oauth/rest.php) and the refresh rotation (tokens.php) both
+ * wrap consume + mint in START TRANSACTION/ROLLBACK, which only rolls back on a transactional
+ * engine. These two tables therefore must be InnoDB; clients and consents are single-statement
+ * writes and are not enrolled here.
+ *
+ * @return string[]
+ */
+function aafm_oauth_lifecycle_table_suffixes(): array {
+	return array( 'aafm_oauth_codes', 'aafm_oauth_access_tokens' );
+}
+
+/**
+ * Ensure the lifecycle tables use a transactional (InnoDB) engine.
+ *
+ * New installs get ENGINE=InnoDB straight from the CREATE, but dbDelta never changes an existing
+ * table's engine, so a table first created on a MyISAM-default server stays MyISAM through every
+ * upgrade. There the consume/deactivate UPDATE commits immediately and a later failing mint cannot
+ * roll back, permanently burning an auth code or refresh token with no successor. So convert any
+ * non-InnoDB lifecycle table with a guarded one-time ALTER. If the ALTER cannot take (a server
+ * with no InnoDB support at all), record a bounded operational warning rather than silently
+ * trusting an atomicity the engine cannot provide - the token endpoints keep working, they just
+ * lose clean rollback on a rare mid-request failure until the host enables InnoDB.
+ *
+ * The return value gates the schema-version stamp in aafm_oauth_finalize_schema(): a confirmed
+ * non-InnoDB table that could not be converted must NOT let the install record v7 as complete, or
+ * both self-heal hooks early-return on the version match and the conversion never retries - the
+ * table stays non-transactional and the warning transient silently expires within a day.
+ *
+ * @return bool True when every lifecycle table is transactional OR its engine is unverifiable - it
+ *              is InnoDB, was just converted to InnoDB, or reads as '' (absent, or a TEMPORARY
+ *              harness table information_schema does not list). False only when a table's engine
+ *              reads as a confirmed non-InnoDB value AND the ALTER left it that way. Unverifiable is
+ *              deliberately treated as "allowed", not "failed": blocking on '' would stop every
+ *              PHPUnit install (whose TEMPORARY tables always read '') from stamping its version.
+ */
+function aafm_oauth_enforce_lifecycle_engine(): bool {
+	global $wpdb;
+
+	$non_transactional = array();
+
+	foreach ( aafm_oauth_lifecycle_table_suffixes() as $suffix ) {
+		$table = $wpdb->prefix . $suffix;
+		$view  = aafm_oauth_table_engine_view( $table );
+
+		// A SUCCESSFUL read of '' means the engine could not be determined: the table is absent, or
+		// it is a TEMPORARY table (the PHPUnit harness form), which information_schema does not
+		// list. Either way there is nothing to convert, nothing to warn about, and nothing to block
+		// the version stamp on. This must be gated on $view['ok'] as well as
+		// the value - a query that FAILED (not merely found nothing) used to read identically to
+		// '' here, so a stale non-null 'InnoDB' string left over from an earlier iteration's
+		// successful read of a DIFFERENT, already-converted table could make this branch wrongly
+		// believe a genuinely MyISAM table was already InnoDB and skip it entirely, with no warning
+		// ever recorded. A failed read now falls through to the same conversion-attempt branch a
+		// confirmed non-InnoDB table takes; if the follow-up read inside
+		// aafm_oauth_convert_table_to_innodb() also fails, the table lands in $non_transactional
+		// and the run is correctly reported incomplete instead of silently believed fine.
+		if ( $view['ok'] && ( '' === $view['value'] || 0 === strcasecmp( $view['value'], 'InnoDB' ) ) ) {
+			continue;
+		}
+
+		if ( ! aafm_oauth_convert_table_to_innodb( $table ) ) {
+			$non_transactional[] = $suffix;
+		}
+	}
+
+	if ( empty( $non_transactional ) ) {
+		delete_transient( 'aafm_oauth_engine_warning' );
+		return true;
+	}
+
+	// Bounded like the schema-error flag: a day-long note the next successful enforce clears.
+	set_transient( 'aafm_oauth_engine_warning', implode( ',', $non_transactional ), DAY_IN_SECONDS );
+	return false;
+}
+
+/**
+ * The storage engine of a table for the current blog, and whether the read itself succeeded.
+ *
+ * The information_schema view may omit a TEMPORARY table (the PHPUnit harness rewrites plugin
+ * CREATE TABLE to that form) or a table that does not exist, so both read as a SUCCESSFUL query
+ * whose value is '' - callers treat that as "cannot verify, do not act". A query that fails
+ * outright is a different thing entirely and must not be folded into the
+ * same '' signal - see aafm_wpdb_scalar()'s docblock for why $wpdb->query()'s own return value,
+ * not a bare get_var(), is what tells the two apart. The table name is bound as a value here
+ * (information_schema stores it as data), never interpolated.
+ *
+ * @param string $table Fully-prefixed table name (an internal constant).
+ * @return array{ok:bool,value:string} ok is false when the query itself failed - value is not
+ *              trustworthy in that case. value is the engine name (e.g. 'InnoDB', 'MyISAM'), or ''
+ *              when the query succeeded but the table is absent/unlisted.
+ */
+function aafm_oauth_table_engine_view( string $table ): array {
+	global $wpdb;
+	$view = aafm_wpdb_scalar(
+		$wpdb->prepare(
+			'SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s',
+			$table
+		)
+	);
+
+	return array(
+		'ok'    => $view['ok'],
+		'value' => is_string( $view['value'] ) ? $view['value'] : '',
+	);
+}
+
+/**
+ * The storage engine of a table for the current blog, or '' when it cannot be determined - either
+ * a genuinely absent/TEMPORARY table, or the read itself failing. Callers that must tell those two
+ * apart (a query failure is not the same thing as a confirmed-absent table) use
+ * aafm_oauth_table_engine_view() directly instead, the way aafm_oauth_enforce_lifecycle_engine()
+ * does.
+ *
+ * @param string $table Fully-prefixed table name (an internal constant).
+ * @return string Engine name (e.g. 'InnoDB', 'MyISAM'), or '' when unknown.
+ */
+function aafm_oauth_table_engine( string $table ): string {
+	return aafm_oauth_table_engine_view( $table )['value'];
+}
+
+/**
+ * Convert a table to InnoDB with a guarded one-time ALTER, and report whether it is now InnoDB.
+ *
+ * A dbDelta run cannot do this (it never touches an existing table's engine), hence the explicit
+ * ALTER. The %i placeholder quotes the identifier (an internal constant).
+ *
+ * @param string $table Fully-prefixed table name.
+ * @return bool True when the table is InnoDB after the attempt.
+ */
+function aafm_oauth_convert_table_to_innodb( string $table ): bool {
+	global $wpdb;
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange
+	$wpdb->query( $wpdb->prepare( 'ALTER TABLE %i ENGINE=InnoDB', $table ) );
+	return 0 === strcasecmp( aafm_oauth_table_engine( $table ), 'InnoDB' );
+}
+
+/**
+ * Admin notice: an OAuth lifecycle table is not on a transactional engine.
+ *
+ * Shown only while aafm_oauth_enforce_lifecycle_engine()'s bounded transient is set (it clears the
+ * moment every lifecycle table is InnoDB), and only to users who can act on it.
+ *
+ * @return void
+ */
+function aafm_oauth_engine_admin_notice(): void {
+	if ( ! current_user_can( 'activate_plugins' ) ) {
+		return;
+	}
+	if ( false === get_transient( 'aafm_oauth_engine_warning' ) ) {
+		return;
+	}
+	echo '<div class="notice notice-error"><p>';
+	echo esc_html__( 'Agent Abilities for MCP could not move its OAuth token tables to a transactional (InnoDB) storage engine. OAuth keeps working, but a rare failure mid-request may not roll back cleanly. Ask your host to enable InnoDB.', 'agent-abilities-for-mcp' );
+	echo '</p></div>';
+}
+add_action( 'admin_notices', 'aafm_oauth_engine_admin_notice' );
+
+/**
+ * Record the schema version, but only once the tables are verified to be really there.
+ *
+ * A dbDelta() run reports nothing when an ALTER it wanted is refused - a transient loss of the
+ * ALTER privilege mid-upgrade, a full disk, a single failed DDL - so the tables can be left partially
+ * upgraded while the call returns as if it succeeded. Stamping the version unconditionally then
+ * makes aafm_maybe_upgrade_oauth_tables() early-return forever, so a half-migrated install (say a
+ * codes/tokens insert that a missing `scope` column rejects) never self-heals and only a manual
+ * option delete recovers it. So verify first: advance the stored version only when the four tables
+ * and the latest columns are actually present. On failure leave the prior version in place - the
+ * next admin or REST request retries the install - and raise a bounded admin notice rather than
+ * silently advancing past a broken schema.
+ *
+ * The stamp is also gated on $engine_ok, the result of aafm_oauth_enforce_lifecycle_engine(): the
+ * v7 migration exists to make the lifecycle tables transactional, so a confirmed non-InnoDB table
+ * that could not be converted is as much a failed migration as a missing column, and stamping past
+ * it would freeze the table on a non-transactional engine forever (both self-heal hooks match on the
+ * version and stop retrying, and the engine warning transient expires within a day). An unverifiable
+ * engine ('' - the TEMPORARY harness tables) reports $engine_ok = true, so tests still stamp normally.
+ * A pure engine failure does not raise the schema-error notice: aafm_oauth_enforce_lifecycle_engine()
+ * already sets its own bounded engine warning, so the table-shape notice would be misleading here.
+ *
+ * @param bool $engine_ok Whether the lifecycle tables are confirmed transactional (or unverifiable).
+ * @return bool True only when the version was stamped.
+ */
+function aafm_oauth_finalize_schema( bool $engine_ok ): bool {
+	$schema_ok = aafm_oauth_schema_verify();
+	$stamped   = false;
+
+	if ( $schema_ok ) {
+		delete_transient( 'aafm_oauth_schema_error' );
+	} else {
+		// Bounded: a day-long flag the next successful verify clears, so the notice shows only while
+		// the schema is genuinely behind and disappears the moment the self-heal lands.
+		set_transient( 'aafm_oauth_schema_error', time(), DAY_IN_SECONDS );
+	}
+
+	if ( $schema_ok && $engine_ok ) {
+		// Verified, not a bare update_option(): aafm_maybe_upgrade_oauth_tables()
+		// below trusts this stamp to decide whether the installer needs to run again, so a write
+		// that a persistent cache silently no-ops must not be allowed to look like it landed.
+		// A fresh install is seeded with Administrators as the only approvers before its first stamp,
+		// and the stamp waits for the seed: an unstamped install is the one state the seed can still
+		// recognise as fresh (aafm_seed_fresh_install_defaults()).
+		$seeded  = aafm_seed_fresh_install_defaults();
+		$stamped = $seeded && aafm_update_option_verified( 'aafm_oauth_schema_version', AAFM_OAUTH_SCHEMA_VERSION );
+		if ( ! $stamped ) {
+			// This return value used to be discarded. The schema itself is
+			// genuinely fine, but with the version left un-stamped, aafm_maybe_upgrade_oauth_tables()
+			// reruns dbDelta() every request instead of settling - and the error transient above
+			// was already cleared on the strength of $schema_ok alone, hiding the persist failure
+			// from the admin notice. Re-set the transient and log the failure so it is visible.
+			set_transient( 'aafm_oauth_schema_error', time(), DAY_IN_SECONDS );
+			if ( $seeded ) {
+				aafm_log_ability_persist_failure( 'aafm_oauth_schema_version', __( 'The OAuth schema version', 'agent-abilities-for-mcp' ) );
+			} else {
+				aafm_log_ability_persist_failure( 'aafm_oauth_connect_roles', __( 'The roles that can connect apps', 'agent-abilities-for-mcp' ) );
+			}
+		}
+	}
+	return $stamped;
+}
+
+/**
+ * The six per-connection columns schema v9 adds to the consents table.
+ *
+ * @return string[]
+ */
+function aafm_oauth_grant_columns(): array {
+	return array( 'paused_at', 'expires_at', 'last_used_at', 'last_used_ip', 'preset', 'rate_per_min' );
+}
+
+/**
+ * Whether the OAuth schema is actually present: all four tables plus the latest columns.
+ *
+ * Verifies table presence, the v6 `scope` column on codes + access-tokens, the v8
+ * `is_agent_identity` column on clients, and every v9 column on consents. The most recent
+ * migration is v9, and every column it adds is checked, because a partial dbDelta can land the
+ * last column and miss an earlier one. Gates the version stamp in aafm_oauth_finalize_schema().
+ *
+ * @return bool
+ */
+function aafm_oauth_schema_verify(): bool {
+	global $wpdb;
+
+	foreach ( aafm_oauth_table_suffixes() as $suffix ) {
+		if ( ! aafm_oauth_table_present( $wpdb->prefix . $suffix ) ) {
+			return false;
+		}
+	}
+
+	foreach ( aafm_oauth_grant_columns() as $col ) {
+		if ( ! aafm_oauth_table_has_column( $wpdb->prefix . 'aafm_oauth_consents', $col ) ) {
+			return false;
+		}
+	}
+
+	return aafm_oauth_table_has_column( $wpdb->prefix . 'aafm_oauth_codes', 'scope' )
+		&& aafm_oauth_table_has_column( $wpdb->prefix . 'aafm_oauth_access_tokens', 'scope' )
+		&& aafm_oauth_table_has_column( $wpdb->prefix . 'aafm_oauth_clients', 'is_agent_identity' );
+}
+
+/**
+ * Whether a table exists for the current blog.
+ *
+ * The PHPUnit harness rewrites plugin CREATE TABLE to its TEMPORARY form, which SHOW TABLES does
+ * not list, so existence is probed with a trivial select that sees a temporary table the same way
+ * the plugin's own queries do. The %i placeholder quotes the identifier (an internal constant).
+ *
+ * This used to read '' === $wpdb->last_error as its success signal, which
+ * confuses a query that never ran (three of $wpdb->query()'s own false-returning paths never
+ * touch last_error - see aafm_wpdb_scalar()'s docblock) with one that ran and found the
+ * table. Under that failure shape an absent table (the consents table, say, after an
+ * unsuccessful CREATE) reported present, and schema finalization could stamp the current version
+ * without the normal missing-table retry ever firing. Delegating to aafm_wpdb_scalar(), which
+ * checks $wpdb->query()'s own return value, closes the same gap the activity-log table's sibling
+ * probe closes.
+ *
+ * @param string $table Fully-prefixed table name.
+ * @return bool
+ */
+function aafm_oauth_table_present( string $table ): bool {
+	global $wpdb;
+	$suppressed = $wpdb->suppress_errors( true );
+	$result     = aafm_wpdb_scalar( $wpdb->prepare( 'SELECT 1 FROM %i LIMIT 0', $table ) );
+	$wpdb->suppress_errors( $suppressed );
+	return $result['ok'];
+}
+
+/**
+ * Whether a named column exists on a table. Works on the harness's TEMPORARY tables.
+ *
+ * A bare $wpdb->get_var() returns the PREVIOUS query's row when the current
+ * query itself fails, so a failed SHOW COLUMNS could inherit an unrelated non-empty value left
+ * over from an earlier, successful check and report a missing column as present - letting schema
+ * finalization stamp the current version over an incomplete upgrade. Routed through
+ * aafm_wpdb_scalar() so a failed read reports absent, the same fail-closed direction this
+ * function already took for a genuinely missing column.
+ *
+ * @param string $table  Fully-prefixed table name (an internal constant).
+ * @param string $column Column name to look for (no wildcards; matched exactly by SHOW COLUMNS).
+ * @return bool
+ */
+function aafm_oauth_table_has_column( string $table, string $column ): bool {
+	global $wpdb;
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$view = aafm_wpdb_scalar( $wpdb->prepare( 'SHOW COLUMNS FROM %i LIKE %s', $table, $column ) );
+	return $view['ok'] && null !== $view['value'] && '' !== $view['value'];
+}
+
+/**
+ * Admin notice: the OAuth schema did not finish installing or upgrading.
+ *
+ * Shown only while aafm_oauth_finalize_schema()'s bounded transient is set (it clears the moment a
+ * verify passes), and only to users who can act on it.
+ *
+ * @return void
+ */
+function aafm_oauth_schema_admin_notice(): void {
+	if ( ! current_user_can( 'activate_plugins' ) ) {
+		return;
+	}
+	if ( false === get_transient( 'aafm_oauth_schema_error' ) ) {
+		return;
+	}
+	echo '<div class="notice notice-error"><p>';
+	echo esc_html__( 'Agent Abilities for MCP could not finish setting up its OAuth database tables. OAuth may not work correctly until the update completes; the plugin retries automatically on the next admin or REST request.', 'agent-abilities-for-mcp' );
+	echo '</p></div>';
+}
+add_action( 'admin_notices', 'aafm_oauth_schema_admin_notice' );
+
+/**
+ * Run the installer when the stored schema version is behind the current one.
+ *
+ * Cheap early return when the option already matches, so this can be hooked on
+ * every admin request without churn. dbDelta() is safe to re-run and the
+ * installer resets the option. Mirrors the audit log's activation wiring.
+ *
+ * Reads the database row directly rather than get_option()'s cache-trusting view:
+ * a stale cached current version over an old/absent database row would skip a genuinely
+ * needed install, and this file's own docblocks identify missing tables/columns as the failure
+ * this guard exists to catch.
+ *
+ * Retry policy: activation takes no lock, so the first admin or REST request after a failed
+ * activation retries at once; a failed retry holds aafm_oauth_upgrade_lock for an hour; deactivating
+ * and reactivating the plugin retries immediately.
+ *
+ * @return void
+ */
+function aafm_maybe_upgrade_oauth_tables(): void {
+	if ( AAFM_OAUTH_SCHEMA_VERSION === (string) aafm_read_option_views( 'aafm_oauth_schema_version' )['db_value'] ) {
+		return;
+	}
+
+	// One request upgrades at a time, and a failed upgrade waits an hour before the next try, so a
+	// refused ALTER does not rerun dbDelta() on every admin and REST request. Same lock and same
+	// ceiling as aafm_maybe_upgrade_activity_log(). An unreadable lock counts as held.
+	$held = aafm_transient_count( 'aafm_oauth_upgrade_lock' );
+	if ( null === $held || $held > 0 ) {
+		return;
+	}
+	set_transient( 'aafm_oauth_upgrade_lock', 1, MINUTE_IN_SECONDS );
+	if ( aafm_install_oauth_tables() ) {
+		delete_transient( 'aafm_oauth_upgrade_lock' );
+		return;
+	}
+	set_transient( 'aafm_oauth_upgrade_lock', 1, HOUR_IN_SECONDS );
+}
+
+/**
+ * Seconds before a never-consented, token-less DCR client row is reaped.
+ *
+ * @return int
+ */
+function aafm_oauth_client_reap_ttl(): int {
+	/**
+	 * TTL (seconds) before a never-consented, token-less DCR client row is reaped.
+	 *
+	 * @param int $ttl TTL in seconds. Default 7 days.
+	 */
+	return max( 0, (int) apply_filters( 'aafm_oauth_client_reap_ttl', 7 * DAY_IN_SECONDS ) );
+}
+
+/**
+ * Empty all four OAuth tables, keeping their structure. Used by the plugin reset.
+ *
+ * Uses DELETE rather than TRUNCATE so it stays compatible with the PHPUnit harness,
+ * which rewrites these tables to their TEMPORARY form (TRUNCATE cannot target a
+ * temporary table in some MySQL configs). Mirrors aafm_drop_oauth_tables()' escaping.
+ *
+ * Certifies each table by reading its row count back rather than trusting the DELETE's own
+ * affected-row count: a table this call never actually reached still
+ * counts as failed, even though it never contributes a nonzero affected-row count either way.
+ *
+ * The confirmation read goes through aafm_wpdb_scalar() rather than a bare get_var():
+ * a get_var() read that itself failed used to cast straight to `(int) null === 0`,
+ * the same "unreadable, so call it empty" mistake the DELETE-count fix above already closed, just
+ * one query later.
+ *
+ * @return bool True when every table is confirmed empty after this call.
+ */
+function aafm_truncate_oauth_tables(): bool {
+	global $wpdb;
+
+	$ok = true;
+	foreach ( aafm_oauth_table_suffixes() as $suffix ) {
+		$table = $wpdb->prefix . $suffix;
+		// Internal table name bound as a SQL identifier via %i (available since WP 6.2).
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$wpdb->query( $wpdb->prepare( 'DELETE FROM %i', $table ) );
+
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$remaining = aafm_wpdb_scalar( $wpdb->prepare( 'SELECT COUNT(*) FROM %i', $table ) );
+		if ( ! $remaining['ok'] || 0 !== (int) $remaining['value'] ) {
+			$ok = false;
+		}
+	}
+
+	return $ok;
+}
+
+/**
+ * Prune dead OAuth artifacts: expired authorization codes and inactive access
+ * tokens whose refresh window has lapsed past a small grace period.
+ *
+ * Run daily by the `aafm_oauth_cleanup` cron event. Two passes:
+ *
+ * - Codes are one-time and short-lived (60-second TTL), so any row past its
+ *   `expires_at` is dead regardless of `used_at` and is deleted.
+ * - Access-token rows are deleted only when inactive (`is_active = 0`) AND their
+ *   `refresh_expires_at` is older than now minus a grace window. An active row is
+ *   never pruned by access-token expiry alone: its refresh token is still valid.
+ *   The grace lets a rotated/replaced (now-inactive) refresh row linger briefly so
+ *   the token manager's reuse-detection still has the parent chain to walk during a
+ *   network race. Filterable via `aafm_oauth_cleanup_grace` (seconds).
+ *
+ * Times are compared in UTC `Y-m-d H:i:s`, the storage format used across the
+ * plugin (matches the token manager and audit log). Mirrors the direct-query and
+ * escaping precedent of aafm_truncate_oauth_tables() / aafm_drop_oauth_tables().
+ *
+ * @return void
+ */
+function aafm_oauth_cleanup(): void {
+	global $wpdb;
+
+	$now = gmdate( 'Y-m-d H:i:s', time() );
+
+	/**
+	 * Grace period (in seconds) before an inactive token row is eligible for
+	 * deletion after its refresh window expires. Keeps a rotated refresh row around
+	 * long enough for reuse detection under a network race.
+	 *
+	 * @param int $grace Grace period in seconds. Default DAY_IN_SECONDS.
+	 */
+	$grace        = (int) apply_filters( 'aafm_oauth_cleanup_grace', DAY_IN_SECONDS );
+	$token_cutoff = gmdate( 'Y-m-d H:i:s', time() - $grace );
+
+	// Internal constant table names; esc_sql() makes the safety explicit for analyzers.
+	$codes_table  = esc_sql( $wpdb->prefix . 'aafm_oauth_codes' );
+	$tokens_table = esc_sql( $wpdb->prefix . 'aafm_oauth_access_tokens' );
+
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$wpdb->query(
+		$wpdb->prepare(
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name is an internal constant.
+			"DELETE FROM {$codes_table} WHERE expires_at IS NOT NULL AND expires_at < %s",
+			$now
+		)
+	);
+
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$wpdb->query(
+		$wpdb->prepare(
+			// phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared -- table name is an internal constant.
+			"DELETE FROM {$tokens_table} WHERE is_active = 0 AND refresh_expires_at IS NOT NULL AND refresh_expires_at < %s",
+			$token_cutoff
+		)
+	);
+
+	// Third pass: reap abandoned Dynamic Client Registration rows so the public DCR
+	// endpoint cannot grow the clients table without bound.
+	aafm_oauth_reap_abandoned_clients();
+}
+
+/**
+ * Delete Dynamic-Client-Registration rows that were never used and are past a TTL.
+ *
+ * The DCR endpoint is public (the OAuth grant is the auth), so a client row is created before
+ * any human approves it. A client that registered but no one ever consented to - and that holds
+ * no token rows of any state - is dead weight. This removes such rows once they are older than
+ * the TTL (default 7 days), keeping a generous window for a legitimate register-then-approve
+ * flow that spans a session. A client with at least one consent OR any token row is kept, so a
+ * live or revoked-but-historical client is never reaped - the deletion re-checks that condition
+ * itself rather than trusting the scan that found the candidates. Deletes the matching codes too.
+ *
+ * The TTL is filterable via `aafm_oauth_client_reap_ttl` (seconds). All three tables are
+ * internal constants; the cutoff is bound.
+ *
+ * @return int Number of client rows reaped.
+ */
+function aafm_oauth_reap_abandoned_clients(): int {
+	global $wpdb;
+
+	$cutoff = gmdate( 'Y-m-d H:i:s', time() - aafm_oauth_client_reap_ttl() );
+
+	$clients_table  = esc_sql( $wpdb->prefix . 'aafm_oauth_clients' );
+	$consents_table = esc_sql( $wpdb->prefix . 'aafm_oauth_consents' );
+	$tokens_table   = esc_sql( $wpdb->prefix . 'aafm_oauth_access_tokens' );
+	$codes_table    = esc_sql( $wpdb->prefix . 'aafm_oauth_codes' );
+
+	// Find abandoned client_ids: older than the cutoff, with no consent row and no token row.
+	// All table names are internal constants; the cutoff is bound. Routed
+	// through aafm_wpdb_col() rather than a bare get_col() - a failed query here must not be
+	// allowed to return an earlier, unrelated query's column values, since this list feeds a
+	// DELETE below and a stale, wrong client_id list would delete the wrong rows.
+	// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+	$view = aafm_wpdb_col(
+		$wpdb->prepare(
+			"SELECT cl.client_id FROM {$clients_table} cl
+			 WHERE cl.created_at < %s
+			   AND NOT EXISTS ( SELECT 1 FROM {$consents_table} co WHERE co.client_id = cl.client_id )
+			   AND NOT EXISTS ( SELECT 1 FROM {$tokens_table} t WHERE t.client_id = cl.client_id )",
+			$cutoff
+		)
+	);
+	// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+
+	if ( ! $view['ok'] || empty( $view['value'] ) || ! is_array( $view['value'] ) ) {
+		return 0;
+	}
+	$abandoned = $view['value'];
+
+	$placeholders = implode( ', ', array_fill( 0, count( $abandoned ), '%s' ) );
+
+	// Delete the clients, but re-certify abandonment in the DELETE's own WHERE clause rather
+	// than trusting the candidate list above: that list can go stale
+	// between the scan and this delete if a candidate is approved in the meantime - consent
+	// recorded, a code minted, a token issued - and a blind IN-list delete would then remove a
+	// registration that just went live, orphaning the token issued seconds earlier. Carrying the
+	// scan's exact predicate here means the database decides from current data at delete time,
+	// not PHP from a stale snapshot, the same fix shape as the row-locked UPDATE.
+	// phpcs:disable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+	$deleted = (int) $wpdb->query(
+		$wpdb->prepare(
+			"DELETE FROM {$clients_table} WHERE client_id IN ( {$placeholders} )
+			   AND created_at < %s
+			   AND NOT EXISTS ( SELECT 1 FROM {$consents_table} co WHERE co.client_id = {$clients_table}.client_id )
+			   AND NOT EXISTS ( SELECT 1 FROM {$tokens_table} t WHERE t.client_id = {$clients_table}.client_id )",
+			array_merge( $abandoned, array( $cutoff ) )
+		)
+	);
+
+	// Only now delete the stray codes - scoped to client_ids that no longer have a client row
+	// at all, derived from the delete that just happened rather than from the stale candidate
+	// list. A candidate that survived the recheck above (freshly approved, consent and a code
+	// both just minted) keeps its client row and, by the same token, its live code.
+	$wpdb->query(
+		$wpdb->prepare(
+			"DELETE FROM {$codes_table} WHERE client_id IN ( {$placeholders} )
+			   AND NOT EXISTS ( SELECT 1 FROM {$clients_table} cl WHERE cl.client_id = {$codes_table}.client_id )",
+			$abandoned
+		)
+	);
+	// phpcs:enable WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQLPlaceholders.UnfinishedPrepare
+
+	return $deleted;
+}
+
+/**
+ * Drop all four OAuth tables. Used by uninstall.
+ *
+ * @return void
+ */
+function aafm_drop_oauth_tables(): void {
+	global $wpdb;
+
+	foreach ( aafm_oauth_table_suffixes() as $suffix ) {
+		// Internal table name bound as a SQL identifier via %i (available since WP 6.2).
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange
+		$wpdb->query( $wpdb->prepare( 'DROP TABLE IF EXISTS %i', $wpdb->prefix . $suffix ) );
+	}
+}

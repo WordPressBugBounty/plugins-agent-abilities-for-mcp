@@ -1,0 +1,1120 @@
+<?php
+/**
+ * WooCommerce integration abilities - shipping zone and method reads and writes (sub-slice W4-WC5).
+ *
+ * Registers ONLY when WooCommerce is active (aafm_integration_active('woocommerce')); a host-inactive
+ * site contributes zero entries to the registry. Every ability gates on the flat, object-independent
+ * manage_woocommerce capability and falls through to its real permission_callback at discovery (no
+ * server.php case). Shared helpers live in _shared.php, loaded before this file.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter( 'aafm_abilities_registry', 'aafm_register_wc_shipping_definitions' );
+add_filter( 'aafm_abilities_registry_integrations', 'aafm_register_wc_shipping_full_definitions' );
+
+/**
+ * Contribute the WooCommerce shipping definitions to the registry, but only when WooCommerce is
+ * active. Host inactive: the registry is returned unchanged.
+ *
+ * @param array<string,array<string,mixed>> $registry Registry.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_wc_shipping_definitions( array $registry ): array {
+	if ( ! aafm_integration_active( 'woocommerce' ) ) {
+		return $registry; // Host inactive: contribute nothing.
+	}
+
+	return array_merge( $registry, aafm_wc_shipping_registry_definitions() );
+}
+
+/**
+ * Contribute the WooCommerce shipping definitions to the guard-independent full registry view.
+ *
+ * Unguarded by design: the full view (aafm_get_abilities_registry_full()) enumerates every
+ * WooCommerce ability even when WooCommerce is inactive, for the Integrations tab and the manifest.
+ * The live registration path never reads this filter, so an inactive host still exposes zero tools.
+ *
+ * @param array<string,array<string,mixed>> $registry Integration rows accumulator.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_wc_shipping_full_definitions( array $registry ): array {
+	return array_merge( $registry, aafm_wc_shipping_registry_definitions() );
+}
+
+/**
+ * The WooCommerce shipping registry rows, keyed by ability name. The single source of truth for
+ * these abilities' label, description, group, risk, and args builder - consumed by both the
+ * host-guarded live registration callback and the unguarded full-view callback.
+ *
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_wc_shipping_registry_definitions(): array {
+	return array(
+		// Shipping zones (sub-slice W4-WC5) - zone and method management gated on manage_woocommerce.
+		'aafm/wc-list-shipping-zones'    => array(
+			'label'        => __( 'List WooCommerce shipping zones', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Lists WooCommerce shipping zones with their id, name, and order. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_list_shipping_zones',
+		),
+
+		'aafm/wc-get-shipping-zone'      => array(
+			'label'        => __( 'Get WooCommerce shipping zone', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Reads one WooCommerce shipping zone by id, including its name, order, and zone locations. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_get_shipping_zone',
+		),
+
+		'aafm/wc-create-shipping-zone'   => array(
+			'label'        => __( 'Create WooCommerce shipping zone', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Creates a WooCommerce shipping zone from a name and optional order. A new zone\'s locations (zone_locations) cannot be set through this plugin\'s abilities, so it matches nothing until they are assigned in the WooCommerce admin under WooCommerce > Settings > Shipping. Returns the full zone shape. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'writes',
+			'risk'         => 'write',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_create_shipping_zone',
+		),
+
+		'aafm/wc-update-shipping-zone'   => array(
+			'label'        => __( 'Update WooCommerce shipping zone', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Updates a WooCommerce shipping zone by id, changing only the fields you send (zone_name, zone_order). An empty request body is a no-op success. The zone\'s locations (zone_locations) cannot be changed through this plugin\'s abilities; assign them in the WooCommerce admin under WooCommerce > Settings > Shipping. Returns the full zone shape. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'writes',
+			'risk'         => 'write',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_update_shipping_zone',
+		),
+
+		// Shipping methods (sub-slice W4-WC5) - always scoped to a zone.
+		'aafm/wc-list-shipping-methods'  => array(
+			'label'        => __( 'List WooCommerce shipping methods', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Lists the shipping methods configured in a WooCommerce shipping zone, given its zone id. Each method returns its instance id, type, title, enabled state, order, and per-instance settings. The settings object is the method\'s own configuration, so for a carrier or gateway plugin it can hold account details; field names matching a known secret pattern are removed before the response, but that check is a denylist and cannot cover every third-party naming. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_list_shipping_methods',
+		),
+
+		'aafm/wc-get-shipping-method'    => array(
+			'label'        => __( 'Get WooCommerce shipping method', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Reads one shipping method from a WooCommerce shipping zone, given the zone id and the method\'s instance id. Returns its type, title, enabled state, order, and per-instance settings. The settings object is the method\'s own configuration, so for a carrier or gateway plugin it can hold account details; field names matching a known secret pattern are removed before the response, but that check is a denylist and cannot cover every third-party naming. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_get_shipping_method',
+		),
+
+		'aafm/wc-create-shipping-method' => array(
+			'label'        => __( 'Create WooCommerce shipping method', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Adds a shipping method to a WooCommerce shipping zone. Provide the zone id and method type (e.g. flat_rate, free_shipping, local_pickup). A newly added method\'s cost is left at WooCommerce\'s own default (0 for flat_rate) until set; this plugin\'s abilities cannot write it, so set the method\'s cost in the WooCommerce admin under the zone\'s shipping method settings. Returns the new method shape. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'writes',
+			'risk'         => 'write',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_create_shipping_method',
+		),
+
+		'aafm/wc-update-shipping-method' => array(
+			'label'        => __( 'Update WooCommerce shipping method', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Updates a shipping method in a WooCommerce shipping zone by zone id and instance id, changing only the fields you send (method_title, enabled). The method\'s cost cannot be changed through this plugin\'s abilities; set it in the WooCommerce admin under the zone\'s shipping method settings. Returns the updated method shape. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'writes',
+			'risk'         => 'write',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_update_shipping_method',
+		),
+
+	);
+}
+
+// =============================================================================
+// SHIPPING ZONES - helpers
+// =============================================================================
+
+/**
+ * Resolve a zone_id to a WC_Shipping_Zone, or null when unavailable or unknown.
+ *
+ * This used to hand-instantiate
+ * `new \WC_Shipping_Zone( $zone_id )` inside a try/catch plus a redundant id-match re-check.
+ * WooCommerce ships the exact resolver for this job, \WC_Shipping_Zones::get_zone( $zone_id )
+ * (class-wc-shipping-zones.php:78-80, a one-line wrapper around get_zone_by()), which does the
+ * identical instantiate-inside-try/catch(Exception) itself (class-wc-shipping-zones.php:90-112) -
+ * confirmed by reading the constructor and the data store's read_multiple(), which is what
+ * actually throws for a missing non-zero id. WooCommerce's own REST controller base class calls
+ * this vendor resolver rather than instantiating directly
+ * (class-wc-rest-shipping-zones-controller-base.php:43-48). Traced both paths line by line: no
+ * observable difference today (the plugin's own $zone_id < 0 guard and post-construction id
+ * re-check were both already redundant with what the vendor resolver does internally), so this
+ * was drift-risk duplication carried by 7 of this file's 8 abilities through this one shared
+ * helper, not a live gap.
+ *
+ * @param int $zone_id Zone id (0 = Rest of World).
+ * @return \WC_Shipping_Zone|null
+ */
+function aafm_wc_get_shipping_zone_object( int $zone_id ): ?\WC_Shipping_Zone {
+	if ( ! class_exists( 'WC_Shipping_Zone' ) ) {
+		return null;
+	}
+	$zone = \WC_Shipping_Zones::get_zone( $zone_id );
+	return $zone instanceof \WC_Shipping_Zone ? $zone : null;
+}
+
+/**
+ * The clean not-found error for an unknown shipping zone id - same contract as the tax sibling's
+ * aafm_not_found.
+ *
+ * @return \WP_Error
+ */
+function aafm_wc_shipping_zone_not_found(): \WP_Error {
+	return new \WP_Error( 'aafm_not_found', __( 'Shipping zone not found.', 'agent-abilities-for-mcp' ) );
+}
+
+/**
+ * Build the lean zone shape for list rows: id, name, order only.
+ *
+ * @param \WC_Shipping_Zone $zone Zone object.
+ * @return array<string,mixed>
+ */
+function aafm_redact_wc_shipping_zone( \WC_Shipping_Zone $zone ): array {
+	$data = $zone->get_data();
+	return array(
+		'id'         => (int) ( $data['id'] ?? $zone->get_id() ),
+		'zone_name'  => (string) ( $data['zone_name'] ?? '' ),
+		'zone_order' => (int) ( $data['zone_order'] ?? 0 ),
+	);
+}
+
+/**
+ * Build the lean zone-list row from a WC_Shipping_Zones::get_zones() row.
+ *
+ * WC_Shipping_Zones::get_zones() hands back each zone as its get_data() array merged with a few
+ * extra keys, not a zone object, so the lean fields are read straight off the row. The zone id is
+ * resolved by the caller (the array is keyed by it) and passed in so an unresolvable row can be
+ * rejected first.
+ *
+ * @param array<string,mixed> $row     One row from WC_Shipping_Zones::get_zones().
+ * @param int                 $zone_id Resolved zone id for the row.
+ * @return array<string,mixed>
+ */
+function aafm_redact_wc_shipping_zone_row( array $row, int $zone_id ): array {
+	return array(
+		'id'         => $zone_id,
+		'zone_name'  => (string) ( $row['zone_name'] ?? '' ),
+		'zone_order' => (int) ( $row['zone_order'] ?? 0 ),
+	);
+}
+
+/**
+ * Build the full zone shape: id, name, order, and zone_locations.
+ *
+ * @param \WC_Shipping_Zone $zone Zone object.
+ * @return array<string,mixed>
+ */
+function aafm_rich_wc_shipping_zone( \WC_Shipping_Zone $zone ): array {
+	$data = $zone->get_data();
+	return array(
+		'id'             => (int) ( $data['id'] ?? $zone->get_id() ),
+		'zone_name'      => (string) ( $data['zone_name'] ?? '' ),
+		'zone_order'     => (int) ( $data['zone_order'] ?? 0 ),
+		'zone_locations' => (array) ( $data['zone_locations'] ?? array() ),
+	);
+}
+
+/**
+ * Shared output properties for the zone full shape.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_wc_shipping_zone_output_properties(): array {
+	return array(
+		'id'             => array( 'type' => 'integer' ),
+		'zone_name'      => array( 'type' => 'string' ),
+		'zone_order'     => array( 'type' => 'integer' ),
+		'zone_locations' => array(
+			'type'        => 'array',
+			'items'       => array( 'type' => 'object' ),
+			'description' => __( 'Countries, states, or postcodes this zone matches, as WooCommerce stores them. Read-only here: this plugin\'s abilities cannot set or change zone_locations, only report it. Assign locations in the WooCommerce admin under WooCommerce > Settings > Shipping.', 'agent-abilities-for-mcp' ),
+		),
+	);
+}
+
+/**
+ * Shared write-input properties for shipping zone create and update.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_wc_shipping_zone_write_properties(): array {
+	return array(
+		'zone_name'  => array(
+			'type'        => 'string',
+			'description' => __( 'Display name for the shipping zone shown in the WooCommerce admin.', 'agent-abilities-for-mcp' ),
+		),
+		'zone_order' => array(
+			'type'        => 'integer',
+			'minimum'     => 0,
+			'description' => __( "Sort position among shipping zones, lowest first. Zones are matched against a customer's address in this order, so an earlier zone whose locations also match a later zone's address wins. New zones default to 0 when omitted; on update, an omitted value leaves the zone's existing order unchanged.", 'agent-abilities-for-mcp' ),
+		),
+	);
+}
+
+/**
+ * Apply validated write-input fields to a WC_Shipping_Zone instance.
+ *
+ * Only keys present in $input are applied; absent keys leave the zone unchanged.
+ *
+ * @param \WC_Shipping_Zone   $zone  Zone object to mutate.
+ * @param array<string,mixed> $input Validated input fields (zone_id already extracted).
+ * @return \WP_Error|null An error when the name is empty, otherwise null.
+ */
+function aafm_wc_apply_shipping_zone_input( \WC_Shipping_Zone $zone, array $input ): ?\WP_Error {
+	if ( array_key_exists( 'zone_name', $input ) ) {
+		$name = aafm_sanitize_plain_text( (string) $input['zone_name'] );
+		if ( '' === trim( $name ) ) {
+			return new \WP_Error(
+				'aafm_wc_invalid_zone_name',
+				__( 'A shipping zone needs a name, so nothing was saved.', 'agent-abilities-for-mcp' ),
+				array( 'status' => 400 )
+			);
+		}
+		$zone->set_zone_name( $name );
+	}
+	if ( array_key_exists( 'zone_order', $input ) ) {
+		$zone->set_zone_order( absint( $input['zone_order'] ) );
+	}
+	return null;
+}
+
+// =============================================================================
+// wc-list-shipping-zones
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-list-shipping-zones.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_list_shipping_zones(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-list-shipping-zones' ),
+		'description'         => aafm_ability_description( 'aafm/wc-list-shipping-zones' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'properties'           => array(),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'zones' => array(
+					'type'  => 'array',
+					'items' => array(
+						'type'                 => 'object',
+						'properties'           => array(
+							'id'         => array( 'type' => 'integer' ),
+							'zone_name'  => array( 'type' => 'string' ),
+							'zone_order' => array( 'type' => 'integer' ),
+						),
+						'additionalProperties' => false,
+					),
+				),
+				'total' => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_wc_list_shipping_zones',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-list-shipping-zones.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_list_shipping_zones( array $input ) { // phpcs:ignore Generic.CodeAnalysis.UnusedFunctionParameter.Found -- no input params used; signature required by abilities API.
+	if ( ! class_exists( 'WC_Shipping_Zones' ) ) {
+		return aafm_generic_error();
+	}
+
+	// WC_Shipping_Zones::get_zones() returns each zone as its get_data() array (id, zone_name,
+	// zone_order, zone_locations) merged with zone_id, formatted_zone_location, and
+	// shipping_methods, keyed by zone id. There is NO zone object on the row - the lean list
+	// fields are read straight off it. A row that carries no usable zone id is a data error, not
+	// a reason to silently drop a real zone into an empty list.
+	$zones_raw = \WC_Shipping_Zones::get_zones();
+	$rows      = array();
+	foreach ( $zones_raw as $zone_key => $zone_data ) {
+		if ( ! is_array( $zone_data ) ) {
+			return aafm_generic_error();
+		}
+		$zone_id = (int) ( $zone_data['id'] ?? $zone_data['zone_id'] ?? $zone_key );
+		if ( $zone_id < 1 ) {
+			return aafm_generic_error();
+		}
+		$rows[] = aafm_redact_wc_shipping_zone_row( $zone_data, $zone_id );
+	}
+
+	return array(
+		'zones' => $rows,
+		'total' => count( $rows ),
+	);
+}
+
+// =============================================================================
+// wc-get-shipping-zone
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-get-shipping-zone.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_get_shipping_zone(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-get-shipping-zone' ),
+		'description'         => aafm_ability_description( 'aafm/wc-get-shipping-zone' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'required'             => array( 'zone_id' ),
+			'properties'           => array(
+				'zone_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 0,
+					'description' => __( 'The shipping zone\'s id. Use 0 for the "Rest of the World" zone, which always exists.', 'agent-abilities-for-mcp' ),
+				),
+			),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_shipping_zone_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_get_shipping_zone',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-get-shipping-zone.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_get_shipping_zone( array $input ) {
+	$zone_id = isset( $input['zone_id'] ) ? (int) $input['zone_id'] : -1;
+	$zone    = aafm_wc_get_shipping_zone_object( $zone_id );
+	if ( null === $zone ) {
+		return aafm_wc_shipping_zone_not_found();
+	}
+	return aafm_rich_wc_shipping_zone( $zone );
+}
+
+// =============================================================================
+// wc-create-shipping-zone
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-create-shipping-zone.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_create_shipping_zone(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-create-shipping-zone' ),
+		'description'         => aafm_ability_description( 'aafm/wc-create-shipping-zone' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'required'             => array( 'zone_name' ),
+			'properties'           => aafm_wc_shipping_zone_write_properties(),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_shipping_zone_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_create_shipping_zone',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-create-shipping-zone.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_create_shipping_zone( array $input ) {
+	if ( ! class_exists( 'WC_Shipping_Zone' ) ) {
+		return aafm_generic_error();
+	}
+
+	$zone  = new \WC_Shipping_Zone();
+	$error = aafm_wc_apply_shipping_zone_input( $zone, $input );
+	if ( null !== $error ) {
+		return $error;
+	}
+
+	$id = (int) aafm_wc_write(
+		'save',
+		array(
+			'object' => $zone,
+			'entity' => 'shipping_zone',
+		)
+	)['returned'];
+	if ( $id < 1 ) {
+		return aafm_generic_error();
+	}
+
+	$saved = aafm_wc_get_shipping_zone_object( $id );
+	if ( null === $saved ) {
+		return aafm_generic_error();
+	}
+
+	return aafm_rich_wc_shipping_zone( $saved );
+}
+
+// =============================================================================
+// wc-update-shipping-zone
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-update-shipping-zone.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_update_shipping_zone(): array {
+	$write_props            = aafm_wc_shipping_zone_write_properties();
+	$write_props['zone_id'] = array(
+		'type'        => 'integer',
+		// Minimum 1, not 0: zone 0 is WooCommerce's always-present "Rest of the World" pseudo-zone,
+		// which has no stored row to update. Calling save() on it takes the data store's CREATE
+		// branch and inserts a stray duplicate zone instead of editing anything, so it is rejected
+		// here (and again in the executor) rather than accepted as a no-op edit.
+		'minimum'     => 1,
+		'description' => __( "The shipping zone's id to update. Must reference an existing editable zone (1 or higher); zone 0 is the Rest of the World zone and cannot be edited.", 'agent-abilities-for-mcp' ),
+	);
+
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-update-shipping-zone' ),
+		'description'         => aafm_ability_description( 'aafm/wc-update-shipping-zone' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'required'             => array( 'zone_id' ),
+			'properties'           => $write_props,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_shipping_zone_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_update_shipping_zone',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-update-shipping-zone.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_update_shipping_zone( array $input ) {
+	$zone_id = isset( $input['zone_id'] ) ? (int) $input['zone_id'] : -1;
+
+	// Zone 0 is the always-present "Rest of the World" pseudo-zone. WC_Shipping_Zone::save()
+	// branches on a falsy id and takes the data store's CREATE path, so saving zone 0 inserts a
+	// brand-new zone (id >= 1) instead of editing anything; the executor would then re-read the
+	// untouched zone 0 and wrongly report it as updated. WooCommerce's own REST API forbids this
+	// for the same reason. Reject it with an actionable error rather than minting a stray duplicate.
+	if ( 0 === $zone_id ) {
+		return new \WP_Error(
+			'aafm_zone_not_editable',
+			__( 'The Rest of the World zone (zone 0) cannot be renamed or reordered. Pass the id of a zone you created (1 or higher).', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	$zone = aafm_wc_get_shipping_zone_object( $zone_id );
+	if ( null === $zone ) {
+		return aafm_wc_shipping_zone_not_found();
+	}
+
+	$fields = $input;
+	unset( $fields['zone_id'] );
+	$error = aafm_wc_apply_shipping_zone_input( $zone, $fields );
+	if ( null !== $error ) {
+		return $error;
+	}
+	$saved_id = (int) aafm_wc_write(
+		'save',
+		array(
+			'object' => $zone,
+			'entity' => 'shipping_zone',
+		)
+	)['returned'];
+	if ( $saved_id < 1 ) {
+		return aafm_generic_error();
+	}
+
+	$saved = aafm_wc_get_shipping_zone_object( $zone_id );
+	if ( null === $saved ) {
+		return aafm_generic_error();
+	}
+
+	return aafm_rich_wc_shipping_zone( $saved );
+}
+
+// =============================================================================
+// SHIPPING METHODS - helpers
+// =============================================================================
+
+/**
+ * Resolve a zone_id + instance_id to a WC_Shipping_Method from the zone, or null.
+ *
+ * @param int $zone_id     Zone id.
+ * @param int $instance_id Instance id.
+ * @return \WC_Shipping_Method|null
+ */
+function aafm_wc_get_shipping_method_object( int $zone_id, int $instance_id ): ?\WC_Shipping_Method {
+	if ( $zone_id < 0 || $instance_id < 1 ) {
+		return null;
+	}
+	$zone = aafm_wc_get_shipping_zone_object( $zone_id );
+	if ( null === $zone ) {
+		return null;
+	}
+	$methods = $zone->get_shipping_methods();
+	return $methods[ $instance_id ] ?? null;
+}
+
+/**
+ * Build the lean + full method shape (list and get share the same shape).
+ *
+ * @param \WC_Shipping_Method $method Method object.
+ * @return array<string,mixed>
+ */
+function aafm_rich_wc_shipping_method( \WC_Shipping_Method $method ): array {
+	// The per-instance display title is the "title" instance setting (WC populates
+	// $method->title from it). Fall back to the generic method label when no instance
+	// title has been saved. update_shipping_method persists to the same place, so a
+	// write -> read round-trip is consistent.
+	$instance_title = (string) $method->title;
+	$display_title  = ( '' !== $instance_title ) ? $instance_title : (string) $method->method_title;
+
+	// Shipping plugins store carrier API keys / account creds / license keys in settings.
+	// Run them through aafm_wc_redact_settings_deep() before returning - a recursive DENYLIST
+	// over field names (see its docblock in gateways.php), not a deny-by-default allowlist. It
+	// catches names matching a known secret pattern (key/secret/token/password/api/...) and
+	// cannot be exhaustive: a carrier plugin storing a credential under an unlisted field name
+	// (e.g. iban, bic, sort_code, or the British spelling licence) still reaches the wire.
+	// Best-effort, not a completeness guarantee.
+	// $method->settings is WooCommerce's LEGACY GLOBAL bucket and is empty for every zone
+	// method instance on WC 2.6+. The real per-instance configuration (title, cost,
+	// tax_status) lives in instance_settings, which is also where our own write path
+	// stores it. Reading the legacy bucket returned {"type":"class"} for flat_rate and []
+	// for free_shipping/local_pickup, so a write never showed up in its own response.
+	$report   = aafm_wc_redact_settings_report( (array) aafm_wc_instance_settings( $method ) );
+	$settings = (array) $report['settings'];
+	// Cast only the empty case so it encodes to "{}" per the declared object schema; a
+	// populated map is already string-keyed, encodes correctly as-is, and stays
+	// array-accessible for callers (same convention as aafm_rich_post()'s terms/meta).
+	$settings_out = array() === $settings ? (object) array() : $settings;
+
+	return array(
+		'instance_id'     => (int) $method->instance_id,
+		'id'              => (string) $method->id,
+		'method_title'    => $display_title,
+		'enabled'         => (string) $method->enabled,
+		'settings'        => $settings_out,
+		// Authoritative list of withheld paths, each an array of key segments; see the gateway
+		// shape for why the in-place marker cannot carry this on its own.
+		'redacted_fields' => array_values( (array) $report['redacted'] ),
+	);
+}
+
+/**
+ * Read a shipping method's per-instance settings, initialising them if the object has not
+ * loaded them yet. Returns an empty array for a method that stores nothing.
+ *
+ * @param \WC_Shipping_Method $method Shipping method instance from WC_Shipping_Zone::get_shipping_methods().
+ * @return array<string,mixed>
+ */
+function aafm_wc_instance_settings( \WC_Shipping_Method $method ): array {
+	if ( empty( $method->instance_settings ) ) {
+		$method->init_instance_settings();
+	}
+	return is_array( $method->instance_settings ) ? $method->instance_settings : array();
+}
+
+/**
+ * Shared output properties for a shipping method shape.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_wc_shipping_method_output_properties(): array {
+	return array(
+		'instance_id'     => array( 'type' => 'integer' ),
+		'id'              => array( 'type' => 'string' ),
+		'method_title'    => array( 'type' => 'string' ),
+		'enabled'         => array(
+			'type' => 'string',
+			'enum' => array( 'yes', 'no' ),
+		),
+		'settings'        => array( 'type' => 'object' ),
+		'redacted_fields' => aafm_wc_redacted_fields_schema(),
+	);
+}
+
+// =============================================================================
+// wc-list-shipping-methods
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-list-shipping-methods.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_list_shipping_methods(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-list-shipping-methods' ),
+		'description'         => aafm_ability_description( 'aafm/wc-list-shipping-methods' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'required'             => array( 'zone_id' ),
+			'properties'           => array(
+				'zone_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 0,
+					'description' => __( 'The shipping zone\'s id whose methods to list. Use 0 for the "Rest of the World" zone.', 'agent-abilities-for-mcp' ),
+				),
+			),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'methods' => array(
+					'type'  => 'array',
+					'items' => array(
+						'type'                 => 'object',
+						'properties'           => aafm_wc_shipping_method_output_properties(),
+						'additionalProperties' => false,
+					),
+				),
+				'total'   => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_wc_list_shipping_methods',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-list-shipping-methods.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_list_shipping_methods( array $input ) {
+	$zone_id = isset( $input['zone_id'] ) ? (int) $input['zone_id'] : -1;
+	$zone    = aafm_wc_get_shipping_zone_object( $zone_id );
+	if ( null === $zone ) {
+		return aafm_wc_shipping_zone_not_found();
+	}
+
+	$methods = $zone->get_shipping_methods();
+	$rows    = array();
+	foreach ( $methods as $method ) {
+		if ( $method instanceof \WC_Shipping_Method ) {
+			$rows[] = aafm_rich_wc_shipping_method( $method );
+		}
+	}
+
+	return array(
+		'methods' => $rows,
+		'total'   => count( $rows ),
+	);
+}
+
+// =============================================================================
+// wc-get-shipping-method
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-get-shipping-method.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_get_shipping_method(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-get-shipping-method' ),
+		'description'         => aafm_ability_description( 'aafm/wc-get-shipping-method' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'required'             => array( 'zone_id', 'instance_id' ),
+			'properties'           => array(
+				'zone_id'     => array(
+					'type'        => 'integer',
+					'minimum'     => 0,
+					'description' => __( 'The shipping zone\'s id the method instance belongs to. Use 0 for the "Rest of the World" zone.', 'agent-abilities-for-mcp' ),
+				),
+				'instance_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => 'The shipping method INSTANCE id within the zone (a method added to a zone, not the method type). Get it from wc-list-shipping-methods for the zone, or from the instance_id returned by wc-create-shipping-method.',
+				),
+			),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_shipping_method_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_get_shipping_method',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-get-shipping-method.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_get_shipping_method( array $input ) {
+	$zone_id     = isset( $input['zone_id'] ) ? (int) $input['zone_id'] : -1;
+	$instance_id = isset( $input['instance_id'] ) ? (int) $input['instance_id'] : 0;
+	$method      = aafm_wc_get_shipping_method_object( $zone_id, $instance_id );
+	if ( null === $method ) {
+		return new \WP_Error( 'aafm_not_found', __( 'Shipping method not found in this zone.', 'agent-abilities-for-mcp' ) );
+	}
+	return aafm_rich_wc_shipping_method( $method );
+}
+
+// =============================================================================
+// wc-create-shipping-method
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-create-shipping-method.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_create_shipping_method(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-create-shipping-method' ),
+		'description'         => aafm_ability_description( 'aafm/wc-create-shipping-method' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'required'             => array( 'zone_id', 'method_type' ),
+			'properties'           => array(
+				'zone_id'     => array(
+					'type'        => 'integer',
+					'minimum'     => 0,
+					'description' => __( 'The shipping zone\'s id to add the method to. Use 0 for the "Rest of the World" zone.', 'agent-abilities-for-mcp' ),
+				),
+				'method_type' => array(
+					'type'        => 'string',
+					'enum'        => array( 'flat_rate', 'free_shipping', 'local_pickup' ),
+					'description' => 'The WooCommerce shipping method type to add to the zone: flat_rate, free_shipping, or local_pickup.',
+				),
+			),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_shipping_method_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_create_shipping_method',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-create-shipping-method.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_create_shipping_method( array $input ) {
+	$zone_id     = isset( $input['zone_id'] ) ? (int) $input['zone_id'] : -1;
+	$method_type = sanitize_text_field( (string) ( $input['method_type'] ?? '' ) );
+
+	$zone = aafm_wc_get_shipping_zone_object( $zone_id );
+	if ( null === $zone ) {
+		return aafm_wc_shipping_zone_not_found();
+	}
+
+	$instance_id = (int) aafm_wc_write(
+		'add_shipping_method',
+		array(
+			'object' => $zone,
+			'type'   => $method_type,
+		)
+	)['returned'];
+	if ( $instance_id < 1 ) {
+		return aafm_generic_error();
+	}
+
+	$method = aafm_wc_get_shipping_method_object( $zone_id, $instance_id );
+	if ( null === $method ) {
+		return new \WP_Error( 'aafm_not_found', __( 'Shipping method not found in this zone.', 'agent-abilities-for-mcp' ) );
+	}
+
+	return aafm_rich_wc_shipping_method( $method );
+}
+
+// =============================================================================
+// wc-update-shipping-method
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-update-shipping-method.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_update_shipping_method(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-update-shipping-method' ),
+		'description'         => aafm_ability_description( 'aafm/wc-update-shipping-method' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'required'             => array( 'zone_id', 'instance_id' ),
+			'properties'           => array(
+				'zone_id'      => array(
+					'type'        => 'integer',
+					'minimum'     => 0,
+					'description' => __( 'The shipping zone\'s id the method instance belongs to. Use 0 for the "Rest of the World" zone.', 'agent-abilities-for-mcp' ),
+				),
+				'instance_id'  => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => 'The shipping method INSTANCE id within the zone (from wc-list-shipping-methods or the instance_id returned by wc-create-shipping-method).',
+				),
+				'method_title' => array(
+					'type'        => 'string',
+					'description' => __( 'Display name shown for this method instance at checkout, overriding the shipping method type\'s generic label (e.g. "Flat rate"). Falls back to the method type\'s own title when never set.', 'agent-abilities-for-mcp' ),
+				),
+				'enabled'      => array(
+					'type'        => 'string',
+					'enum'        => array( 'yes', 'no' ),
+					'description' => 'Whether the shipping method is enabled, as the string "yes" or "no". This differs from the payment-gateway abilities, where the equivalent enabled flag is a boolean (true/false); shipping keeps a string to match WooCommerce\'s own shipping-method storage.',
+				),
+			),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_shipping_method_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_update_shipping_method',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-update-shipping-method.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_update_shipping_method( array $input ) {
+	$zone_id     = isset( $input['zone_id'] ) ? (int) $input['zone_id'] : -1;
+	$instance_id = isset( $input['instance_id'] ) ? (int) $input['instance_id'] : 0;
+
+	// Verify the zone exists and the method exists within it.
+	$zone = aafm_wc_get_shipping_zone_object( $zone_id );
+	if ( null === $zone ) {
+		return aafm_wc_shipping_zone_not_found();
+	}
+	$method = aafm_wc_get_shipping_method_object( $zone_id, $instance_id );
+	if ( null === $method ) {
+		return new \WP_Error( 'aafm_not_found', __( 'Shipping method not found in this zone.', 'agent-abilities-for-mcp' ) );
+	}
+
+	// Persist the enabled flag FIRST. For a zone method this is NOT an instance setting - it
+	// lives in the is_enabled column of the woocommerce_shipping_zone_methods table, keyed
+	// by instance_id. WC core toggles it with a direct $wpdb->update() and then bumps the
+	// shipping transient version; there is no higher-level API for this column.
+	//
+	// This is the only write in this executor whose failure is DETECTABLE
+	// ($wpdb->update() returns false on a genuine DB error; update_option() cannot distinguish
+	// failure from an unchanged value). Running it before the title write means its error path
+	// returns while nothing has been changed yet - the old sequence persisted the title first and
+	// then reported a bare error after part of the request had already landed.
+	if ( array_key_exists( 'enabled', $input ) ) {
+		$is_enabled = ( 'no' === $input['enabled'] ) ? 0 : 1;
+
+		// No core API exists for the is_enabled column; this mirrors
+		// WC_REST_Shipping_Zone_Methods_V2_Controller::update_fields().
+		$updated_rows = aafm_wc_write(
+			'shipping_method_enabled',
+			array(
+				'data'         => array( 'is_enabled' => $is_enabled ),
+				'where'        => array( 'instance_id' => $instance_id ),
+				'format'       => array( '%d' ),
+				'where_format' => array( '%d' ),
+			)
+		)['returned'];
+
+		if ( false === $updated_rows ) {
+			return new \WP_Error(
+				'aafm_wc_enabled_write_failed',
+				__( 'The enabled state could not be saved. Nothing on the shipping method was changed.', 'agent-abilities-for-mcp' )
+			);
+		}
+
+		// WooCommerce fires this action from all three of its own toggle write paths (AJAX
+		// shipping_zone_methods_save_changes, REST v2 shipping-zone-methods, and the v4
+		// ShippingZoneMethodService), each gated on the $wpdb->update() rows-affected count - a
+		// no-change toggle affects zero rows and fires nothing. Mirror the signature exactly:
+		// (int $instance_id, string $method_id, int $zone_id, bool $is_enabled).
+		if ( $updated_rows > 0 ) {
+			// This action is documented in WooCommerce: src/Internal/RestApi/Routes/V4/ShippingZoneMethod/ShippingZoneMethodService.php.
+			// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WooCommerce-core action; fired with WC's own signature so extensions hooking the toggle stay in sync.
+			do_action( 'woocommerce_shipping_zone_method_status_toggled', $instance_id, (string) $method->id, $zone_id, (bool) $is_enabled );
+		}
+
+		// Invalidate the shipping cache so the toggle is reflected on the next read.
+		if ( class_exists( '\WC_Cache_Helper' ) ) {
+			\WC_Cache_Helper::get_transient_version( 'shipping', true );
+		}
+	}
+
+	// Persist the per-instance display title ("method_title" in this ability) into the
+	// method's "title" instance setting. WC_Shipping_Method has no per-object save();
+	// instance settings are written by update_option() on the method's instance option
+	// key, mirroring WC core's WC_REST_Shipping_Zone_Methods_V2_Controller::update_fields().
+	if ( array_key_exists( 'method_title', $input ) ) {
+		$title = aafm_sanitize_plain_text( (string) $input['method_title'] );
+
+		$method->init_instance_settings();
+		$instance_settings          = is_array( $method->instance_settings ) ? $method->instance_settings : array();
+		$instance_settings['title'] = $title;
+
+		// This filter is documented in WooCommerce: includes/abstracts/abstract-wc-settings-api.php.
+		// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedHooknameFound -- WooCommerce-core filter; we mirror WC's own write so extending plugins still fire.
+		$instance_settings = apply_filters( 'woocommerce_shipping_' . $method->id . '_instance_settings_values', $instance_settings, $method );
+
+		aafm_wc_write(
+			'option',
+			array(
+				'option'    => $method->get_instance_option_key(),
+				'value'     => $instance_settings,
+				'entity'    => 'shipping_method',
+				'object_id' => $instance_id,
+			)
+		);
+
+		// Verify the write actually persisted. update_option() returns false both on genuine
+		// failure and when the new value equals the old one, so its return value alone cannot
+		// distinguish "nothing changed" from "a filter (a caching/compliance layer's
+		// pre_update_option_* veto) silently blocked the write" - read the database row instead,
+		// mirroring the gateway settings write's own read-back (gateways.php,
+		// aafm_wc_gateway_write_failed_error()). The row, not get_option(): a stale cache holding
+		// the requested title makes update_option() skip the write while get_option() shows it.
+		// A failed read and a missing row both take the not-persisted branch.
+		//
+		// Compare against $instance_settings['title'] - the value AFTER the
+		// woocommerce_shipping_{id}_instance_settings_values filter ran and was actually handed
+		// to update_option() - not the raw pre-filter $title. That filter is a documented WC
+		// value-transformation hook (abstract-wc-shipping-method.php,
+		// class-wc-rest-shipping-zone-methods-v2-controller.php), not merely a veto mechanism;
+		// comparing against the pre-filter value would misreport a legitimate site-level title
+		// transform as a write failure.
+		$row       = aafm_option_row( $method->get_instance_option_key() );
+		$persisted = ( $row['ok'] && $row['found'] ) ? $row['value'] : array();
+		$expected  = is_array( $instance_settings ) && array_key_exists( 'title', $instance_settings ) ? $instance_settings['title'] : $title;
+		// A bool or null on either side is compared by identity: its string form would let a kept
+		// false or null confirm a requested '', or a kept '' confirm a filtered false.
+		if ( ! is_array( $persisted ) || ! array_key_exists( 'title', $persisted ) || ! aafm_option_value_matches( $persisted['title'], $expected )
+			|| ( ( is_bool( $persisted['title'] ) || null === $persisted['title'] || is_bool( $expected ) || null === $expected ) && $persisted['title'] !== $expected ) ) {
+			// `enabled` (if present in this request) is written strictly before this point and
+			// already returned on its own failure above, so reaching here means any `enabled`
+			// write in THIS request genuinely persisted - the message must not claim otherwise.
+			return new \WP_Error(
+				'aafm_wc_shipping_title_write_failed',
+				array_key_exists( 'enabled', $input )
+					? __( 'The method title could not be saved, but the enabled state was already updated. Read the shipping method to see its current state.', 'agent-abilities-for-mcp' )
+					: __( 'The method title could not be saved. Nothing on the shipping method was changed.', 'agent-abilities-for-mcp' )
+			);
+		}
+	}
+
+	// Re-resolve from the zone so the returned shape reflects what was just persisted. Every write
+	// above has already succeeded by this point, so a failed re-read must say the changes were
+	// saved rather than pretend the request failed outright.
+	$updated = aafm_wc_get_shipping_method_object( $zone_id, $instance_id );
+	if ( null === $updated ) {
+		return new \WP_Error(
+			'aafm_wc_update_not_confirmed',
+			__( 'The requested changes were saved, but the shipping method could not be re-read to confirm them. Call wc-get-shipping-method to verify its current state.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	return aafm_rich_wc_shipping_method( $updated );
+}

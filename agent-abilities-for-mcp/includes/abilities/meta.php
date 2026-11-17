@@ -1,0 +1,605 @@
+<?php
+/**
+ * Governed post-meta abilities (read + write). Every meta operation passes the
+ * shared aafm_can_access_post_meta() gate: the post must be editable by the agent
+ * (Unit 1 per-object resolver) AND the key must clear the hard-block + allowlist.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter( 'aafm_abilities_registry', 'aafm_register_meta_definitions' );
+
+/**
+ * Contribute the post-meta definitions to the registry.
+ *
+ * @param array<string,array<string,mixed>> $registry Registry.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_meta_definitions( array $registry ): array {
+	$registry['aafm/get-post-meta']     = array(
+		'label'        => __( 'Get post meta', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Read a single allowlisted meta value from a post the agent can edit (scalar only). Keys are opt-in: an administrator exposes each one under Exposed meta keys in the Content sub-tab of the Abilities tab.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_get_post_meta',
+	);
+	$registry['aafm/get-all-post-meta'] = array(
+		'label'        => __( 'Get all post meta', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Read every allowlisted scalar meta value from a post the agent can edit, returned as a key/value map. Protected, underscore, and non-scalar values are excluded. Keys are opt-in: an administrator exposes each one under Exposed meta keys in the Content sub-tab of the Abilities tab.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_get_all_post_meta',
+	);
+	$registry['aafm/update-post-meta']  = array(
+		'label'        => __( 'Update post meta', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Write a single allowlisted scalar meta value to a post the agent can edit. The value is stored as plain text: line breaks and tabs become single spaces, so multi-line text is saved on one line. The response returns the old value when it is plain text or a number. Keys are opt-in: an administrator exposes each one under Exposed meta keys in the Content sub-tab of the Abilities tab.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_update_post_meta',
+	);
+	$registry['aafm/delete-post-meta']  = array(
+		'label'        => __( 'Delete post meta', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Delete an allowlisted meta key from a post the agent can edit. Removes all values of that key. The response returns the old value when it is plain text or a number. Keys are opt-in: an administrator exposes each one under Exposed meta keys in the Content sub-tab of the Abilities tab.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'destructive',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_delete_post_meta',
+	);
+	return $registry;
+}
+
+/**
+ * Shared meta gate: the post must be editable by the agent (Unit 1 resolver) AND the key
+ * must clear the hard-block + allowlist. Used by all three meta permission callbacks.
+ *
+ * @param array<string,mixed> $input Ability input.
+ * @return bool
+ */
+function aafm_can_access_post_meta( array $input ): bool {
+	$id   = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$post = $id ? aafm_exact_object( 'post', $id ) : null;
+	if ( ! $post instanceof WP_Post || ! aafm_can_edit_post_object( $post ) ) {
+		return false;
+	}
+	$key = isset( $input['meta_key'] ) ? (string) $input['meta_key'] : '';
+	return ! is_wp_error( aafm_validate_meta_key( $key ) );
+}
+
+/**
+ * Args for aafm/get-post-meta.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_post_meta(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-post-meta' ),
+		'description'         => aafm_ability_description( 'aafm/get-post-meta' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id'  => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the post whose meta to read. The current user must have edit access to it.', 'agent-abilities-for-mcp' ),
+				),
+				'meta_key' => array( // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- schema property key, not a meta query.
+					'type'        => 'string',
+					'minLength'   => 1,
+					'description' => __( 'The post-meta key to read. Must be on the operator\'s post-meta allowlist (or the allow-all wildcard) and not explicitly denied or hard-blocked; protected (underscore-prefixed), auth, and capability keys can never be exposed. A key that fails any of those checks is rejected before the read runs, not returned empty. Attachment alt text is stored under _wp_attachment_image_alt, a protected key, so it is never readable here. Call aafm-get-media-item, which returns alt as a plain field. The featured image is stored under _thumbnail_id, also protected; call aafm-get-post or aafm-get-page, which return the "featured_image" object.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id', 'meta_key' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'post_id'  => array( 'type' => 'integer' ),
+				'meta_key' => array( 'type' => 'string' ), // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- schema property key, not a meta query.
+				'value'    => array(
+					'type'        => array( 'string', 'number', 'boolean' ),
+					'description' => __( 'The stored scalar value. A key with no stored value is returned as an empty string, not null.', 'agent-abilities-for-mcp' ),
+				),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_post_meta',
+		'permission_callback' => 'aafm_perm_get_post_meta',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/get-post-meta: the shared per-object + per-key gate.
+ *
+ * @param array<string,mixed> $input Ability input.
+ * @return bool
+ */
+function aafm_perm_get_post_meta( array $input ): bool {
+	return aafm_can_access_post_meta( $input );
+}
+
+/**
+ * Execute aafm/get-post-meta.
+ *
+ * Re-validates the key (defence in depth - the permission callback already gated it),
+ * then reads a single value. Non-scalar values are refused so a serialized array/object
+ * can never be dumped to the agent.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_get_post_meta( array $input ) {
+	$id  = absint( $input['post_id'] );
+	$key = aafm_validate_meta_key( isset( $input['meta_key'] ) ? (string) $input['meta_key'] : '' );
+	if ( is_wp_error( $key ) || ! aafm_exact_object( 'post', $id ) instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+	$value = aafm_meta_get( 'post', $id, $key, true );
+	if ( '' !== $value && ! is_scalar( $value ) ) {
+		return aafm_generic_error(); // never dump arrays/serialized blobs.
+	}
+	return array(
+		'post_id'  => $id,
+		'meta_key' => $key, // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- response array key, not a meta query.
+		'value'    => $value,
+	);
+}
+
+/**
+ * Args for aafm/get-all-post-meta.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_all_post_meta(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-all-post-meta' ),
+		'description'         => aafm_ability_description( 'aafm/get-all-post-meta' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( "ID of the post whose allowlisted meta to read. The current user must have edit access to it. Only keys on the operator\'s post-meta allowlist (or every stored key under the allow-all wildcard) are returned; protected, denied, and hard-blocked keys are silently excluded from this bulk read rather than causing an error.", 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'meta' => array( 'type' => 'object' ),
+				'note' => array( 'type' => 'string' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_all_post_meta',
+		'permission_callback' => 'aafm_perm_get_all_post_meta',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/get-all-post-meta: per-object edit_post only.
+ *
+ * Unlike the single get-post-meta gate, there is no meta_key to validate here - the bulk
+ * read iterates the allowlist itself. So this checks the post is editable by the agent
+ * (the same Unit 1 per-object resolver), and the execute body enforces the key allowlist
+ * and scalar-only floor for each value.
+ *
+ * @param array<string,mixed> $input Ability input.
+ * @return bool
+ */
+function aafm_perm_get_all_post_meta( array $input ): bool {
+	$id   = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$post = $id ? aafm_exact_object( 'post', $id ) : null;
+	return $post instanceof WP_Post && aafm_can_edit_post_object( $post );
+}
+
+/**
+ * Execute aafm/get-all-post-meta.
+ *
+ * Returns each exposed post-meta key's single scalar value. The candidate set is the
+ * literal allowlist, or - when the allow-`*` wildcard is set - the post's own stored meta
+ * keys, so the bulk reader matches the single get-post-meta reader under allow-all. Every
+ * candidate is re-validated through aafm_validate_meta_key() (hard-block -> deny -> allow/`*`),
+ * so protected, denied, and deny-`*` keys are never returned. Keys with no value, or whose
+ * stored value is non-scalar (a serialized array/object), are skipped so nothing unsanitized
+ * or structured is ever dumped to the agent. Default-deny by construction: with no allowlist
+ * and no wildcard the map is empty.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_get_all_post_meta( array $input ) {
+	$id = absint( $input['post_id'] );
+	if ( ! aafm_exact_object( 'post', $id ) instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+
+	// Candidate keys: under allow-`*` enumerate the post's OWN stored meta so the bulk
+	// reader matches the single get-post-meta reader's wildcard behavior; otherwise iterate
+	// the literal allowlist. Either way every key is re-validated through the full precedence
+	// chain (hard-block -> deny -> allow/`*`) via aafm_validate_meta_key(), so protected
+	// (`_`-prefixed), denied, and deny-`*` keys never slip through under the wildcard.
+	$candidate_keys = aafm_meta_allow_has_star()
+		? array_keys( aafm_meta_get( 'post', $id ) )
+		: aafm_allowed_meta_keys();
+
+	$meta = array();
+	foreach ( $candidate_keys as $key ) {
+		if ( ! is_string( aafm_validate_meta_key( (string) $key ) ) ) {
+			continue; // hard-blocked, denied, or not allowed.
+		}
+		$value = aafm_meta_get( 'post', $id, (string) $key, true );
+		// Deliberately SKIPS empty/missing keys (a bulk map omits absent keys),
+		// unlike the single get-post-meta reader which returns an empty value as-is.
+		// The opposite-looking phrasing is intentional; both keep a stored '0'.
+		if ( '' === $value || ! is_scalar( $value ) ) {
+			continue; // skip empty/missing and never dump arrays/serialized blobs.
+		}
+		$meta[ (string) $key ] = $value;
+	}
+
+	$out = array(
+		// Cast so an empty map JSON-encodes to "{}" (object) per the schema.
+		'meta' => (object) $meta,
+	);
+	if ( empty( $meta ) ) {
+		$out['note'] = __( "No allowed values to show. Keys that aren't allowed, are empty or hold arrays are left out, so an empty map doesn't mean the post has no meta.", 'agent-abilities-for-mcp' );
+	}
+	return $out;
+}
+
+/**
+ * Args for aafm/update-post-meta.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_update_post_meta(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/update-post-meta' ),
+		'description'         => aafm_ability_description( 'aafm/update-post-meta' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id'  => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the post whose meta to write. The current user must have edit access to it.', 'agent-abilities-for-mcp' ),
+				),
+				'meta_key' => array( // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- schema property key, not a meta query.
+					'type'        => 'string',
+					'minLength'   => 1,
+					'description' => __( 'The post-meta key to write. Must be on the operator\'s post-meta allowlist (or the allow-all wildcard) and not explicitly denied or hard-blocked; protected (underscore-prefixed), auth, and capability keys can never be exposed. A key that fails any of those checks is rejected before the write runs, never silently ignored. Attachment alt text is stored under _wp_attachment_image_alt, a protected key, so it can never be written here. Call aafm-update-media and pass its alt parameter instead. The featured image is stored under _thumbnail_id, also protected; call aafm-set-featured-image, or pass "featured_media" to aafm-update-post or aafm-update-page.', 'agent-abilities-for-mcp' ),
+				),
+				'value'    => array(
+					'type'        => array( 'string', 'number', 'boolean', 'integer' ),
+					'description' => __( 'The scalar value to store. Only text, number, or boolean values are accepted; the value is plain-text sanitized (meta is not rendered as post content, so no markup is preserved) and then run through any registered sanitize_post_meta_{key} callback. Line breaks and tabs become single spaces, so send multi-line text knowing it is saved on one line.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id', 'meta_key', 'value' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array_merge(
+				array(
+					'post_id'  => array( 'type' => 'integer' ),
+					'meta_key' => array( 'type' => 'string' ), // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- schema property key, not a meta query.
+					'value'    => array(
+						'type' => array( 'string', 'number', 'boolean', 'integer' ),
+					),
+				),
+				aafm_meta_write_output_properties()
+			),
+		),
+		'execute_callback'    => 'aafm_exec_update_post_meta',
+		'permission_callback' => 'aafm_perm_update_post_meta',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/update-post-meta: the shared per-object + per-key gate.
+ *
+ * @param array<string,mixed> $input Ability input.
+ * @return bool
+ */
+function aafm_perm_update_post_meta( array $input ): bool {
+	return aafm_can_access_post_meta( $input );
+}
+
+/**
+ * Execute aafm/update-post-meta.
+ *
+ * Re-validates the key, refuses non-scalar values via aafm_sanitize_meta_value(),
+ * then writes a single value. wp_slash() guards update_post_meta()'s internal unslash.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_update_post_meta( array $input ) {
+	$id  = absint( $input['post_id'] );
+	$key = aafm_validate_meta_key( isset( $input['meta_key'] ) ? (string) $input['meta_key'] : '' );
+	if ( is_wp_error( $key ) || ! aafm_exact_object( 'post', $id ) instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+	// Pass the post's real type, not the default 'post', so a
+	// sanitize_callback registered for a page or a custom post type is not invisible to the probe.
+	// Resolve it through get_object_subtype(), the same filterable call core
+	// itself makes at write time, rather than the raw get_post_type() - a get_object_subtype_post
+	// filter remapping the subtype is honoured here the same way it is at write time.
+	$subtype = (string) get_object_subtype( 'post', $id );
+	$value   = aafm_sanitize_meta_value( $key, $input['value'] ?? '', $subtype );
+	if ( is_wp_error( $value ) ) {
+		return $value;
+	}
+	$result = aafm_meta_set( 'post', $id, $key, $value, $subtype );
+	if ( is_wp_error( $result ) ) {
+		return $result;
+	}
+	return aafm_meta_update_response(
+		'post',
+		$id,
+		$key,
+		$result,
+		array(
+			'post_id'  => $id,
+			'meta_key' => $key, // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- response array key, not a meta query.
+		)
+	);
+}
+
+/**
+ * Args for aafm/delete-post-meta.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_delete_post_meta(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/delete-post-meta' ),
+		'description'         => aafm_ability_description( 'aafm/delete-post-meta' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id'  => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the post whose meta to delete. The current user must have edit access to it.', 'agent-abilities-for-mcp' ),
+				),
+				'meta_key' => array( // phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_key -- schema property key, not a meta query.
+					'type'        => 'string',
+					'minLength'   => 1,
+					'description' => __( 'The post-meta key to delete. Removes every stored value of this key, not just one. Must be on the operator\'s post-meta allowlist (or the allow-all wildcard) and not explicitly denied or hard-blocked; protected (underscore-prefixed), auth, and capability keys can never be exposed. A key that fails any of those checks is rejected before the delete runs. Attachment alt text is stored under _wp_attachment_image_alt, a protected key, so it can never be deleted here. Call aafm-update-media with an empty alt to clear it. The featured image is stored under _thumbnail_id, also protected, and has no delete route: call aafm-set-featured-image to change it instead.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id', 'meta_key' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array_merge(
+				array(
+					'deleted' => array( 'type' => 'boolean' ),
+				),
+				aafm_meta_delete_output_properties()
+			),
+		),
+		'execute_callback'    => 'aafm_exec_delete_post_meta',
+		'permission_callback' => 'aafm_perm_delete_post_meta',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/delete-post-meta: the shared per-object + per-key gate.
+ *
+ * @param array<string,mixed> $input Ability input.
+ * @return bool
+ */
+function aafm_perm_delete_post_meta( array $input ): bool {
+	return aafm_can_access_post_meta( $input );
+}
+
+/**
+ * Execute aafm/delete-post-meta.
+ *
+ * Re-validates the key (defence in depth - the permission callback already gated it),
+ * then removes every value of that key. delete_post_meta() with no value arg deletes
+ * all values of the key, which is the intended destructive behaviour here.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_delete_post_meta( array $input ) {
+	$id  = absint( $input['post_id'] );
+	$key = aafm_validate_meta_key( isset( $input['meta_key'] ) ? (string) $input['meta_key'] : '' );
+	if ( is_wp_error( $key ) || ! aafm_exact_object( 'post', $id ) instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+	return aafm_meta_delete_response( 'post', $id, $key, aafm_meta_delete( 'post', $id, $key ) );
+}
+
+/**
+ * The response update-post-meta, update-term-meta and update-user-meta return.
+ *
+ * A write that did not land as `written` or `unchanged` is its error. Otherwise the response is
+ * the family's identity fields, then `value`, then the outcome fields. `value` is read after the
+ * helper returns, through core with `single` true, exactly as get_*_meta( ..., true ) reads it,
+ * so read filters shape it as they always have. That read runs inside a checked-read scope: a
+ * failed load is the `unconfirmed` error, never a made-up value. `status` still comes from the
+ * helper.
+ *
+ * @param string              $type     'post', 'term' or 'user'.
+ * @param int                 $id       Object id.
+ * @param string              $key      Meta key.
+ * @param array<string,mixed> $result   The aafm_meta_set() result.
+ * @param array<string,mixed> $identity The family's identity fields, in wire order.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_meta_update_response( string $type, int $id, string $key, array $result, array $identity ) {
+	if ( ! in_array( $result['status'], array( AAFM_WRITE_WRITTEN, AAFM_WRITE_UNCHANGED ), true ) ) {
+		return aafm_meta_write_error( $result['status'], 'write', $type, $id, $key );
+	}
+	return aafm_with_checked_reads(
+		static function () use ( $type, $id, $key, $result, $identity ): array {
+			$identity['value'] = aafm_meta_get( $type, $id, $key, true );
+			return array_merge( $identity, aafm_meta_write_response_fields( $result ) );
+		},
+		aafm_meta_write_error( AAFM_WRITE_UNCONFIRMED, 'write', $type, $id, $key )
+	);
+}
+
+/**
+ * The response delete-post-meta, delete-term-meta and delete-user-meta return: `deleted: true`
+ * for `deleted` and `absent`, since deleting an absent key is an idempotent success, then the
+ * outcome fields. Any other status is its error.
+ *
+ * @param string              $type   'post', 'term' or 'user'.
+ * @param int                 $id     Object id.
+ * @param string              $key    Meta key.
+ * @param array<string,mixed> $result The aafm_meta_delete() result.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_meta_delete_response( string $type, int $id, string $key, array $result ) {
+	if ( ! in_array( $result['status'], array( AAFM_WRITE_DELETED, AAFM_WRITE_ABSENT ), true ) ) {
+		return aafm_meta_write_error( $result['status'], 'delete', $type, $id, $key );
+	}
+	return array_merge( array( 'deleted' => true ), aafm_meta_write_response_fields( $result ) );
+}
+
+/**
+ * The outcome fields a meta write or delete adds to its response, each present exactly when the
+ * helper's own result carries it, in this order: status, previous, rows, acknowledged, observed
+ * and modified_by_site. `value` is not among them; aafm_meta_update_response() reads its own.
+ * `previous` goes out only when it is a scalar: get-meta never returns an array, object or null
+ * value to an agent, so an overwrite or delete does not hand one back either.
+ *
+ * @param array<string,mixed> $result The aafm_meta_set() or aafm_meta_delete() result.
+ * @return array<string,mixed>
+ */
+function aafm_meta_write_response_fields( array $result ): array {
+	$fields = array();
+	foreach ( array( 'status', 'previous', 'rows', 'acknowledged', 'observed', 'modified_by_site' ) as $name ) {
+		if ( array_key_exists( $name, $result ) && ( 'previous' !== $name || is_scalar( $result[ $name ] ) ) ) {
+			$fields[ $name ] = $result[ $name ];
+		}
+	}
+	return $fields;
+}
+
+/**
+ * Output-schema properties a meta write adds to its ability's response.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_meta_write_output_properties(): array {
+	return array(
+		'status'           => array(
+			'type' => 'string',
+			'enum' => array( 'written', 'unchanged' ),
+		),
+		'previous'         => array(
+			'type' => array( 'string', 'number', 'integer', 'boolean' ),
+		),
+		'rows'             => array( 'type' => 'integer' ),
+		'acknowledged'     => array( 'type' => 'boolean' ),
+		'observed'         => array(
+			'type'       => 'object',
+			'properties' => array(
+				'exists' => array( 'type' => 'boolean' ),
+				'count'  => array( 'type' => 'integer' ),
+			),
+		),
+		'modified_by_site' => array( 'type' => 'boolean' ),
+	);
+}
+
+/**
+ * Output-schema properties a meta delete adds to its ability's response.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_meta_delete_output_properties(): array {
+	$properties = aafm_meta_write_output_properties();
+	unset( $properties['modified_by_site'] );
+	$properties['status']['enum'] = array( 'deleted', 'absent' );
+	return $properties;
+}
+
+/**
+ * The error a meta write or delete returns when it did not succeed. The code is the one these
+ * abilities have always returned; the message says which status occurred, and the data carries
+ * identifiers only, never a value, because the adapter's error handler logs it.
+ *
+ * @param string $status    refused, read_failed or unconfirmed.
+ * @param string $operation 'write' or 'delete'.
+ * @param string $type      'post', 'term' or 'user'.
+ * @param int    $id        Object id.
+ * @param string $key       Meta key.
+ * @return WP_Error
+ */
+function aafm_meta_write_error( string $status, string $operation, string $type, int $id, string $key ): WP_Error {
+	$delete = 'delete' === $operation;
+	switch ( $status ) {
+		case AAFM_WRITE_READ_FAILED:
+			$message = $delete
+				? __( 'The current value could not be read, so nothing was deleted. Try again.', 'agent-abilities-for-mcp' )
+				: __( 'The current value could not be read, so nothing was written. Try again.', 'agent-abilities-for-mcp' );
+			break;
+		case AAFM_WRITE_UNCONFIRMED:
+			$message = __( 'The write could not be confirmed; read the key to see its current state.', 'agent-abilities-for-mcp' );
+			break;
+		default:
+			$message = $delete
+				? __( 'The site refused or failed the delete; read the key to see its current state.', 'agent-abilities-for-mcp' )
+				: __( 'The site refused or failed the write; read the key to see its current state.', 'agent-abilities-for-mcp' );
+	}
+	// The adapter's error handler writes error_data to error_log() whether or not WP_DEBUG is on,
+	// so the key goes through the activity-log key rule first and is null when it fails it.
+	$target = aafm_meta_write_target( $type, $id, $key );
+	return new WP_Error(
+		'aafm_error',
+		$message,
+		array(
+			'status'    => $status,
+			'kind'      => $target['kind'],
+			'object_id' => $target['object_id'],
+			'key'       => aafm_activity_detail_field( 'key', $target['key'] ),
+		)
+	);
+}

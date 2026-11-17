@@ -1,0 +1,63 @@
+<?php
+/**
+ * Reusable admin notice/callout component (four WP-native variants).
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Build the HTML for an admin notice. The message is escaped with esc_html() unless $args['html']
+ * is true, in which case it is run through wp_kses_post() so only post-safe markup survives.
+ *
+ * The leading glyph is an inline SVG from aafm_icon(), keyed by variant. Callers can
+ * override it with the `icon` arg (an aafm_icon name).
+ *
+ * @param string              $variant warning|info|success|error (unknown → info).
+ * @param string              $message Plain text (escaped), or HTML run through wp_kses_post() when $args['html'].
+ * @param array<string,mixed> $args    icon (override aafm_icon name), inline (bool), html (bool),
+ *                                     class (extra CSS class appended to the wrapper, sanitized
+ *                                     with sanitize_html_class()).
+ * @return string
+ */
+function aafm_get_notice_html( string $variant, string $message, array $args = array() ): string {
+	$icons = array(
+		'warning' => 'warning',
+		'info'    => 'info',
+		'success' => 'success',
+		'error'   => 'error',
+	);
+	if ( ! isset( $icons[ $variant ] ) ) {
+		$variant = 'info';
+	}
+
+	$icon_name = isset( $args['icon'] ) ? (string) $args['icon'] : $icons[ $variant ];
+
+	$inline = empty( $args['inline'] ) ? '' : ' aafm-notice-inline';
+	$extra  = empty( $args['class'] ) ? '' : ' ' . sanitize_html_class( (string) $args['class'] );
+	$body   = empty( $args['html'] ) ? esc_html( $message ) : wp_kses_post( $message );
+
+	return sprintf(
+		'<div class="aafm-notice aafm-notice-%1$s%2$s%5$s"><span class="aafm-notice-ic">%3$s</span><div class="aafm-notice-body">%4$s</div></div>',
+		esc_attr( $variant ),
+		esc_attr( $inline ),
+		wp_kses( aafm_icon( $icon_name ), aafm_svg_allowed_html() ),
+		$body,
+		esc_attr( $extra )
+	);
+}
+
+/**
+ * Echo an admin notice. See aafm_get_notice_html().
+ *
+ * @param string              $variant Variant slug.
+ * @param string              $message Message.
+ * @param array<string,mixed> $args    Options.
+ * @return void
+ */
+function aafm_render_notice( string $variant, string $message, array $args = array() ): void {
+	echo wp_kses( aafm_get_notice_html( $variant, $message, $args ), aafm_admin_allowed_html() );
+}

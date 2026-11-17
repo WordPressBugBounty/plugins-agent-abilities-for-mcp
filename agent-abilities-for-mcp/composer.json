@@ -1,0 +1,41 @@
+{
+  "name": "unaibamir/agent-abilities-for-mcp",
+  "description": "Exposes curated WordPress abilities to AI agents over the Model Context Protocol (MCP).",
+  "type": "wordpress-plugin",
+  "license": "GPL-2.0-or-later",
+  "require": {
+    "php": ">=7.4",
+    "wordpress/mcp-adapter": "0.7.1"
+  },
+  "require-dev": {
+    "yoast/phpunit-polyfills": "^4.0",
+    "php-stubs/wordpress-stubs": "^7.1",
+    "szepeviktor/phpstan-wordpress": "^2.0",
+    "phpstan/phpstan": "^2.3",
+    "phpstan/extension-installer": "^1.4",
+    "wp-coding-standards/wpcs": "^3.4",
+    "phpcompatibility/phpcompatibility-wp": "^2.1",
+    "dealerdirect/phpcodesniffer-composer-installer": "^1.0",
+    "squizlabs/php_codesniffer": "^3.10"
+  },
+  "config": {
+    "allow-plugins": {
+      "composer/installers": true,
+      "dealerdirect/phpcodesniffer-composer-installer": true,
+      "phpstan/extension-installer": true,
+      "automattic/jetpack-autoloader": true
+    },
+    "platform": { "php": "7.4" },
+    "sort-packages": true,
+    "optimize-autoloader": true
+  },
+  "autoload": {
+    "classmap": [ "includes/" ]
+  },
+  "scripts": {
+    "phpcs": "phpcs",
+    "phpcbf": "phpcbf",
+    "phpstan": "phpstan analyse",
+    "test": "phpunit"
+  }
+}

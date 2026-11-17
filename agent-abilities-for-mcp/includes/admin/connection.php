@@ -1,0 +1,1404 @@
+<?php
+/**
+ * Connection tab: endpoint display, agent-user helper, connect wizard, diagnostics.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * The MCP endpoint URL for this site.
+ *
+ * Calls rest_url() only after confirming $wp_rewrite is available: rest_url() ->
+ * get_rest_url() dereferences it, and a fatal is the result when it is not yet instantiated.
+ * The OAuth bearer path no longer reaches here that early (the bearer resolves only once REST
+ * routing has begun), so the branch that reconstructs the URL without $wp_rewrite is defensive,
+ * for any caller that asks early. ValidatorTest pins its plain-permalink form.
+ *
+ * Both branches MUST produce byte-identical output so the RFC 8707 audience
+ * hash_equals() check in the validator passes regardless of which branch ran at
+ * token-mint time versus token-check time. The reconstruction branch uses
+ * get_option('permalink_structure') - which never touches $wp_rewrite - to decide
+ * between the pretty-permalink (/wp-json/) and plain-permalink (?rest_route=) forms,
+ * matching exactly what rest_url() would have returned.
+ *
+ * @return string Full URL of the MCP REST endpoint.
+ */
+function aafm_endpoint_url(): string {
+	// Single-sourced in bootstrap.php; byte-identical to the namespace/route create_server()
+	// registers, which the OAuth audience binding (hash_equals) depends on.
+	$route = aafm_mcp_rest_namespace_route();
+
+	if ( isset( $GLOBALS['wp_rewrite'] ) && $GLOBALS['wp_rewrite'] instanceof \WP_Rewrite ) {
+		return rest_url( $route );
+	}
+
+	// $wp_rewrite is not yet available. Reconstruct without touching it.
+	// get_option('permalink_structure') returns '' on plain permalinks, a non-empty
+	// template (e.g. '/%postname%/') on pretty permalinks - same information $wp_rewrite
+	// would expose, but available before $wp_rewrite is instantiated.
+	$permalink_structure = (string) get_option( 'permalink_structure', '' );
+
+	if ( '' === $permalink_structure ) {
+		// Plain-permalink form: home_url()/index.php?rest_route=/route.
+		// Matches rest_url() on a plain-permalink install.
+		return add_query_arg( 'rest_route', '/' . $route, trailingslashit( home_url() ) . 'index.php' );
+	}
+
+	// Pretty-permalink form: home_url() + REST prefix + route.
+	// home_url() and rest_get_url_prefix() never dereference $wp_rewrite.
+	$home = rtrim( home_url(), '/' );
+	return $home . '/' . trim( rest_get_url_prefix(), '/' ) . '/' . $route;
+}
+
+/**
+ * Whether this site looks like a local/development install.
+ *
+ * Local stacks (DDEV, Local, Valet, wp-env) serve a self-signed or
+ * locally-trusted TLS certificate. The MCP client proxies run under Node,
+ * which rejects such certificates by default, so a snippet generated for a
+ * local site needs a TLS hint to connect. Production sites, with a
+ * publicly-trusted certificate, never need it and never get it.
+ *
+ * Detection uses the WordPress environment type first, then falls back to the
+ * common local host suffixes so a stock DDEV install (which reports as
+ * "production") is still recognised.
+ *
+ * @return bool
+ */
+function aafm_site_is_local(): bool {
+	$is_local = in_array( wp_get_environment_type(), array( 'local', 'development' ), true );
+
+	if ( ! $is_local ) {
+		$host     = wp_parse_url( home_url(), PHP_URL_HOST );
+		$is_local = is_string( $host ) && aafm_host_looks_local( $host );
+	}
+
+	/**
+	 * Filters whether the connection snippet treats this site as a local install.
+	 *
+	 * @param bool $is_local Whether the site is considered local/development.
+	 */
+	return (bool) apply_filters( 'aafm_site_is_local', $is_local );
+}
+
+/**
+ * Whether a host name looks like a local install: localhost, 127.0.0.1, or a common local suffix.
+ * The one list of local hosts, shared by aafm_site_is_local() and the Connection Doctor.
+ *
+ * @param string $host Host name, any case.
+ * @return bool
+ */
+function aafm_host_looks_local( string $host ): bool {
+	$host = strtolower( $host );
+	if ( 'localhost' === $host || '127.0.0.1' === $host ) {
+		return true;
+	}
+	foreach ( array( '.test', '.local', '.localhost', '.ddev.site', '.wip' ) as $suffix ) {
+		if ( str_ends_with( $host, $suffix ) ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * The diagnostics rail's Authorization header row. A browser page load carries no Authorization
+ * header, so it shows what the last "Check my connection" probe learned (doctor.php) instead of
+ * guessing from the current request.
+ *
+ * @return array{id:string,label:string,status:string,detail:string}
+ */
+function aafm_diagnostic_auth_header_check(): array {
+	$auth_seen = aafm_doctor_last_header_result();
+	if ( null === $auth_seen ) {
+		$status = 'warn';
+		$detail = __( 'Not tested yet. Run "Check my connection" on this tab.', 'agent-abilities-for-mcp' );
+	} elseif ( $auth_seen ) {
+		$status = 'pass';
+		$detail = __( 'PHP received the test Authorization header on the last connection check.', 'agent-abilities-for-mcp' );
+	} else {
+		$status = 'fail';
+		$detail = __( 'The server removed the test Authorization header on the last connection check. Run "Check my connection" for the fix.', 'agent-abilities-for-mcp' );
+	}
+
+	return array(
+		'id'     => 'auth_header',
+		'label'  => __( 'Authorization header reaches WordPress', 'agent-abilities-for-mcp' ),
+		'status' => $status,
+		'detail' => $detail,
+	);
+}
+
+/**
+ * Run the lean, read-only connection diagnostics shown on the Connection tab.
+ *
+ * @return array<int,array{id:string,label:string,status:string,detail:string}>
+ */
+function aafm_diagnostic_checks(): array {
+	$checks = array();
+
+	// 1. Adapter active and at or above the version floor.
+	$version  = aafm_loaded_adapter_version();
+	$checks[] = array(
+		'id'     => 'adapter',
+		'label'  => __( 'MCP adapter active and compatible', 'agent-abilities-for-mcp' ),
+		'status' => ( null !== $version && aafm_adapter_is_compatible( $version ) ) ? 'pass' : 'fail',
+		'detail' => null !== $version
+			/* translators: %s: adapter version number. */
+			? sprintf( __( 'Adapter %s loaded.', 'agent-abilities-for-mcp' ), $version )
+			: __( 'Adapter not loaded.', 'agent-abilities-for-mcp' ),
+	);
+
+	// 2. The MCP REST route is registered.
+	$routes    = rest_get_server()->get_routes();
+	$has_route = (bool) preg_grep( '#^' . preg_quote( aafm_mcp_rest_route(), '#' ) . '#', array_keys( $routes ) );
+	$checks[]  = array(
+		'id'     => 'endpoint',
+		'label'  => __( 'MCP REST endpoint registered', 'agent-abilities-for-mcp' ),
+		'status' => $has_route ? 'pass' : 'fail',
+		'detail' => aafm_endpoint_url(),
+	);
+
+	// 3. The Authorization header reaches PHP (some hosts/proxies strip it).
+	$checks[] = aafm_diagnostic_auth_header_check();
+
+	return $checks;
+}
+
+/**
+ * Create a dedicated low-privilege user for the agent.
+ *
+ * The agent connects as this user over an Application Password, so its reach is bounded
+ * by the subscriber role - least privilege by construction, no custom auth code.
+ *
+ * @param string $login Desired login.
+ * @return array{user_id:int,login:string}|WP_Error
+ */
+function aafm_create_agent_user( string $login ) {
+	$login = sanitize_user( $login, true );
+	if ( '' === $login ) {
+		return new WP_Error( 'aafm_bad_login', __( 'Invalid username.', 'agent-abilities-for-mcp' ) );
+	}
+	$existing_id = username_exists( $login );
+	if ( $existing_id ) {
+		$existing_id = (int) $existing_id;
+
+		// Self-heal the marker: an agent user created before the marker existed (or under a custom
+		// login) has no plugin marker, so the onboarding "Connect your agent" step stays stuck at
+		// "To do" even though the account is right there. Stamp the marker ONLY when the existing
+		// account matches the exact shape the create path produces - a single 'subscriber' role and
+		// nothing else - and does not hold manage_options. An Editor, Author, or Contributor whose
+		// login merely collides is not the dedicated agent, so it must not self-heal; and we NEVER
+		// stamp a privileged account, which would misreport a full-caps login as the low-privilege
+		// agent. When the shape matches, re-clicking "Create agent user" flips the step to done.
+		$existing_user   = aafm_exact_object( 'user', $existing_id );
+		$is_agent_shaped = $existing_user instanceof WP_User
+			&& array( 'subscriber' ) === array_values( array_map( 'strval', $existing_user->roles ) );
+		if ( $is_agent_shaped
+			&& ! user_can( $existing_id, 'manage_options' )
+			&& ! aafm_meta_get( 'user', $existing_id, aafm_agent_user_marker_meta_key(), true )
+		) {
+			aafm_meta_set( 'user', $existing_id, aafm_agent_user_marker_meta_key(), 1 );
+			aafm_meta_set( 'user', $existing_id, 'aafm_agent_user_created', time() );
+		}
+
+		// The user is already there - hand back a friendly message plus the existing user's
+		// id and edit link so the caller can offer "Edit user" instead of a dead-end error.
+		return new WP_Error(
+			'aafm_user_exists',
+			__( 'That user already exists, so there is nothing to create. You can edit it instead.', 'agent-abilities-for-mcp' ),
+			array(
+				'user_id'  => $existing_id,
+				'edit_url' => (string) get_edit_user_link( $existing_id ),
+			)
+		);
+	}
+
+	$user_id = wp_insert_user(
+		array(
+			'user_login' => $login,
+			'user_pass'  => wp_generate_password( 24, true, true ),
+			'role'       => 'subscriber',
+			'user_email' => '',
+		)
+	);
+	if ( is_wp_error( $user_id ) ) {
+		return $user_id;
+	}
+
+	$user_id = (int) $user_id;
+
+	// Stamp the plugin-created marker so the onboarding "Connect your agent" signal can tell this
+	// dedicated agent user apart from any unrelated application-password holder. Whatever login the
+	// admin typed, the marker travels with the account - the signal keys off the marker, not a name.
+	$stamps = array(
+		aafm_meta_set( 'user', $user_id, aafm_agent_user_marker_meta_key(), 1 ),
+		aafm_meta_set( 'user', $user_id, 'aafm_agent_user_created', time() ),
+	);
+	foreach ( $stamps as $stamp ) {
+		// A stamp that did not land leaves the account unmarked, so the create has not succeeded.
+		if ( is_wp_error( $stamp ) || ! in_array( $stamp['status'], array( AAFM_WRITE_WRITTEN, AAFM_WRITE_UNCHANGED ), true ) ) {
+			return aafm_generic_error();
+		}
+	}
+
+	// Hand back the sanitized login too, not just the id: on the same-session create the JS rewrites
+	// the App-Password config snippets to name this account, and it must use the login the server
+	// actually created (sanitize_user() may have changed what the admin typed), which is exactly what
+	// the next page render resolves as $existing_agent_login.
+	return array(
+		'user_id' => $user_id,
+		'login'   => $login,
+	);
+}
+
+/**
+ * One-time backfill: stamp the agent-user marker on an install that created its agent user
+ * through the pre-marker flow, so its onboarding "Connect your agent" step is not stuck "To do".
+ *
+ * The old flow always produced the same shape: login 'mcp-agent', the subscriber role, and
+ * (once the operator connected a client) at least one application password. We stamp ONLY a user
+ * that matches that exact shape, so a same-named account created for some unrelated reason is
+ * never mis-marked. This is deliberately conservative: the marker only drives an onboarding hint,
+ * so a missed backfill (operator re-runs the create step, which is idempotent) is far cheaper than
+ * a false one. Guarded by a stored flag so it runs at most once per install.
+ *
+ * @return void
+ */
+function aafm_backfill_agent_user_marker(): void {
+	if ( '1' === get_option( 'aafm_agent_user_marker_backfilled', '' ) ) {
+		return;
+	}
+
+	$existing_id = (int) username_exists( 'mcp-agent' );
+	if ( $existing_id > 0 && ! aafm_meta_get( 'user', $existing_id, aafm_agent_user_marker_meta_key(), true ) ) {
+		$user = aafm_exact_object( 'user', $existing_id );
+		if ( $user instanceof WP_User
+			&& array( 'subscriber' ) === array_values( array_map( 'strval', $user->roles ) )
+			&& ! empty( WP_Application_Passwords::get_user_application_passwords( $existing_id ) )
+		) {
+			aafm_meta_set( 'user', $existing_id, aafm_agent_user_marker_meta_key(), 1 );
+			aafm_meta_set( 'user', $existing_id, 'aafm_agent_user_created', time() );
+		}
+	}
+
+	// A failed write here just means this admin_init runs the (idempotent, conservative) check
+	// again next time - cheaper to retry than to report, so the result is intentionally unused,
+	// same as the other fire-and-forget guards this file has no operator-facing response for.
+	aafm_update_option_verified( 'aafm_agent_user_marker_backfilled', '1', true );
+}
+
+/**
+ * Build a copy-paste client config snippet pre-pointed at the scoped agent user.
+ *
+ * The snippet never contains a real secret - it carries a paste placeholder so the
+ * operator drops in the Application Password they generate through WordPress core.
+ *
+ * Two shapes are produced from the same data:
+ *
+ * - unix    - `npx` is launched directly (macOS, Linux).
+ * - windows - the launcher is wrapped in `cmd /c` because Windows MCP clients
+ *             cannot spawn the `npx` shim by name.
+ *
+ * On a local install (see {@see aafm_site_is_local()}) the env block also carries
+ * `NODE_TLS_REJECT_UNAUTHORIZED=0` so the Node proxy will accept the self-signed
+ * certificate during local testing. Production snippets never include it.
+ *
+ * Per-client shaping: most clients read the server map under an `mcpServers` key, so
+ * that is the default. VS Code is the exception - its `.vscode/mcp.json` uses a `servers`
+ * key - so a client of 'vscode' switches the top-level wrapper. The proxy package, env
+ * block, local-cert handling, and Windows handling stay identical across every client.
+ *
+ * @param string $client   Target client slug (see {@see aafm_quickstart_clients()}).
+ * @param string $username The agent username.
+ * @param string $os       Target OS shape: 'unix' (default) or 'windows'.
+ * @return string
+ */
+function aafm_client_snippet( string $client, string $username, string $os = 'unix' ): string {
+	// Hosted web apps connect over OAuth by URL and cannot run an mcp-remote stdio server, so the
+	// builder self-guards: it never hands back a config a hosted client could not use. The UI
+	// already skips these clients before calling here; this closes the direct-call footgun.
+	if ( aafm_client_is_hosted_web_app( $client ) ) {
+		return '';
+	}
+
+	$env = array(
+		'WP_API_URL'      => aafm_endpoint_url(),
+		'WP_API_USERNAME' => $username,
+		'WP_API_PASSWORD' => 'PASTE-APPLICATION-PASSWORD-HERE',
+	);
+	if ( aafm_site_is_local() ) {
+		$env['NODE_TLS_REJECT_UNAUTHORIZED'] = '0';
+	}
+
+	$server = array(
+		'agent-abilities' => array_merge(
+			aafm_npx_launch_command( $os, '@automattic/mcp-wordpress-remote@latest' ),
+			array( 'env' => $env )
+		),
+	);
+
+	$cfg = array( aafm_client_config_root_key( $client ) => $server );
+
+	return (string) wp_json_encode( $cfg, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+}
+
+/**
+ * The `command`/`args` pair for launching an npx-distributed proxy package, shaped for the
+ * unix or windows quickstart snippet: `npx -y <package> [...extra]` directly on unix, wrapped
+ * in `cmd /c` on windows because Windows MCP clients cannot spawn the `npx` shim by name.
+ * Shared by {@see aafm_client_snippet()} and {@see aafm_oauth_client_snippet()}, which differ
+ * only in the package name and whether an extra positional arg (the OAuth endpoint URL) follows it.
+ *
+ * @param string   $os         'unix' (default) or 'windows'.
+ * @param string   $package    The npx package spec to run.
+ * @param string[] $extra_args Extra positional args appended after the package name.
+ * @return array{command:string,args:string[]}
+ */
+function aafm_npx_launch_command( string $os, string $package, array $extra_args = array() ): array {
+	if ( 'windows' === $os ) {
+		return array(
+			'command' => 'cmd',
+			'args'    => array_merge( array( '/c', 'npx', '-y', $package ), $extra_args ),
+		);
+	}
+	return array(
+		'command' => 'npx',
+		'args'    => array_merge( array( '-y', $package ), $extra_args ),
+	);
+}
+
+/**
+ * The top-level key a client's MCP config file uses for its server map: VS Code's
+ * `.vscode/mcp.json` uses "servers"; every other client uses "mcpServers".
+ *
+ * @param string $client Client slug.
+ * @return string
+ */
+function aafm_client_config_root_key( string $client ): string {
+	return ( 'vscode' === $client ) ? 'servers' : 'mcpServers';
+}
+
+/**
+ * Every MCP client the Connection tab guides, slug => display label, in display order.
+ *
+ * The list leads with the hosted web apps most people reach for (ChatGPT, Claude AI), then the
+ * editors and CLIs. Web apps connect over OAuth by URL only; the rest can also run the
+ * mcp-remote stdio bridge. Which clients get an mcp-remote config snippet is decided by
+ * {@see aafm_config_snippet_clients()}, not this list.
+ *
+ * @return array<string,string> Slug-keyed labels, in the order shown in the UI.
+ */
+function aafm_quickstart_clients(): array {
+	return array(
+		'chatgpt'     => __( 'ChatGPT', 'agent-abilities-for-mcp' ),
+		'claude'      => __( 'Claude', 'agent-abilities-for-mcp' ),
+		'claude-code' => __( 'Claude Code', 'agent-abilities-for-mcp' ),
+		'cursor'      => __( 'Cursor', 'agent-abilities-for-mcp' ),
+		'vscode'      => __( 'VS Code', 'agent-abilities-for-mcp' ),
+		'windsurf'    => __( 'Windsurf', 'agent-abilities-for-mcp' ),
+		'gemini-cli'  => __( 'Gemini CLI', 'agent-abilities-for-mcp' ),
+		'manus'       => __( 'Manus', 'agent-abilities-for-mcp' ),
+		'generic'     => __( 'Generic', 'agent-abilities-for-mcp' ),
+	);
+}
+
+/**
+ * The hosted web-app clients: OAuth-by-URL only, and never an mcp-remote stdio config.
+ *
+ * ChatGPT, Claude (the claude.ai web app and Claude Desktop, which share one custom-connector flow),
+ * and Manus all run as hosted cloud services. They cannot launch a local stdio server on the
+ * operator's machine, so they must never be shown an mcp-remote snippet or appear in the
+ * App-Password config grid. Manus connects the same way: its MCP connectors are added by remote URL
+ * and approved over OAuth 2.0 (per manus.im/docs/integrations/mcp-connectors), so it belongs with
+ * the URL-only web apps rather than the stdio-bridge clients.
+ *
+ * @return list<string> Slugs of the hosted web-app clients.
+ */
+function aafm_hosted_web_app_clients(): array {
+	return array( 'chatgpt', 'claude', 'manus' );
+}
+
+/**
+ * Whether a client is a hosted web app that connects over OAuth by URL only.
+ *
+ * @param string $client Client slug.
+ * @return bool
+ */
+function aafm_client_is_hosted_web_app( string $client ): bool {
+	return in_array( $client, aafm_hosted_web_app_clients(), true );
+}
+
+/**
+ * The clients that get an mcp-remote config snippet, slug => label, in display order.
+ *
+ * This is {@see aafm_quickstart_clients()} minus the hosted web apps, so the App-Password config
+ * grid and the per-client snippet cards never hand out a stdio config to a client that cannot run
+ * one.
+ *
+ * @return array<string,string> Slug-keyed labels.
+ */
+function aafm_config_snippet_clients(): array {
+	return array_filter(
+		aafm_quickstart_clients(),
+		static fn( string $slug ): bool => ! aafm_client_is_hosted_web_app( $slug ),
+		ARRAY_FILTER_USE_KEY
+	);
+}
+
+/**
+ * How each OAuth client connects, as the second line on its picker card. Worded from the steps the
+ * picker shows: hosted apps add the site as a connector, the rest paste a config and then sign in.
+ *
+ * @return array<string,string> Client slug => method label.
+ */
+function aafm_client_method_labels(): array {
+	$labels = array();
+	foreach ( array_keys( aafm_quickstart_clients() ) as $slug ) {
+		$labels[ $slug ] = aafm_client_is_hosted_web_app( $slug )
+			? __( 'Added as a connector inside the app', 'agent-abilities-for-mcp' )
+			: __( 'Paste a config, then sign in', 'agent-abilities-for-mcp' );
+	}
+	return $labels;
+}
+
+/**
+ * A one-click install link for the OAuth path: the endpoint URL and a server name, never a credential.
+ *
+ * Only clients with a documented link format get one. Cursor: cursor://anysphere.cursor-deeplink/mcp/install
+ * with `name` and a base64 JSON `config` (cursor.com/docs/mcp/install-links). VS Code: vscode:mcp/install
+ * followed by the URL-encoded JSON server config with its `name` (VS Code MCP extension guide). The
+ * client still runs the OAuth sign-in itself.
+ *
+ * @param string $client Client slug.
+ * @return string Raw link, or '' when the client has no documented format.
+ */
+function aafm_client_install_link( string $client ): string {
+	$url = aafm_endpoint_url();
+	switch ( $client ) {
+		case 'cursor':
+			$config = (string) wp_json_encode( array( 'url' => $url ), JSON_UNESCAPED_SLASHES );
+			return 'cursor://anysphere.cursor-deeplink/mcp/install?name=agent-abilities&config=' . rawurlencode( base64_encode( $config ) ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.obfuscation_base64_encode -- the link format Cursor documents.
+		case 'vscode':
+			$config = array(
+				'name' => 'agent-abilities',
+				'type' => 'http',
+				'url'  => $url,
+			);
+			return 'vscode:mcp/install?' . rawurlencode( (string) wp_json_encode( $config, JSON_UNESCAPED_SLASHES ) );
+		default:
+			return '';
+	}
+}
+
+/**
+ * The one-line "where do I put this?" note for each quickstart client.
+ *
+ * Kept as plain prose with no markup so the render can escape each line wholesale.
+ *
+ * @param string $client Client slug.
+ * @return string Localized note, or an empty string for an unknown slug.
+ */
+function aafm_quickstart_note( string $client ): string {
+	// A switch, not an array lookup: each arm's __() must stay reachable only for its own
+	// client, since an eagerly built array would translate all seven notes on every call
+	// (wasted work, and a client picker that resolves per keystroke would multiply it).
+	switch ( $client ) {
+		case 'claude-code':
+			return __( "Add it to your project's .mcp.json, or run claude mcp add.", 'agent-abilities-for-mcp' );
+		case 'cursor':
+			return __( 'Add it to ~/.cursor/mcp.json (or Settings → MCP), then reload.', 'agent-abilities-for-mcp' );
+		case 'vscode':
+			return __( 'Save it as .vscode/mcp.json in your workspace. Note the key is "servers", not "mcpServers".', 'agent-abilities-for-mcp' );
+		case 'windsurf':
+			return __( "Add it under Windsurf's MCP config (mcp_config.json) and refresh the server list.", 'agent-abilities-for-mcp' );
+		case 'gemini-cli':
+			return __( 'Add it to the mcpServers block in your Gemini CLI settings.json.', 'agent-abilities-for-mcp' );
+		case 'manus':
+			return __( "Add it to Manus's MCP server config.", 'agent-abilities-for-mcp' );
+		case 'generic':
+			return __( 'For any client that speaks MCP over the mcp-wordpress-remote proxy, use this block.', 'agent-abilities-for-mcp' );
+		default:
+			return '';
+	}
+}
+
+/**
+ * Build a copy-paste config snippet for the OAuth bridge path.
+ *
+ * Like {@see aafm_client_snippet()}, but for the OAuth connection method.  The
+ * agent connects over the browser-based OAuth approval flow - no stored secret
+ * is ever needed, so the snippet carries only the endpoint URL (via mcp-remote)
+ * and never any `WP_API_*` env vars.
+ *
+ * On a local install the `env` block carries `NODE_EXTRA_CA_CERTS` pointing at a
+ * placeholder path so the operator can substitute their own mkcert root CA and
+ * avoid Node rejecting the locally-trusted certificate.  Production snippets
+ * include no `env` block at all.
+ *
+ * The unix/windows and VS Code root-key rules match {@see aafm_client_snippet()}
+ * exactly so the two snippet renderers feel consistent.
+ *
+ * @param string $client Target client slug (see {@see aafm_quickstart_clients()}).
+ * @param string $os     Target OS shape: 'unix' (default) or 'windows'.
+ * @return string JSON snippet, credential-free.
+ */
+function aafm_oauth_client_snippet( string $client, string $os = 'unix' ): string {
+	// Hosted web apps connect over OAuth by URL only and cannot run the mcp-remote bridge, so the
+	// builder returns no snippet for them. The OAuth panel already renders the endpoint URL for
+	// these clients instead of calling here; this self-guard closes the direct-call footgun.
+	if ( aafm_client_is_hosted_web_app( $client ) ) {
+		return '';
+	}
+
+	$entry = aafm_npx_launch_command( $os, 'mcp-remote', array( aafm_endpoint_url() ) );
+
+	if ( aafm_site_is_local() ) {
+		// Placeholder path: local TLS certificates (mkcert, DDEV, Valet) are machine-specific.
+		// The operator replaces this string with the real path from `mkcert -CAROOT`.
+		$entry['env'] = array( 'NODE_EXTRA_CA_CERTS' => 'PATH-TO-YOUR-mkcert-rootCA.pem' );
+	}
+
+	$server = array( 'agent-abilities' => $entry );
+
+	return (string) wp_json_encode( array( aafm_client_config_root_key( $client ) => $server ), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES );
+}
+
+/**
+ * Whether this client's primary OAuth connection mode is native (URL-based) or bridge.
+ *
+ * Clients that have first-class support for adding a remote MCP server by URL and running
+ * the OAuth browser flow natively are classed as 'native'.  Clients that cannot run the
+ * browser flow by themselves are guided through the mcp-remote stdio bridge first ('bridge').
+ *
+ * @param string $client Client slug.
+ * @return string 'native' or 'bridge'.
+ */
+function aafm_oauth_client_mode( string $client ): string {
+	$native_clients = array( 'chatgpt', 'claude', 'manus', 'claude-code', 'cursor', 'vscode', 'windsurf', 'gemini-cli' );
+	return in_array( $client, $native_clients, true ) ? 'native' : 'bridge';
+}
+
+/**
+ * Per-client one-line note explaining where to paste the OAuth endpoint URL.
+ *
+ * Plain prose, no markup, fully translatable. Returns an empty string for unknown slugs so
+ * callers can skip the note rather than rendering a blank paragraph.
+ *
+ * @param string $client Client slug.
+ * @return string Localized instruction, or '' for an unknown slug.
+ */
+function aafm_oauth_client_note( string $client ): string {
+	// A switch, not an array lookup: see aafm_quickstart_note()'s comment above - an
+	// eagerly built array would translate all nine notes on every call instead of one.
+	switch ( $client ) {
+		case 'chatgpt':
+			return __( 'On ChatGPT web, open Plugins, select the plus button, then Add custom MCP server. Name it, paste the endpoint URL under Connection, choose OAuth, tick the risk acknowledgment, select Create as a plugin, and approve the sign-in. You don\'t need to turn on Developer Mode first.', 'agent-abilities-for-mcp' );
+		case 'claude':
+			return __( 'Open Customize, then Connectors, choose + Add, then Add custom connector, paste the endpoint URL, and approve the sign-in. The claude.ai web app and Claude Desktop use the same flow.', 'agent-abilities-for-mcp' );
+		case 'claude-code':
+			return __( 'Run: claude mcp add --transport http agent-abilities <endpoint-url>', 'agent-abilities-for-mcp' );
+		case 'cursor':
+			return __( 'Add a server to ~/.cursor/mcp.json with a "url" pointing at the endpoint, then reload.', 'agent-abilities-for-mcp' );
+		case 'vscode':
+			return __( 'Add a .vscode/mcp.json server with "type":"http" and the endpoint "url" (key is "servers").', 'agent-abilities-for-mcp' );
+		case 'windsurf':
+			return __( "Add the endpoint URL as a server in Windsurf's MCP config, then refresh.", 'agent-abilities-for-mcp' );
+		case 'gemini-cli':
+			return __( 'Add the endpoint under httpUrl in your Gemini CLI settings.json mcpServers block.', 'agent-abilities-for-mcp' );
+		case 'manus':
+			return __( 'In Manus, add a custom MCP connector, paste the endpoint URL as the server URL, and approve the OAuth sign-in. Manus runs in the cloud, so it connects by URL - there is no local bridge to install.', 'agent-abilities-for-mcp' );
+		case 'generic':
+			return __( 'Use the bridge snippet below with any MCP client that runs a local stdio server.', 'agent-abilities-for-mcp' );
+		default:
+			return '';
+	}
+}
+
+/**
+ * AJAX: create the dedicated agent user.
+ *
+ * Gated on create_users as well as manage_options, mirroring the aafm/create-user
+ * ability. create_users is the check core itself maps correctly on multisite
+ * (map_meta_cap sends non-super-admins to do_not_allow unless the network's
+ * add_new_users setting is on), so a subsite admin cannot use this handler to mint
+ * network-wide accounts the Users screen would refuse them. manage_options alone
+ * misses that: it is a per-site cap every subsite admin holds.
+ *
+ * @return void
+ */
+function aafm_ajax_create_agent_user(): void {
+	check_ajax_referer( 'aafm_admin', 'nonce' );
+	if ( ! current_user_can( 'manage_options' ) || ! current_user_can( 'create_users' ) ) {
+		wp_send_json_error( array( 'message' => __( 'You are not allowed to create users.', 'agent-abilities-for-mcp' ) ), 403 );
+	}
+	$login  = isset( $_POST['login'] ) ? sanitize_user( wp_unslash( (string) $_POST['login'] ), true ) : '';
+	$result = aafm_create_agent_user( $login );
+	if ( is_wp_error( $result ) ) {
+		$payload = array( 'message' => $result->get_error_message() );
+		// On a duplicate username, carry the existing user's id + edit link so the JS can
+		// render an "Edit user" link rather than a bare error string.
+		$data = $result->get_error_data();
+		if ( is_array( $data ) && ! empty( $data['user_id'] ) ) {
+			$payload['user_id']  = (int) $data['user_id'];
+			$payload['edit_url'] = isset( $data['edit_url'] ) ? esc_url_raw( (string) $data['edit_url'] ) : '';
+		}
+		wp_send_json_error( $payload );
+	}
+	wp_send_json_success( $result );
+}
+
+/**
+ * AJAX: revoke an OAuth client from the Connections management table.
+ *
+ * Deactivates the client and revokes its active tokens, so it is locked out at once.
+ * Nonce + manage_options gated; the client_id is the only client-supplied value and
+ * it is sanitized as plain text before use.
+ *
+ * @return void
+ */
+function aafm_ajax_oauth_revoke_client(): void {
+	check_ajax_referer( 'aafm_admin', 'nonce' );
+	if ( ! current_user_can( 'manage_options' ) ) {
+		wp_send_json_error( array( 'message' => __( 'You are not allowed to do this.', 'agent-abilities-for-mcp' ) ), 403 );
+	}
+	// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+	$client_id = isset( $_POST['client_id'] ) ? sanitize_text_field( wp_unslash( (string) $_POST['client_id'] ) ) : '';
+	if ( '' === $client_id ) {
+		wp_send_json_error( array( 'message' => __( 'Missing client.', 'agent-abilities-for-mcp' ) ) );
+	}
+
+	$deactivated = aafm_oauth_deactivate_client( $client_id );
+	$revoked     = aafm_oauth_revoke_client_tokens( $client_id );
+	// Drop any pending (not-yet-redeemed) authorization codes too, or one could still mint
+	// fresh tokens within its short window after the client is revoked.
+	aafm_oauth_revoke_client_codes( $client_id );
+
+	// Authoritative final-state read: report success only when the client is really
+	// deactivated, no active token for it survives, and no code row survives either, whatever
+	// any single write above reported on its own (a failed UPDATE used to
+	// still send success, and the code-table delete above was never
+	// certified at all).
+	//
+	// aafm_oauth_revoke_client_tokens() reports a genuine query failure as -1, and the final-state
+	// read can still find zero active tokens when that UPDATE failed, so -1 is refused the same as
+	// any other unconfirmed revoke.
+	$app = sprintf( ' (app %s)', substr( $client_id, 0, 8 ) );
+	if ( ! $deactivated || -1 === $revoked || aafm_oauth_client_has_active_tokens( $client_id ) || aafm_oauth_client_has_pending_codes( $client_id ) ) {
+		aafm_log_setting_change( 'aafm/oauth-client', __( 'Could not revoke the app', 'agent-abilities-for-mcp' ) . $app, false );
+		wp_send_json_error( array( 'message' => __( 'Could not fully revoke the client. Please try again.', 'agent-abilities-for-mcp' ) ) );
+	}
+
+	aafm_log_setting_change( 'aafm/oauth-client', __( 'App revoked', 'agent-abilities-for-mcp' ) . $app );
+	wp_send_json_success( array( 'client_id' => $client_id ) );
+}
+
+/**
+ * AJAX: flag or unflag a registered OAuth client as an agent-identity connection.
+ *
+ * Nonce + manage_options gated, mirroring aafm_ajax_oauth_revoke_client()'s shape. The
+ * client_id is the only client-supplied identifier; is_agent_identity is read as a simple
+ * truthy/falsy flag, not a scalar that needs further sanitizing.
+ *
+ * @return void
+ */
+function aafm_ajax_set_client_agent_identity(): void {
+	check_ajax_referer( 'aafm_admin', 'nonce' );
+	if ( ! current_user_can( 'manage_options' ) ) {
+		wp_send_json_error( array( 'message' => __( 'You are not allowed to do this.', 'agent-abilities-for-mcp' ) ), 403 );
+	}
+	// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+	$client_id = isset( $_POST['client_id'] ) ? sanitize_text_field( wp_unslash( (string) $_POST['client_id'] ) ) : '';
+	if ( '' === $client_id ) {
+		wp_send_json_error( array( 'message' => __( 'Missing client.', 'agent-abilities-for-mcp' ) ) );
+	}
+	// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+	$flag_raw = isset( $_POST['is_agent_identity'] ) ? sanitize_text_field( wp_unslash( (string) $_POST['is_agent_identity'] ) ) : '';
+	$flag     = '' !== $flag_raw && '0' !== $flag_raw;
+
+	if ( ! aafm_oauth_set_client_agent_identity( $client_id, $flag ) ) {
+		wp_send_json_error( array( 'message' => __( 'Client not found.', 'agent-abilities-for-mcp' ) ) );
+	}
+
+	wp_send_json_success(
+		array(
+			'client_id'         => $client_id,
+			'is_agent_identity' => $flag,
+		)
+	);
+}
+
+/**
+ * AJAX: revoke an OAuth grant (user consent) from the Connections management table.
+ *
+ * Deletes the user's consent for the client and revokes that user+client's active
+ * tokens, so the user must re-approve to reconnect. Nonce + manage_options gated;
+ * user_id is cast with absint and client_id sanitized as plain text.
+ *
+ * @return void
+ */
+function aafm_ajax_oauth_revoke_grant(): void {
+	check_ajax_referer( 'aafm_admin', 'nonce' );
+	if ( ! current_user_can( 'manage_options' ) ) {
+		wp_send_json_error( array( 'message' => __( 'You are not allowed to do this.', 'agent-abilities-for-mcp' ) ), 403 );
+	}
+	// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+	$user_id = isset( $_POST['user_id'] ) ? absint( wp_unslash( $_POST['user_id'] ) ) : 0;
+	// phpcs:ignore WordPress.Security.NonceVerification.Missing -- nonce verified above.
+	$client_id = isset( $_POST['client_id'] ) ? sanitize_text_field( wp_unslash( (string) $_POST['client_id'] ) ) : '';
+	if ( $user_id <= 0 || '' === $client_id ) {
+		wp_send_json_error( array( 'message' => __( 'Missing grant.', 'agent-abilities-for-mcp' ) ) );
+	}
+
+	$consent_deleted = aafm_oauth_delete_consent( $user_id, $client_id );
+	$revoked         = aafm_oauth_revoke_user_client_tokens( $user_id, $client_id );
+	// Drop any pending (not-yet-redeemed) authorization codes for this user+client too, or one
+	// could still mint fresh tokens after the consent and existing tokens are gone.
+	aafm_oauth_revoke_user_client_codes( $user_id, $client_id );
+
+	// Authoritative final-state read: report success only when the consent is really gone, no
+	// active token for this user+client survives, and no code row survives either, whatever any
+	// single write above reported on its own (a failed UPDATE used to still
+	// send success while the bearer token kept validating, and the code-table
+	// delete above was never certified at all).
+	//
+	// aafm_oauth_revoke_user_client_tokens() reports a genuine query failure as -1, and the
+	// final-state read can still find zero active tokens when that UPDATE failed, so -1 is refused
+	// the same as any other unconfirmed revoke.
+	$grant = sprintf( ' (user ID %1$d, app %2$s)', $user_id, substr( $client_id, 0, 8 ) );
+	if ( ! $consent_deleted || -1 === $revoked || aafm_oauth_user_client_has_active_tokens( $user_id, $client_id ) || aafm_oauth_user_client_has_pending_codes( $user_id, $client_id ) ) {
+		aafm_log_setting_change( 'aafm/oauth-grant', __( 'Could not revoke the grant', 'agent-abilities-for-mcp' ) . $grant, false );
+		wp_send_json_error( array( 'message' => __( 'Could not fully revoke the grant. Please try again.', 'agent-abilities-for-mcp' ) ) );
+	}
+
+	aafm_log_setting_change( 'aafm/oauth-grant', __( 'Grant revoked', 'agent-abilities-for-mcp' ) . $grant );
+
+	wp_send_json_success(
+		array(
+			'user_id'   => $user_id,
+			'client_id' => $client_id,
+		)
+	);
+}
+
+/**
+ * AJAX: check that the MCP endpoint is reachable and answers JSON-RPC.
+ *
+ * This is an honest reachability probe, NOT an impersonation of the agent. It self-calls
+ * the endpoint using the current admin's cookie plus a fresh REST nonce, so it confirms
+ * the route is registered, reachable, and replies to `tools/list`. The tool count it
+ * reports is the ADMIN's view - the agent connects as the low-privilege user over an
+ * Application Password and will usually see fewer tools. The response is labeled so it
+ * never implies "this is what your agent will see," and it never sends or logs the
+ * Application Password.
+ *
+ * The target URL comes from aafm_endpoint_url(), which calls core's own
+ * rest_url() and is therefore filterable by any active plugin to a different host.
+ * Sending this call's scoped auth cookies there trusts whatever rest_url filter the site
+ * already runs - already-privileged, already-installed code, not attacker input - the
+ * same trust prerequisite documented in aafm_ability_disclosures()'s file docblock.
+ *
+ * @return void
+ */
+function aafm_ajax_test_connection(): void {
+	check_ajax_referer( 'aafm_admin', 'nonce' );
+	if ( ! current_user_can( 'manage_options' ) ) {
+		wp_send_json_error( array( 'message' => __( 'You are not allowed to do this.', 'agent-abilities-for-mcp' ) ), 403 );
+	}
+	if ( aafm_pause_all() ) {
+		wp_send_json_error( array( 'message' => __( 'Access to this site is paused. Resume it on this tab, then check again.', 'agent-abilities-for-mcp' ) ) );
+	}
+
+	// Forward only the current admin's WordPress auth cookies on the self-call (admin-eye
+	// reachability check). The self-request is same-origin and already nonce + cap gated, but it
+	// should carry just what the auth handshake needs - the logged-in/auth/secure-auth cookies plus
+	// the session test cookie - not the operator's entire cookie jar (analytics, third-party, etc.).
+	$auth_cookie_names = array();
+	foreach ( array( 'LOGGED_IN_COOKIE', 'AUTH_COOKIE', 'SECURE_AUTH_COOKIE', 'TEST_COOKIE' ) as $cookie_const ) {
+		if ( defined( $cookie_const ) ) {
+			$auth_cookie_names[] = (string) constant( $cookie_const );
+		}
+	}
+
+	$cookies = array();
+	// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- entry already nonce + cap checked; reading own auth cookies for a self-call.
+	foreach ( wp_unslash( $_COOKIE ) as $cookie_name => $cookie_value ) {
+		$cookie_name = (string) $cookie_name;
+		if ( ! in_array( $cookie_name, $auth_cookie_names, true ) ) {
+			continue; // Drop everything that is not a WordPress auth cookie.
+		}
+		$cookies[ $cookie_name ] = is_scalar( $cookie_value ) ? (string) $cookie_value : '';
+	}
+
+	$body = (string) wp_json_encode(
+		array(
+			'jsonrpc' => '2.0',
+			'id'      => 1,
+			'method'  => 'tools/list',
+			'params'  => new stdClass(),
+		)
+	);
+
+	// The login travels only to this site's own address. A rest_url filter or a mapped domain can
+	// point the endpoint at another host, and the request then runs without the login. With the
+	// login attached, redirects are off: WordPress would carry the domainless cookies and the nonce
+	// header to wherever a redirect points.
+	$same_origin = aafm_endpoint_is_same_origin();
+	$args        = array(
+		'timeout' => 10,
+		'headers' => array( 'Content-Type' => 'application/json' ),
+		'body'    => $body,
+	);
+	if ( $same_origin ) {
+		$args['cookies'] = $cookies;
+		// A cookie-authenticated REST call needs the REST nonce or core rejects it with 401.
+		$args['headers']['X-WP-Nonce'] = wp_create_nonce( 'wp_rest' );
+		$args['redirection']           = 0;
+	}
+
+	$response = wp_remote_post( aafm_endpoint_url(), $args );
+
+	if ( is_wp_error( $response ) ) {
+		wp_send_json_error( array( 'message' => $response->get_error_message() ) );
+	}
+
+	$code       = (int) wp_remote_retrieve_response_code( $response );
+	$body       = json_decode( (string) wp_remote_retrieve_body( $response ), true );
+	$reachable  = ( 200 === $code && is_array( $body ) && isset( $body['result'] ) );
+	$tool_count = ( is_array( $body ) && isset( $body['result']['tools'] ) && is_array( $body['result']['tools'] ) )
+		? count( $body['result']['tools'] )
+		: 0;
+
+	wp_send_json_success(
+		array(
+			'http_code'        => $code,
+			'reachable'        => $reachable,
+			'admin_tool_count' => $tool_count, // The admin's-eye count, not the agent's.
+			'cookies_skipped'  => ! $same_origin,
+			'redirected'       => $same_origin && $code >= 300 && $code < 400,
+		)
+	);
+}
+
+/**
+ * Whether the MCP endpoint is on this site's own origin, so the Test connection call may carry the
+ * admin's login.
+ *
+ * @return bool
+ */
+function aafm_endpoint_is_same_origin(): bool {
+	$endpoint = aafm_site_origin( aafm_endpoint_url() );
+	return '' !== $endpoint
+		&& ( aafm_site_origin( home_url() ) === $endpoint || aafm_site_origin( site_url() ) === $endpoint );
+}
+
+/**
+ * Format a stored UTC datetime for admin display, falling back to the raw value.
+ *
+ * The OAuth tables store created_at/granted_at as UTC 'Y-m-d H:i:s'. This renders them
+ * with the site's date+time format so the management tables read consistently with the
+ * rest of the admin. An unparseable value is returned as-is (already escaped by the caller).
+ *
+ * @param string $utc Stored UTC datetime string.
+ * @return string Formatted local datetime, or the original string when it cannot be parsed.
+ */
+function aafm_format_admin_datetime( string $utc ): string {
+	if ( '' === $utc ) {
+		return '';
+	}
+	$ts = strtotime( $utc . ' UTC' );
+	if ( false === $ts ) {
+		return $utc;
+	}
+	$formatted = wp_date( get_option( 'date_format' ) . ' ' . get_option( 'time_format' ), $ts );
+	return false === $formatted ? $utc : $formatted;
+}
+
+/**
+ * Render the OS tabs and client grid shared by the OAuth and App Password pickers.
+ *
+ * @param string               $label_id Id of the OS label that names the tablist.
+ * @param string               $grid_id  Id of the client grid.
+ * @param array<string,string> $clients       Client slug => label, in display order.
+ * @param array<string,string> $method_labels Client slug => how it connects, shown as a second line
+ *                                            inside the card (so it is part of the radio's name).
+ * @return void
+ */
+function aafm_render_client_picker( string $label_id, string $grid_id, array $clients, array $method_labels = array() ): void {
+	echo '<div class="aafm-connect-os">';
+	echo '<div class="aafm-stat-label" id="' . esc_attr( $label_id ) . '">' . esc_html__( 'Your operating system', 'agent-abilities-for-mcp' ) . '</div>';
+	// The OS tabs are a cross-cutting filter over the per-client snippet pairs (one tablist,
+	// many panels), so they carry no aria-controls (optional in the WAI-ARIA tabs pattern);
+	// the tablist is given an accessible name via aria-labelledby instead.
+	echo '<div class="aafm-seg aafm-os-tabs" role="tablist" aria-labelledby="' . esc_attr( $label_id ) . '">';
+	printf(
+		'<button type="button" class="aafm-os-tab is-active" data-os="unix" role="tab" aria-selected="true">%s</button>',
+		esc_html__( 'macOS / Linux', 'agent-abilities-for-mcp' )
+	);
+	printf(
+		'<button type="button" class="aafm-os-tab" data-os="windows" role="tab" aria-selected="false">%s</button>',
+		esc_html__( 'Windows', 'agent-abilities-for-mcp' )
+	);
+	echo '</div>';
+	echo '</div>';
+
+	echo '<div class="aafm-connect-client">';
+	echo '<div class="aafm-stat-label" id="' . esc_attr( $grid_id . '-label' ) . '">' . esc_html__( 'Your client', 'agent-abilities-for-mcp' ) . '</div>';
+	// One choice from a set: a named radiogroup of radio buttons, with one tab stop and the arrow
+	// keys moving the selection (admin.js keeps aria-checked, tabindex and .on in step).
+	echo '<div class="aafm-client-grid" id="' . esc_attr( $grid_id ) . '" role="radiogroup" aria-labelledby="' . esc_attr( $grid_id . '-label' ) . '">';
+	$first = true;
+	foreach ( $clients as $slug => $label ) {
+		// A real <button>, not a click-only div: the OAuth picker is the only route to the OAuth
+		// instructions, so it has to be reachable by keyboard and announce its selected state.
+		echo wp_kses(
+			sprintf(
+				'<button type="button" class="aafm-client%1$s" data-client="%2$s" role="radio" aria-checked="%5$s" tabindex="%6$s"><span class="ci">%3$s</span>%4$s</button>',
+				$first ? ' on' : '',
+				esc_attr( $slug ),
+				aafm_icon( 'client-' . $slug ),
+				isset( $method_labels[ $slug ] )
+					? '<span class="aafm-client-text"><span class="aafm-client-name">' . esc_html( $label ) . '</span> <span class="aafm-client-method">' . esc_html( $method_labels[ $slug ] ) . '</span></span>'
+					: esc_html( $label ),
+				$first ? 'true' : 'false',
+				$first ? '0' : '-1'
+			),
+			aafm_admin_allowed_html()
+		);
+		$first = false;
+	}
+	echo '</div>';
+	echo '</div>';
+}
+
+/**
+ * Render one config snippet in a code block with its copy button.
+ *
+ * @param string $snippet The snippet text.
+ * @param string $os      'unix' or 'windows' for an OS-switched block (windows starts hidden), '' for a plain block.
+ * @return void
+ */
+function aafm_render_snippet_block( string $snippet, string $os = '' ): void {
+	if ( '' === $os ) {
+		echo '<div class="aafm-codeblock">';
+	} else {
+		printf( '<div class="aafm-codeblock aafm-snippet" data-os="%s"%s>', esc_attr( $os ), 'windows' === $os ? ' hidden' : '' );
+	}
+	printf( '<pre>%s</pre>', esc_html( $snippet ) );
+	echo wp_kses(
+		sprintf(
+			'<button type="button" class="aafm-btn aafm-btn-secondary aafm-btn-sm copy-fab aafm-copy" data-copy="%1$s">%2$s<span class="aafm-copy-label">%3$s</span></button>',
+			esc_attr( $snippet ),
+			aafm_icon( 'copy' ),
+			esc_html__( 'Copy', 'agent-abilities-for-mcp' )
+		),
+		aafm_admin_allowed_html()
+	);
+	echo '</div>';
+}
+
+/**
+ * Render the Connection tab.
+ *
+ * Layout (OAuth-first):
+ *   1. Endpoint card - single canonical endpoint display, then the Connection Doctor and the
+ *      Pause all access switch, so the kill switch is on screen without opening a tab.
+ *   2. OAuth card (Recommended) - guided browser-approval flow when OAuth is enabled;
+ *      a short notice when it is turned off.
+ *   3. OAuth and Application Passwords tabs (aafm_render_connection_tabs()), OAuth selected
+ *      when it is on.
+ *   4. The allowlist, which governs both methods.
+ *
+ * @return void
+ */
+function aafm_render_connection_tab(): void {
+	$url      = aafm_endpoint_url();
+	$oauth_on = aafm_oauth_enabled();
+	$is_local = aafm_site_is_local();
+
+	echo '<div class="aafm-connection">';
+	aafm_render_pause_all_notice();
+
+	// ---- 1. Endpoint card (the single canonical endpoint display) ----
+	echo '<section class="aafm-card aafm-endpoint-card">';
+	echo '<div class="aafm-card-head">' . wp_kses( aafm_card_head_html( 'endpoint', __( 'MCP endpoint', 'agent-abilities-for-mcp' ) ), aafm_admin_allowed_html() ) . '</div>';
+	echo '<div class="aafm-card-pad">';
+	echo '<div class="aafm-field-mono">';
+	printf( '<span class="aafm-endpoint">%s</span>', esc_html( $url ) );
+	echo wp_kses(
+		sprintf(
+			'<button type="button" class="aafm-btn aafm-btn-secondary aafm-copy" data-copy="%1$s" aria-label="%4$s">%2$s<span class="aafm-copy-label">%3$s</span></button>',
+			esc_attr( $url ),
+			aafm_icon( 'copy' ),
+			esc_html__( 'Copy', 'agent-abilities-for-mcp' ),
+			esc_attr__( 'Copy the MCP endpoint URL', 'agent-abilities-for-mcp' )
+		),
+		aafm_admin_allowed_html()
+	);
+	echo '</div>';
+	echo '</div></section>'; // .aafm-card-pad, .aafm-endpoint-card
+
+	aafm_render_doctor_card();
+	aafm_render_pause_all_card();
+
+	// ---- 2. OAuth card ----
+	echo '<section class="aafm-card aafm-oauth-card">';
+	echo '<div class="aafm-card-head">' . wp_kses( aafm_card_head_html( 'connection', __( 'Connect with OAuth', 'agent-abilities-for-mcp' ), '', '<span class="aafm-pill aafm-pill-info aafm-recommended-pill">' . esc_html__( 'Recommended', 'agent-abilities-for-mcp' ) . '</span>' ), aafm_admin_allowed_html() ) . '</div>';
+	echo '<div class="aafm-card-pad">';
+
+	if ( $oauth_on ) {
+		echo '<p class="aafm-card-desc">' . esc_html__( 'Paste your site\'s MCP endpoint URL into your agent. It opens a browser tab for approval - no secret to put in your config file.', 'agent-abilities-for-mcp' ) . '</p>';
+
+		// REST-lockdown diagnostic. The OAuth /register and /token endpoints must answer BEFORE a
+		// client has any credential, so a security or membership plugin that restricts the whole
+		// REST API to logged-in users blocks them and the connect flow dies with no obvious cause.
+		// Surface it here so an operator who sees connections fail knows where to look. A dynamic
+		// loopback self-check that only warns when a lockdown is actually detected would be the
+		// fuller fix; this is the minimal always-visible note.
+		aafm_render_notice(
+			'info',
+			__( 'If a security or membership plugin on this site restricts the WordPress REST API to logged-in users, OAuth connections will fail: an agent has to reach the sign-in and token steps before it is logged in. Application Passwords are not affected. If a connection never completes, check your REST API restrictions first.', 'agent-abilities-for-mcp' )
+		);
+
+		// OAuth client picker: OS tabs + client grid + per-client instructions and bridge snippet.
+		echo '<div class="aafm-connect-controls aafm-oauth-picker">';
+		aafm_render_client_picker( 'aafm-os-label-oauth', 'aafm-oauth-clients', aafm_quickstart_clients(), aafm_client_method_labels() );
+		echo '</div>'; // .aafm-oauth-picker
+
+		// Per-client OAuth instructions + bridge snippet: hidden data cards the JS swaps in.
+		// Native-mode clients lead with the URL paste note; bridge-mode clients lead with the snippet.
+		echo '<div class="aafm-oauth-panels">';
+		foreach ( aafm_quickstart_clients() as $slug => $label ) {
+			$mode       = aafm_oauth_client_mode( $slug );
+			$note       = aafm_oauth_client_note( $slug );
+			$is_web_app = aafm_client_is_hosted_web_app( $slug );
+
+			printf(
+				'<div class="aafm-oauth-panel" data-client="%s"%s>',
+				esc_attr( $slug ),
+				'chatgpt' === $slug ? '' : ' hidden'
+			);
+
+			if ( $is_web_app ) {
+				// Hosted web app: it connects over OAuth by URL only and cannot run a local
+				// stdio server, so show the endpoint URL to paste and never an mcp-remote config.
+				if ( '' !== $note ) {
+					echo '<p class="aafm-oauth-note">' . esc_html( $note ) . '</p>';
+				}
+				echo '<div class="aafm-field-mono aafm-oauth-endpoint">';
+				printf( '<span class="aafm-endpoint">%s</span>', esc_html( $url ) );
+				echo wp_kses(
+					sprintf(
+						'<button type="button" class="aafm-btn aafm-btn-secondary aafm-btn-sm copy-fab aafm-copy" data-copy="%1$s" aria-label="%4$s">%2$s<span class="aafm-copy-label">%3$s</span></button>',
+						esc_attr( $url ),
+						aafm_icon( 'copy' ),
+						esc_html__( 'Copy', 'agent-abilities-for-mcp' ),
+						esc_attr__( 'Copy the MCP endpoint URL', 'agent-abilities-for-mcp' )
+					),
+					aafm_admin_allowed_html()
+				);
+				echo '</div>';
+				echo '</div>'; // .aafm-oauth-panel
+				continue;
+			}
+
+			$unix_oauth    = aafm_oauth_client_snippet( $slug, 'unix' );
+			$windows_oauth = aafm_oauth_client_snippet( $slug, 'windows' );
+
+			if ( 'native' === $mode ) {
+				// Native: lead with URL-paste instructions, offer bridge as secondary.
+				if ( '' !== $note ) {
+					echo '<p class="aafm-oauth-note">' . esc_html( $note ) . '</p>';
+				}
+				// One-click install where the client documents a link format. OAuth path only: the
+				// link carries the endpoint and a server name, and the client signs in itself.
+				$install = aafm_client_install_link( $slug );
+				if ( '' !== $install ) {
+					$protocol = (string) strtok( $install, ':' );
+					echo wp_kses(
+						sprintf(
+							'<p class="aafm-oauth-install"><a class="aafm-btn aafm-btn-secondary" href="%1$s">%2$s</a></p>',
+							esc_url( $install, array( $protocol ) ),
+							/* translators: %s: client name, e.g. "Cursor". */
+							esc_html( sprintf( __( 'Add to %s', 'agent-abilities-for-mcp' ), $label ) )
+						),
+						aafm_admin_allowed_html(),
+						array_merge( wp_allowed_protocols(), array( $protocol ) )
+					);
+				}
+				// Local cert notice for native-mode clients when the site is local.
+				if ( $is_local ) {
+					$local_note = __( 'Your site looks local. If the client throws a certificate error, use the bridge snippet below and point NODE_EXTRA_CA_CERTS at your mkcert root CA.', 'agent-abilities-for-mcp' );
+					echo '<p class="aafm-oauth-local-note">' . esc_html( $local_note ) . '</p>';
+				}
+				echo '<details class="aafm-bridge-alt">';
+				echo '<summary>' . esc_html__( 'Need a local server instead? Use the mcp-remote bridge.', 'agent-abilities-for-mcp' ) . '</summary>';
+			} else {
+				// Bridge-mode clients: lead straight with the snippet.
+				if ( '' !== $note ) {
+					echo '<p class="aafm-oauth-note">' . esc_html( $note ) . '</p>';
+				}
+				echo '<div class="aafm-bridge-alt">';
+			}
+
+			// Bridge snippet (shown for both modes; inside <details> for native clients).
+			aafm_render_snippet_block( $unix_oauth, 'unix' );
+			aafm_render_snippet_block( $windows_oauth, 'windows' );
+
+			if ( 'native' === $mode ) {
+				echo '</details>'; // .aafm-bridge-alt
+			} else {
+				echo '</div>'; // .aafm-bridge-alt
+			}
+
+			echo '</div>'; // .aafm-oauth-panel
+		}
+		echo '</div>'; // .aafm-oauth-panels
+
+	} else {
+		// OAuth is off - short notice instead of the picker.
+		echo '<p class="aafm-card-desc">' . esc_html__(
+			'OAuth is turned off. Enable it under Settings to use the browser-approval flow, or connect with an Application Password below.',
+			'agent-abilities-for-mcp'
+		) . '</p>';
+
+		// Hosted web apps (ChatGPT, Claude, Manus) can ONLY connect over OAuth - they cannot run the
+		// Application Password bridge below - so with OAuth off they have no path at all. Name them
+		// rather than let the operator discover the dead end. The label list is derived from
+		// aafm_hosted_web_app_clients() so it stays in sync if that set changes.
+		$client_labels = aafm_quickstart_clients();
+		$hosted_labels = array();
+		foreach ( aafm_hosted_web_app_clients() as $hosted_slug ) {
+			if ( isset( $client_labels[ $hosted_slug ] ) ) {
+				$hosted_labels[] = $client_labels[ $hosted_slug ];
+			}
+		}
+		if ( ! empty( $hosted_labels ) ) {
+			echo '<p class="aafm-card-desc aafm-oauth-off-hosted">' . esc_html(
+				sprintf(
+					/* translators: %s: comma-separated list of hosted client names, e.g. "ChatGPT, Claude, and Manus". */
+					__( '%s connect over OAuth only, so they need OAuth turned on - the Application Password path below will not work for them.', 'agent-abilities-for-mcp' ),
+					wp_sprintf_l( '%l', $hosted_labels )
+				)
+			) . '</p>';
+		}
+	}
+
+	echo '</div></section>'; // .aafm-card-pad, .aafm-oauth-card
+
+	aafm_render_connection_tabs( $oauth_on );
+
+	// After the tabs: the allowlist governs both roles and OAuth clients, whichever method is in use.
+	aafm_render_allowlist_section();
+
+	echo '</div>'; // .aafm-connection
+}
+
+/**
+ * Render the Application Passwords panel body: the whole-site credential warning and Steps 1 to 3.
+ *
+ * @return void
+ */
+function aafm_render_app_password_steps(): void {
+	$is_local  = aafm_site_is_local();
+	$kses_code = array( 'code' => array() );
+
+	aafm_render_app_passwords_card( aafm_connection_app_passwords_data() );
+
+	// One card for the three steps, headed like the OAuth card. The steps sit straight in its body:
+	// no card inside a card.
+	echo '<section class="aafm-card aafm-app-password-steps">';
+	echo '<div class="aafm-card-head">' . wp_kses( aafm_card_head_html( 'terminal', __( 'Connect with an Application Password', 'agent-abilities-for-mcp' ) ), aafm_admin_allowed_html() ) . '</div>';
+	echo '<div class="aafm-card-pad">';
+
+	// Whole-site-credential caution. An Application Password is a core WordPress feature this
+	// plugin cannot scope: it authenticates the connected user everywhere in WordPress, not only
+	// through this plugin's MCP endpoint. Said once, here, where an operator is about to generate
+	// one.
+	aafm_render_notice(
+		'warning',
+		__( "An Application Password is a whole-site WordPress credential, not something this plugin can scope down. It authenticates the connected user across all of WordPress, including the REST API and XML-RPC, with everything that user's role allows, not only the abilities you turn on below. The allowlist, the high-risk floor, and the activity log on this plugin's tabs all apply to calls made through this MCP endpoint only, never to anything done with the same password elsewhere. OAuth above does not have this limit: a token this plugin issues only ever authenticates this one endpoint.", 'agent-abilities-for-mcp' )
+	);
+
+	// ---- Step 1: create a dedicated agent user ----
+	// Done-ness keys off the plugin-created marker (any dedicated agent user this plugin made),
+	// NOT a hardcoded login: the create form below lets the admin type any username, so matching
+	// on 'mcp-agent' would disagree with the Dashboard checklist whenever they picked another name.
+	// When a marked user exists, show its actual login so the "already exists" copy names the right
+	// account. The create form still seeds the 'mcp-agent' default for a fresh install.
+	$default_agent_login  = 'mcp-agent';
+	$created_agent_ids    = aafm_created_agent_users();
+	$agent_exists         = array() !== $created_agent_ids;
+	$existing_agent_id    = $agent_exists ? $created_agent_ids[0] : 0;
+	$existing_agent_login = $default_agent_login;
+	if ( $agent_exists ) {
+		$existing_agent_user = aafm_exact_object( 'user', (int) $existing_agent_id );
+		if ( $existing_agent_user instanceof WP_User ) {
+			$existing_agent_login = (string) $existing_agent_user->user_login;
+		}
+	}
+
+	printf(
+		'<div class="aafm-step aafm-conn-step%s">',
+		$agent_exists ? ' aafm-step-done' : ''
+	);
+	echo '<div class="aafm-step-head"><span class="aafm-sidx">';
+	if ( $agent_exists ) {
+		echo wp_kses( aafm_icon( 'check' ), aafm_svg_allowed_html() );
+	} else {
+		echo '1';
+	}
+	echo '</span><div>';
+	echo '<h3>' . esc_html__( 'Create a dedicated agent user', 'agent-abilities-for-mcp' ) . '</h3>';
+	echo '<p class="sub">' . esc_html__( 'Give the agent its own user with the least privilege it needs. It can only do what that user\'s role allows, and every ability is off until you turn it on.', 'agent-abilities-for-mcp' ) . '</p>';
+	echo '</div></div>';
+	echo '<div class="aafm-step-rail">';
+	wp_nonce_field( 'aafm_admin', 'aafm_conn_nonce' );
+	if ( $agent_exists ) {
+		$edit_url = (string) get_edit_user_link( $existing_agent_id );
+		echo '<p class="aafm-agent-done">';
+		echo '<span class="aafm-pill aafm-pill-success">' . esc_html__( 'Done', 'agent-abilities-for-mcp' ) . '</span> ';
+		echo wp_kses(
+			sprintf(
+				/* translators: %s: the agent user's login. */
+				esc_html__( 'The %s user already exists, so you can move straight to connecting your client.', 'agent-abilities-for-mcp' ),
+				'<strong>' . esc_html( $existing_agent_login ) . '</strong>'
+			),
+			aafm_admin_allowed_html()
+		);
+		if ( '' !== $edit_url ) {
+			printf(
+				' <a href="%1$s">%2$s</a>',
+				esc_url( $edit_url ),
+				esc_html__( 'Edit user', 'agent-abilities-for-mcp' )
+			);
+		}
+		echo '</p>';
+	} else {
+		// The field has no visible label, so it carries its own accessible name; the
+		// wizard's equivalent input (quickconnect.php) is labelled the same way.
+		echo '<p><input type="text" id="aafm-agent-login" value="' . esc_attr( $default_agent_login ) . '" class="regular-text" aria-label="' . esc_attr__( 'Agent username', 'agent-abilities-for-mcp' ) . '"> <button type="button" class="aafm-btn aafm-btn-secondary" id="aafm-create-user">' . esc_html__( 'Create agent user', 'agent-abilities-for-mcp' ) . '</button> <span class="aafm-user-status" aria-live="polite"></span></p>';
+	}
+	echo '</div>'; // .aafm-step-rail
+	echo '</div>';
+
+	// ---- Step 2: connect your client (App Password path) ----
+	echo '<div class="aafm-step aafm-conn-step">';
+	echo '<div class="aafm-step-head"><span class="aafm-sidx">2</span><div>';
+	echo '<h3>' . esc_html__( 'Connect your client', 'agent-abilities-for-mcp' ) . '</h3>';
+	echo '<p class="sub">' . esc_html__( 'Generate an Application Password for the agent user (Users → Profile → Application Passwords), pick your client, then copy the config.', 'agent-abilities-for-mcp' ) . '</p>';
+	echo '</div></div>';
+
+	echo '<div class="aafm-step-rail">';
+
+	// OS toggle + client picker row.
+	echo '<div class="aafm-connect-controls">';
+	aafm_render_client_picker( 'aafm-os-label-bridge', 'aafm-clients', aafm_config_snippet_clients() );
+	echo '</div>'; // .aafm-connect-controls
+
+	// Primary config block: the default (first) client, one .aafm-codeblock per OS.
+	echo '<div class="aafm-connect-config">';
+
+	// Use the first client in the config-snippet grid (claude-code) for the default block. Seed the
+	// username from the actual marked agent login when one exists (the admin may have created the
+	// agent user under a different name than the 'mcp-agent' default), falling back to the default
+	// on a fresh install, so the copied config never names a user that does not exist.
+	$unix_snippet    = aafm_client_snippet( 'claude-code', $existing_agent_login, 'unix' );
+	$windows_snippet = aafm_client_snippet( 'claude-code', $existing_agent_login, 'windows' );
+
+	aafm_render_snippet_block( $unix_snippet, 'unix' );
+	aafm_render_snippet_block( $windows_snippet, 'windows' );
+
+	// Windows / certificate notices.
+	$windows_note = __( 'On Windows the launcher is wrapped in <code>cmd /c</code> so the <code>npx</code> command resolves - use the Windows tab above.', 'agent-abilities-for-mcp' );
+
+	$cert_note = __( 'If your site uses a self-signed or locally-trusted certificate (DDEV, Local, Valet), Node rejects it by default; add <code>"NODE_TLS_REJECT_UNAUTHORIZED": "0"</code> to <code>env</code> for local testing only, never on a production site.', 'agent-abilities-for-mcp' );
+	if ( $is_local ) {
+		$cert_note .= ' ' . __( 'This site looks local, so that line is already included above.', 'agent-abilities-for-mcp' );
+	}
+
+	// Two labelled rows (Windows, Certificate) built as one HTML body and routed through the
+	// shared notice component, so this callout carries the same icon + tinted chrome as every
+	// other notice on this tab instead of a bespoke wp-admin-native box.
+	$os_note_body  = sprintf(
+		'<p class="aafm-os-note-row"><span class="aafm-os-note-label">%1$s</span> <span class="aafm-os-note-text">%2$s</span></p>',
+		esc_html__( 'Windows', 'agent-abilities-for-mcp' ),
+		wp_kses( $windows_note, $kses_code )
+	);
+	$os_note_body .= sprintf(
+		'<p class="aafm-os-note-row"><span class="aafm-os-note-label">%1$s</span> <span class="aafm-os-note-text">%2$s</span></p>',
+		esc_html__( 'Certificate', 'agent-abilities-for-mcp' ),
+		wp_kses( $cert_note, $kses_code )
+	);
+	aafm_render_notice(
+		'info',
+		$os_note_body,
+		array(
+			'html'  => true,
+			'class' => 'aafm-os-note',
+		)
+	);
+
+	// Per-client quickstarts: the JS-toggled grid of ready-to-paste configs, one per client.
+	// Each client's exact snippet stays present here so the picker can surface any of them.
+	echo '<div class="aafm-quickstarts">';
+	echo '<p><button type="button" class="button aafm-quickstart-toggle" aria-expanded="false" aria-controls="aafm-quickstart-grid">' . esc_html__( 'Show config for a specific client', 'agent-abilities-for-mcp' ) . '</button></p>';
+	echo '<div class="aafm-quickstart-grid" id="aafm-quickstart-grid" hidden>';
+	foreach ( aafm_config_snippet_clients() as $slug => $label ) {
+		// Same as the default block above: name the real marked agent login when one exists.
+		$snippet = aafm_client_snippet( $slug, $existing_agent_login, 'unix' );
+		echo '<div class="aafm-quickstart-card" data-client="' . esc_attr( $slug ) . '" data-config="' . esc_attr( $snippet ) . '">';
+		echo '<h4 class="aafm-quickstart-name">' . esc_html( $label ) . '</h4>';
+		echo '<p class="aafm-quickstart-where">' . esc_html( aafm_quickstart_note( $slug ) ) . '</p>';
+		aafm_render_snippet_block( $snippet );
+		echo '</div>';
+	}
+	echo '</div>';
+	echo '</div>';
+
+	echo '</div>'; // .aafm-connect-config
+
+	echo '</div>'; // .aafm-step-rail
+	echo '</div>'; // .aafm-step 2
+
+	// ---- Step 3: check the endpoint is reachable ----
+	echo '<div class="aafm-step aafm-conn-step">';
+	echo '<div class="aafm-step-head"><span class="aafm-sidx">3</span><div>';
+	echo '<h3>' . esc_html__( 'Check the endpoint is reachable', 'agent-abilities-for-mcp' ) . '</h3>';
+	echo '<p class="sub">' . esc_html__( 'This confirms the endpoint answers from your server. It checks as the current admin, so the tool count shown is your view - your agent connects as the low-privilege user above and will usually see fewer tools.', 'agent-abilities-for-mcp' ) . '</p>';
+	echo '</div></div>';
+
+	echo '<div class="aafm-step-rail">';
+	echo '<div class="aafm-connect-check">';
+	echo '<button type="button" class="aafm-btn aafm-btn-primary" id="aafm-test-connection">';
+	echo wp_kses( aafm_icon( 'check' ), aafm_svg_allowed_html() );
+	echo esc_html__( 'Check endpoint', 'agent-abilities-for-mcp' ) . '</button> <span class="aafm-test-status" aria-live="polite"></span>';
+	echo '</div>';
+
+	// Diagnostics rail: one row per check, status mapped to a coloured dot.
+	$dot_class = array(
+		'pass' => 'd-ok',
+		'warn' => 'd-warn',
+		'fail' => 'd-bad',
+	);
+	echo '<div class="aafm-diag">';
+	foreach ( aafm_diagnostic_checks() as $check ) {
+		$dot = $dot_class[ $check['status'] ] ?? 'd-warn';
+		printf(
+			'<div class="aafm-diag-row" data-check="%4$s"><span class="dot-lg %1$s"></span><div><div class="d-title">%2$s</div><div class="d-detail">%3$s</div></div></div>',
+			esc_attr( $dot ),
+			esc_html( $check['label'] ),
+			esc_html( $check['detail'] ),
+			esc_attr( $check['id'] )
+		);
+	}
+	echo '</div>';
+	echo '</div>'; // .aafm-step-rail
+	echo '</div>'; // .aafm-step 3
+
+	echo '</div></section>'; // .aafm-card-pad, .aafm-app-password-steps
+}

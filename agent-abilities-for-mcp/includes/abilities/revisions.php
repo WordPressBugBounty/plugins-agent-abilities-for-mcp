@@ -1,0 +1,589 @@
+<?php
+/**
+ * Governed revision abilities. Every revision operation passes the shared
+ * aafm_revision_parent_editable() gate: the parent post must be editable by the agent
+ * (Unit 1 per-object resolver). list-revisions stays metadata-only (the lean redactor
+ * never returns post_content). get-revision additionally returns the revision body and
+ * excerpt (Wave 1 enrichment) for a normal post, but withholds the body, excerpt, and
+ * diff when the parent post is password-protected - see aafm_get_revision_payload().
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter( 'aafm_abilities_registry', 'aafm_register_revisions_definitions' );
+
+/**
+ * Contribute the revision definitions to the registry.
+ *
+ * @param array<string,array<string,mixed>> $registry Registry.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_revisions_definitions( array $registry ): array {
+	$registry['aafm/list-revisions']   = array(
+		'label'        => __( 'List revisions', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'List the revisions of a post the agent can edit (metadata only, without the body content).', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_list_revisions',
+	);
+	$registry['aafm/get-revision']     = array(
+		'label'        => __( 'Get revision', 'agent-abilities-for-mcp' ),
+		'description'  => __( "Get a single revision of a post the agent can edit, including its body content (rendered or raw) and an optional diff against the post's current content.", 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_get_revision',
+	);
+	$registry['aafm/restore-revision'] = array(
+		'label'        => __( 'Restore revision', 'agent-abilities-for-mcp' ),
+		'description'  => sprintf(
+			/* translators: %s: page builder names, for example Elementor and Divi. */
+			__( 'Restore a post to one of its revisions. The current state is first saved as a fresh revision, so the restore is reversible. Refused when revisions are disabled for the post, since the current state could not be preserved and the restore would be irreversible. Also refused when the post is owned by a page builder (%s), since the restore would either have no visible effect or corrupt the builder\'s stored markup, except an Avada or WPBakery page while that builder is active: those keep the whole layout in the post content. An Avada or WPBakery restore, including one of a builder\'s own content types, is refused when saving the revision as this user would change it or the current page, for example by removing an element or an embed the user may not keep. So is a revision made with the other builder, for example a WPBakery revision of a page Avada owns now. After a WPBakery restore the page\'s generated CSS is rebuilt; if that fails the tool says the CSS may be stale.', 'agent-abilities-for-mcp' ),
+			aafm_page_builder_names()
+		),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_restore_revision',
+	);
+	$registry['aafm/delete-revision']  = array(
+		'label'        => __( 'Delete revision', 'agent-abilities-for-mcp' ),
+		'description'  => __( "Permanently delete a single revision from a post's history. This cannot be undone (unlike trashing a post, there is no Trash for revisions). The live post is not changed. Requires edit access to the parent post.", 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'destructive',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_delete_revision',
+	);
+	return $registry;
+}
+
+/**
+ * Shared gate: the parent post must be editable by the agent. The same check as the page builder
+ * tools (aafm_perm_avada_post_object()), so the revision tools reach a builder's own types that keep
+ * revisions, such as an Avada layout section for a user with manage_options.
+ *
+ * @param array<string,mixed> $input Ability input.
+ * @return bool
+ */
+function aafm_revision_parent_editable( array $input ): bool {
+	return aafm_perm_avada_post_object( $input );
+}
+
+/**
+ * Args for aafm/list-revisions.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_list_revisions(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/list-revisions' ),
+		'description'         => aafm_ability_description( 'aafm/list-revisions' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				array(
+					'post_id' => array(
+						'type'        => 'integer',
+						'minimum'     => 1,
+						'description' => __( 'ID of the post whose revision history to list. The caller must be able to edit this post.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_pagination_schema_props(
+					AAFM_LIST_PER_PAGE_MAX,
+					__( 'Number of revisions per page, clamped to the 1-50 range regardless of the value requested. Defaults to 10 when omitted.', 'agent-abilities-for-mcp' ),
+					__( '1-based page number for pagination. Defaults to 1.', 'agent-abilities-for-mcp' )
+				)
+			),
+			'required'             => array( 'post_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'revisions' => array( 'type' => 'array' ),
+				'total'     => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_list_revisions',
+		'permission_callback' => 'aafm_perm_list_revisions',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/list-revisions: the shared parent-editability gate.
+ *
+ * @param array<string,mixed> $input Ability input.
+ * @return bool
+ */
+function aafm_perm_list_revisions( array $input ): bool {
+	return aafm_revision_parent_editable( $input );
+}
+
+/**
+ * Execute aafm/list-revisions.
+ *
+ * Returns the post's revisions newest-first, paginated, each reduced to the
+ * metadata-only shape by aafm_redact_revision(). Autosaves are included (both are
+ * post_type=revision); that is intentional - the redactor exposes no body regardless.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_list_revisions( array $input ) {
+	$id = absint( $input['post_id'] );
+	if ( ! aafm_exact_object( 'post', $id ) instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+	$all    = wp_get_post_revisions( $id, array( 'fields' => 'ids' ) );
+	$paging = aafm_paginate_args( $input, AAFM_LIST_PER_PAGE_MAX );
+	$slice  = array_slice( array_values( $all ), ( $paging['page'] - 1 ) * $paging['per_page'], $paging['per_page'] );
+	$rows   = array();
+	/**
+	 * With 'fields' => 'ids' the revisions are ids; the stub types them as WP_Post[].
+	 *
+	 * @var int[] $slice
+	 */
+	foreach ( $slice as $rid ) {
+		// $rid is an int under 'fields' => 'ids', and each revision is loaded exactly by that id.
+		$rev = aafm_exact_object( 'post', $rid );
+		if ( $rev instanceof WP_Post && 'revision' === $rev->post_type ) {
+			$rows[] = aafm_redact_revision( $rev );
+		}
+	}
+	return array(
+		'revisions' => $rows,
+		'total'     => count( $all ),
+	);
+}
+
+/**
+ * Args for aafm/get-revision.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_revision(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-revision' ),
+		'description'         => aafm_ability_description( 'aafm/get-revision' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id'        => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the parent post. The caller must be able to edit it, and the revision must genuinely belong to it.', 'agent-abilities-for-mcp' ),
+				),
+				'revision_id'    => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the revision to read.', 'agent-abilities-for-mcp' ),
+				),
+				'content_format' => array(
+					'type'        => 'string',
+					'enum'        => array( 'rendered', 'raw' ),
+					'default'     => 'rendered',
+					'description' => __( 'Whether to return the body as rendered HTML (with the_content filters applied) or the raw stored markup. Defaults to rendered. On a password-protected post the body, excerpt, and diff are withheld either way.', 'agent-abilities-for-mcp' ),
+				),
+				'with_diff'      => array(
+					'type'        => 'boolean',
+					'default'     => false,
+					'description' => __( 'When true, also returns a text diff between this revision\'s content and the post\'s current content. Defaults to false. Withheld as null on a password-protected post.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id', 'revision_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'revision' => array( 'type' => 'object' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_revision',
+		'permission_callback' => 'aafm_perm_get_revision',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/get-revision: parent editable AND the revision genuinely
+ * belongs to that parent.
+ *
+ * @param array<string,mixed> $input Ability input.
+ * @return bool
+ */
+function aafm_perm_get_revision( array $input ): bool {
+	if ( ! aafm_revision_parent_editable( $input ) ) {
+		return false;
+	}
+	$revision_id = isset( $input['revision_id'] ) ? absint( $input['revision_id'] ) : 0;
+	$post_id     = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	return ! is_wp_error( aafm_validate_revision( $revision_id, $post_id ) );
+}
+
+/**
+ * Execute aafm/get-revision.
+ *
+ * Returns the single revision's metadata plus its body content, excerpt, and an optional
+ * diff, assembled by aafm_get_revision_payload(). The validator guarantees the revision
+ * belongs to the named parent before anything is returned.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_get_revision( array $input ) {
+	$revision = aafm_validate_revision( absint( $input['revision_id'] ?? 0 ), absint( $input['post_id'] ?? 0 ) );
+	if ( is_wp_error( $revision ) ) {
+		return aafm_generic_error();
+	}
+	return array( 'revision' => aafm_get_revision_payload( $revision, $input ) );
+}
+
+/**
+ * Args for aafm/restore-revision.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_restore_revision(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/restore-revision' ),
+		'description'         => aafm_ability_description( 'aafm/restore-revision' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id'     => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the post to restore. The caller must be able to edit it, and the revision must genuinely belong to it.', 'agent-abilities-for-mcp' ),
+				),
+				'revision_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the revision to restore the post to. The post\'s current state is saved as a fresh revision first, so this restore is itself reversible.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id', 'revision_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'restored'    => array( 'type' => 'boolean' ),
+				'post_id'     => array( 'type' => 'integer' ),
+				'revision_id' => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_restore_revision',
+		'permission_callback' => 'aafm_perm_restore_revision',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/restore-revision: parent editable AND the revision genuinely
+ * belongs to that parent.
+ *
+ * @param array<string,mixed> $input Ability input.
+ * @return bool
+ */
+function aafm_perm_restore_revision( array $input ): bool {
+	if ( ! aafm_revision_parent_editable( $input ) ) {
+		return false;
+	}
+	$revision_id = isset( $input['revision_id'] ) ? absint( $input['revision_id'] ) : 0;
+	$post_id     = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	return ! is_wp_error( aafm_validate_revision( $revision_id, $post_id ) );
+}
+
+/**
+ * Execute aafm/restore-revision.
+ *
+ * Restores the post to the named revision via wp_restore_post_revision(), which first
+ * snapshots the current state as a fresh revision - making the restore reversible. The
+ * validator guarantees the revision belongs to the named parent before any write.
+ *
+ * On failure, wp_restore_post_revision() may return null/false (nothing restored) OR the
+ * WP_Error bubbled up from the underlying wp_update_post() - its documented int|false|null
+ * return is incomplete. A WP_Error is a truthy object, so a falsy-only guard would treat a
+ * failed write as success; we reject WP_Error and any non-positive int and surface the
+ * generic error instead.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_restore_revision( array $input ) {
+	$post_id     = absint( $input['post_id'] ?? 0 );
+	$revision_id = absint( $input['revision_id'] ?? 0 );
+	if ( is_wp_error( aafm_validate_revision( $revision_id, $post_id ) ) ) {
+		return aafm_generic_error();
+	}
+	// Restoring a revision rewrites title/content/excerpt exactly like aafm/update-post, so it
+	// is a page-builder write too: a builder-owned post's rendered output is driven by the
+	// builder's own meta (_elementor_data, _et_pb_use_builder, _fl_builder_data), not post_content,
+	// so a "successful" restore here would silently do nothing visible while still reporting
+	// success.
+	//
+	// The exceptions (design 325 section 8): Avada and WPBakery keep the whole layout in post_content,
+	// which is what a revision holds, so their pages restore while that builder is active, through the
+	// builder checks below.
+	$owning_builder = aafm_post_has_foreign_builder_ownership( $post_id );
+	if ( false !== $owning_builder && ! ( in_array( $owning_builder, array( 'avada', 'wpbakery' ), true ) && aafm_integration_active( $owning_builder ) ) ) {
+		return aafm_page_builder_owned_error( $owning_builder );
+	}
+	// Reversibility guard: the fresh pre-restore snapshot is taken by core's
+	// wp_save_post_revision() hook, which bails when revisions are disabled for this post
+	// (WP_POST_REVISIONS false / the wp_revisions_to_keep filter returning 0) or the type
+	// dropped 'revisions' support. Restoring in that state would silently destroy the
+	// current state under a "reversible" promise, so refuse with an actionable error.
+	$parent = aafm_exact_object_chain( 'post', $post_id );
+	if ( ! $parent instanceof WP_Post
+		|| ! post_type_supports( $parent->post_type, 'revisions' )
+		|| ! wp_revisions_enabled( $parent ) ) {
+		return new WP_Error(
+			'aafm_restore_irreversible',
+			__( 'Revisions are disabled for this post, so the current state cannot be saved before restoring and the restore would be irreversible. Refusing. Enable revisions for this post type to restore.', 'agent-abilities-for-mcp' )
+		);
+	}
+	$revision = aafm_exact_object( 'post', $revision_id );
+	$builder  = $revision instanceof WP_Post ? aafm_restore_builder( $owning_builder, $parent, $revision ) : null;
+	if ( null !== $builder ) {
+		$checked = aafm_restore_builder_check( $builder, $parent, (string) $revision->post_content );
+		if ( is_wp_error( $checked ) ) {
+			return $checked;
+		}
+	}
+	$old = array();
+	foreach ( array( 'post_title', 'post_content', 'post_excerpt' ) as $field ) {
+		$old[ $field ] = (string) $parent->$field;
+	}
+	$restored = wp_restore_post_revision( $revision_id );
+	if ( is_wp_error( $restored ) || (int) $restored < 1 ) {
+		return aafm_generic_error();
+	}
+	// Read the post back: a wp_insert_post_data filter can rewrite the restored fields, and core
+	// still reports success.
+	foreach ( $old as $field => $before ) {
+		$wanted = $revision instanceof WP_Post ? (string) $revision->$field : '';
+		if ( ! aafm_post_field_confirm_logged( $post_id, $field, $wanted, $before ) ) {
+			return new WP_Error(
+				'aafm_restore_unconfirmed',
+				__( 'The restore ran, but the post does not match the revision afterwards, so it could not be confirmed. Read the post to check its current state.', 'agent-abilities-for-mcp' )
+			);
+		}
+	}
+	if ( 'wpbakery' === $builder && ! aafm_wpbakery_rebuild_css( $post_id ) ) {
+		return new WP_Error(
+			'aafm_wpbakery_css_stale',
+			__( 'The revision was restored, but WPBakery could not rebuild the page\'s generated CSS, so the page may look out of date until it is saved again in WPBakery.', 'agent-abilities-for-mcp' )
+		);
+	}
+	return array(
+		'restored'    => true,
+		'post_id'     => $post_id,
+		'revision_id' => $revision_id,
+	);
+}
+
+/**
+ * Which builder a restore belongs to, if any (Ruling B8): the guard names it; or the guard finds no
+ * builder and the post is one of the builder's own types, or the revision's or the current content
+ * matches the builder's pattern. Only while that builder's integration is active.
+ *
+ * @param string|false $owning   The guard's answer for the post.
+ * @param WP_Post      $post     Post being restored.
+ * @param WP_Post      $revision Revision being restored.
+ * @return string|null avada, wpbakery or null.
+ */
+function aafm_restore_builder( $owning, WP_Post $post, WP_Post $revision ): ?string {
+	foreach ( aafm_restore_builder_patterns() as $builder => $pattern ) {
+		if ( ! aafm_integration_active( $builder ) ) {
+			continue;
+		}
+		if ( $owning === $builder ) {
+			return $builder;
+		}
+		if ( false === $owning && (
+			in_array( $post->post_type, aafm_builder_own_post_types( $builder ), true )
+			|| 1 === preg_match( $pattern, (string) $revision->post_content )
+			|| 1 === preg_match( $pattern, (string) $post->post_content )
+		) ) {
+			return $builder;
+		}
+	}
+	return null;
+}
+
+/**
+ * The content pattern of each builder a restore can belong to: a Fusion container for Avada, the
+ * guard's root row or section for WPBakery.
+ *
+ * @return array<string,string> Builder => regular expression.
+ */
+function aafm_restore_builder_patterns(): array {
+	return array(
+		'avada'    => '/\[fusion_builder_container\b/',
+		'wpbakery' => aafm_page_builder_content_pattern(),
+	);
+}
+
+/**
+ * The builder checks a restore runs before wp_restore_post_revision() (design 325 section 8): the
+ * revision must not be the other builder's, the revision's content must parse, saving the current page as this user must leave it as it is, and the
+ * revision's content replayed through the same save must keep its outline and equal itself byte for
+ * byte, so an embed the user may not keep is not stripped on the way back.
+ *
+ * @param string  $builder avada or wpbakery.
+ * @param WP_Post $post  Post being restored.
+ * @param string  $target  The revision's content.
+ * @return true|WP_Error
+ */
+function aafm_restore_builder_check( string $builder, WP_Post $post, string $target ) {
+	// A revision made by the other builder (a page rebuilt from WPBakery in Avada, or back) would be
+	// checked with the wrong tag list, pass on two empty outlines, and leave content the page's
+	// owner cannot read.
+	foreach ( aafm_restore_builder_patterns() as $other => $pattern ) {
+		if ( $other !== $builder && 1 === preg_match( $pattern, $target ) ) {
+			return new WP_Error(
+				'aafm_restore_other_builder',
+				__( 'This revision was made with a different page builder than the one that owns the page now, so restoring it would leave content the current builder cannot edit. Nothing was changed.', 'agent-abilities-for-mcp' ),
+				array( 'status' => 409 )
+			);
+		}
+	}
+	$current = (string) $post->post_content;
+	$tags    = 'wpbakery' === $builder ? aafm_wpbakery_shortcode_tags( $current, $target ) : aafm_fusion_shortcode_tags();
+	$walk    = null === $tags ? null : aafm_builder_walk( $target, $tags );
+	if ( null === $tags || null === $walk ) {
+		return aafm_builder_error( 'aafm_builder_unparseable' );
+	}
+	return aafm_builder_replay_check( $builder, (int) $post->ID, $current, $target, $tags, $walk, true );
+}
+
+/**
+ * Args for aafm/delete-revision.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_delete_revision(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/delete-revision' ),
+		'description'         => aafm_ability_description( 'aafm/delete-revision' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'post_id'     => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the parent post. The caller must be able to edit it, and the revision must genuinely belong to it.', 'agent-abilities-for-mcp' ),
+				),
+				'revision_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'ID of the revision to permanently delete from the post\'s history. This cannot be undone; the live post itself is never changed.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'post_id', 'revision_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'deleted'     => array( 'type' => 'boolean' ),
+				'post_id'     => array( 'type' => 'integer' ),
+				'revision_id' => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_delete_revision',
+		'permission_callback' => 'aafm_perm_delete_revision',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => true,
+			),
+		),
+	);
+}
+
+/**
+ * Permission for aafm/delete-revision: the parent must be EDITABLE (same base gate as restore)
+ * AND the caller must hold DELETE on the parent - WordPress core's own REST revisions
+ * controller requires delete_post to remove a revision, not merely edit_post, because deleting
+ * revision history is irreversible in a way restoring one is not. An agent that can edit a post
+ * but cannot delete it must not be able to wipe that post's revision history.
+ *
+ * The revision must also genuinely belong to the named post_id.
+ *
+ * @param array<string,mixed> $input Ability input.
+ * @return bool
+ */
+function aafm_perm_delete_revision( array $input ): bool {
+	if ( ! aafm_revision_parent_editable( $input ) ) {
+		return false;
+	}
+	$post_id = isset( $input['post_id'] ) ? absint( $input['post_id'] ) : 0;
+	$post    = $post_id ? aafm_exact_object( 'post', $post_id ) : null;
+	if ( ! $post instanceof WP_Post || ! aafm_can_delete_post_object( $post ) ) {
+		return false;
+	}
+	$revision_id = isset( $input['revision_id'] ) ? absint( $input['revision_id'] ) : 0;
+	return ! is_wp_error( aafm_validate_revision( $revision_id, $post_id ) );
+}
+
+/**
+ * Execute aafm/delete-revision.
+ *
+ * Permanently removes one revision via wp_delete_post_revision(). The validator
+ * guarantees the revision belongs to the named parent before any delete. The live post
+ * is never touched - this prunes change history only.
+ *
+ * wp_delete_post_revision() returns WP_Post|false|null|0|WP_Error: false/null/0 when
+ * nothing was deleted, the deleted WP_Post on success, and a WP_Error bubbled up from
+ * wp_delete_post(). A WP_Error is a truthy object, so - mirroring aafm_exec_restore_revision
+ * - we reject WP_Error and any falsy return and surface the generic error instead.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_delete_revision( array $input ) {
+	$post_id     = absint( $input['post_id'] ?? 0 );
+	$revision_id = absint( $input['revision_id'] ?? 0 );
+	if ( is_wp_error( aafm_validate_revision( $revision_id, $post_id ) ) ) {
+		return aafm_generic_error();
+	}
+	$deleted = wp_delete_post_revision( $revision_id );
+	if ( is_wp_error( $deleted ) || ! $deleted ) {
+		return aafm_generic_error();
+	}
+	return array(
+		'deleted'     => true,
+		'post_id'     => $post_id,
+		'revision_id' => $revision_id,
+	);
+}

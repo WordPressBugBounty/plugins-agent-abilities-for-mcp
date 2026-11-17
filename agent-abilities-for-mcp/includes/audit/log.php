@@ -1,0 +1,1238 @@
+<?php
+/**
+ * Activity log: table install, write, query, and clear.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+if ( ! defined( 'AAFM_ACTIVITY_LOG_SCHEMA_VERSION' ) ) {
+	// v2 adds composite (status, created_at) and (ability, created_at) indexes so the filtered
+	// admin query (WHERE status/ability = ? ORDER BY created_at DESC) is index-backed instead of
+	// filesorting. v3 adds the client_id column (M16) so an OAuth-attributed call can be traced
+	// back to the client that made it; NOT NULL DEFAULT '' so every existing row (and every
+	// caller that never supplies one) is unaffected. v4 adds the nullable result_count column
+	// (L5) so a list/read call's magnitude is observable; NULL by default so an unmeasured or
+	// write call is distinguishable from a genuine zero-item result, and every existing row is
+	// unaffected. v5 adds event_type and detail so the log can hold events that are not ability
+	// calls (an ability being toggled, a security-relevant setting change, the log-cleared
+	// marker) and so a row can say what it touched, not only which ability ran. event_type is
+	// NOT NULL DEFAULT 'ability_call', so the ALTER writes the correct meaning into every
+	// existing row and no backfill is needed; detail is nullable so "no detail declared" stays
+	// distinguishable from "declared and empty". The event_created index mirrors v2's composite
+	// indexes so an event-filtered query is index-backed. Bumping this makes
+	// aafm_maybe_upgrade_activity_log() re-run dbDelta so existing installs pick the change up
+	// without a reactivation. Mirrors AAFM_OAUTH_SCHEMA_VERSION in includes/oauth/schema.php.
+	// v6 adds the nullable duration_ms column: milliseconds spent inside an ability's execute
+	// callback, NULL for a call that never executed or was never measured, so NULL is never a
+	// fabricated zero. Nullable with no default, so the ALTER is metadata-only on current engines
+	// and every existing row is unaffected.
+	// v7 adds the aafm_changes table next to the log (the undo history, includes/undo/store.php).
+	// It rides this installer, verify and stamp so a failed change table is retried like a failed
+	// log table, with nothing new to wire.
+	define( 'AAFM_ACTIVITY_LOG_SCHEMA_VERSION', '7' );
+}
+
+/**
+ * The single source of truth for the activity-log status values.
+ *
+ * 'started' is written only as the initial pending state of an in-flight call; the resolve path
+ * (aafm_update_activity_status()) narrows a row to the terminal set. The $include_started flag
+ * lets the update path reuse this list minus 'started'.
+ *
+ * @param bool $include_started Whether to include the pending 'started' status.
+ * @return string[] The allowed status values.
+ */
+function aafm_activity_statuses( bool $include_started = true ): array {
+	$terminal = array( 'success', 'error', 'denied' );
+	return $include_started ? array_merge( array( 'started' ), $terminal ) : $terminal;
+}
+
+/**
+ * The single source of truth for the activity-log event_type values.
+ *
+ * 'ability_call' is the column's SQL default, so every row written before schema v5 and every
+ * caller that never supplies one means exactly this. The other six are events that are not
+ * ability calls: the two ability-toggle events, a blocked attempt to enable a locked high-risk
+ * ability, a security-relevant setting change, the tamper-evident log-cleared marker, and a
+ * permission callback that crashed during a discovery check (aafm_deny_crashed_permission_check()
+ * in includes/server.php - those rows carry a real ability name, so only the type can say they
+ * are not agent calls), and an ability the registration-time preflight left OUT of the server
+ * because its schema breached the measurement bounds or the enabled set exceeded the tool cap
+ * (aafm_reconcile_omitted_abilities() in includes/server.php - also a real ability name, again
+ * distinguishable only by type). The ninth, write_outcome, is the write-and-confirm contract's own
+ * row (includes/write-contract.php): one per write or delete outcome, carrying identifiers only,
+ * never the ability that triggered it. The tenth, review_action, is an owner's Publish or Discard
+ * from the Needs review inbox (includes/admin/review-inbox.php). The eleventh, undo_action, is an owner's
+ * Revert, Revert all or Clear history from the Changes tab (includes/admin/changes.php). Mirrors aafm_activity_statuses().
+ *
+ * @return string[] The allowed event_type values.
+ */
+function aafm_activity_event_types(): array {
+	return array( 'ability_call', 'ability_enabled', 'ability_disabled', 'ability_enable_blocked', 'setting_changed', 'log_cleared', 'permission_check_crashed', 'ability_omitted', 'write_outcome', 'review_action', 'undo_action' );
+}
+
+/**
+ * The activity log table name for the current blog.
+ *
+ * @return string
+ */
+function aafm_activity_log_table(): string {
+	global $wpdb;
+	return $wpdb->prefix . 'aafm_activity_log';
+}
+
+/**
+ * The change history (undo) table name for the current blog.
+ *
+ * @return string
+ */
+function aafm_changes_table(): string {
+	global $wpdb;
+	return $wpdb->prefix . 'aafm_changes';
+}
+
+/**
+ * Drop the change history table for the current blog. Runs on every uninstall, whatever the
+ * delete-data flag says: before-values are content, and they are not kept on a plugin that is gone.
+ *
+ * @return void
+ */
+function aafm_drop_changes_table(): void {
+	global $wpdb;
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange
+	$wpdb->query( $wpdb->prepare( 'DROP TABLE IF EXISTS %i', aafm_changes_table() ) );
+}
+
+/**
+ * The plugin's own table names for one site, built from that site's prefix.
+ *
+ * @param int $blog_id Site id.
+ * @return list<string>
+ */
+function aafm_site_table_names( int $blog_id ): array {
+	global $wpdb;
+	$prefix = $wpdb->get_blog_prefix( $blog_id );
+	$tables = array( $prefix . 'aafm_activity_log', $prefix . 'aafm_changes' );
+	foreach ( aafm_oauth_table_suffixes() as $suffix ) {
+		$tables[] = $prefix . $suffix;
+	}
+	return $tables;
+}
+
+/**
+ * Add this plugin's tables to the list core drops when a site is deleted.
+ *
+ * Hooked to wpmu_drop_tables, so it runs only where the plugin is loaded: network active, active
+ * on the site running the delete, or a subsite deleting itself. A site that had the plugin active
+ * only on itself and is deleted from a main site without it keeps its tables; core has no other hook.
+ *
+ * @param array<int,string> $tables  Tables core is about to drop.
+ * @param int               $blog_id The site being deleted.
+ * @return array<int,string>
+ */
+function aafm_filter_wpmu_drop_tables( array $tables, int $blog_id ): array {
+	return array_values( array_unique( array_merge( $tables, aafm_site_table_names( $blog_id ) ) ) );
+}
+
+/**
+ * Create (or upgrade) the activity log table, then record the schema version.
+ *
+ * Idempotent: dbDelta() only applies the diff. Mirrors aafm_install_oauth_tables().
+ *
+ * @return bool Whether the schema verified and its version was stamped.
+ */
+function aafm_install_activity_log(): bool {
+	global $wpdb;
+	require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+
+	$table           = aafm_activity_log_table();
+	$charset_collate = $wpdb->get_charset_collate();
+
+	$sql = "CREATE TABLE {$table} (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+		ability VARCHAR(191) NOT NULL DEFAULT '',
+		principal_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		principal_login VARCHAR(191) NOT NULL DEFAULT '',
+		status VARCHAR(20) NOT NULL DEFAULT '',
+		arg_keys TEXT NULL,
+		source_ip VARCHAR(45) NOT NULL DEFAULT '',
+		client_id VARCHAR(191) NOT NULL DEFAULT '',
+		result_count BIGINT UNSIGNED NULL,
+		event_type VARCHAR(32) NOT NULL DEFAULT 'ability_call',
+		detail TEXT NULL,
+		duration_ms INT UNSIGNED NULL,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY  (id),
+		KEY created_at (created_at),
+		KEY status_created (status, created_at),
+		KEY ability_created (ability, created_at),
+		KEY event_created (event_type, created_at)
+	) {$charset_collate};";
+
+	dbDelta( $sql );
+
+	// The change history table, same installer. before_values is the only large column; the
+	// snapshot_bytes and created_at indexes keep the caps pass cheap (a SUM and a range scan).
+	$changes = aafm_changes_table();
+	$sql     = "CREATE TABLE {$changes} (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+		log_row_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		group_id CHAR(32) NOT NULL DEFAULT '',
+		ability VARCHAR(191) NOT NULL DEFAULT '',
+		source VARCHAR(10) NOT NULL DEFAULT 'agent',
+		principal_user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		client_id VARCHAR(191) NOT NULL DEFAULT '',
+		object_type VARCHAR(10) NOT NULL DEFAULT '',
+		object_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		undo_op VARCHAR(10) NOT NULL DEFAULT '',
+		status VARCHAR(16) NOT NULL DEFAULT 'pending',
+		reason VARCHAR(40) NOT NULL DEFAULT '',
+		fields TEXT NULL,
+		perm_input TEXT NULL,
+		before_values LONGTEXT NULL,
+		before_sha256 CHAR(64) NOT NULL DEFAULT '',
+		after_hashes TEXT NULL,
+		reverts_change_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		reverted_by_change_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+		snapshot_bytes INT UNSIGNED NOT NULL DEFAULT 0,
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		PRIMARY KEY  (id),
+		KEY object_lookup (object_type, object_id, id),
+		KEY status_created (status, created_at),
+		KEY principal_lookup (principal_user_id, id),
+		KEY connection_undo (principal_user_id, client_id, reverts_change_id, created_at),
+		KEY created_at (created_at),
+		KEY size_scan (snapshot_bytes),
+		KEY log_row (log_row_id),
+		KEY group_lookup (group_id)
+	) {$charset_collate};";
+
+	dbDelta( $sql );
+
+	return aafm_activity_log_finalize_schema();
+}
+
+/**
+ * Record the activity-log schema version, but only once the table is verified to be really there.
+ *
+ * Same failure the OAuth installer guards against (aafm_oauth_finalize_schema()): a dbDelta() run
+ * whose ALTER is refused - a transient loss of the ALTER privilege, a full disk, one failed DDL -
+ * returns as if it worked, leaving the table missing a column the write path references. Stamping
+ * the version unconditionally then makes aafm_maybe_upgrade_activity_log() early-return forever, so
+ * every audit insert quietly fails against the old columns while the self-heal never retries and
+ * the security trail is lost. So verify first: advance the stored version only when the table and
+ * its latest columns/index are present. On failure leave the prior version so the next admin or
+ * REST request retries, and raise a bounded admin notice.
+ *
+ * @return bool Whether the schema verified and the version stamp was certified.
+ */
+function aafm_activity_log_finalize_schema(): bool {
+	if ( aafm_activity_log_schema_verify() ) {
+		delete_transient( 'aafm_activity_log_schema_error' );
+		// Verified, not a bare update_option(): aafm_maybe_upgrade_activity_log()
+		// below trusts this stamp to decide whether the installer needs to run again, so a write
+		// that a persistent cache silently no-ops must not be allowed to look like it landed.
+		if ( ! aafm_update_option_verified( 'aafm_activity_log_schema_version', AAFM_ACTIVITY_LOG_SCHEMA_VERSION ) ) {
+			// This return value used to be discarded. The table itself is
+			// genuinely fine, but with the version left un-stamped, aafm_maybe_upgrade_activity_log()
+			// reruns dbDelta() every request instead of settling - and the error transient above
+			// was already cleared on the strength of the schema check alone, hiding the persist
+			// failure from the admin notice. Re-set the transient and log the failure so it is
+			// visible instead of silent.
+			set_transient( 'aafm_activity_log_schema_error', time(), DAY_IN_SECONDS );
+			aafm_log_ability_persist_failure( 'aafm_activity_log_schema_version', __( 'The activity-log schema version', 'agent-abilities-for-mcp' ) );
+			return false;
+		}
+		return true;
+	}
+
+	// Bounded: a day-long flag the next successful verify clears, so the notice shows only while the
+	// schema is genuinely behind and disappears the moment the self-heal lands.
+	set_transient( 'aafm_activity_log_schema_error', time(), DAY_IN_SECONDS );
+	return false;
+}
+
+/**
+ * Whether the activity-log schema is actually present: the table plus its latest columns and index.
+ *
+ * Verifies the table, the v5 event_type and detail columns, the v6 duration_ms column, and the
+ * event_created index - the most recent migrations, so their absence is the signal a dbDelta run did not fully land. Gates the
+ * version stamp in aafm_activity_log_finalize_schema().
+ *
+ * @return bool
+ */
+function aafm_activity_log_schema_verify(): bool {
+	$table = aafm_activity_log_table();
+
+	if ( ! aafm_activity_log_table_present( $table ) ) {
+		return false;
+	}
+
+	if ( ! aafm_activity_log_table_present( aafm_changes_table() ) || ! aafm_activity_log_has_column( aafm_changes_table(), 'before_sha256' ) ) {
+		return false;
+	}
+
+	return aafm_activity_log_has_column( $table, 'event_type' )
+		&& aafm_activity_log_has_column( $table, 'detail' )
+		&& aafm_activity_log_has_column( $table, 'duration_ms' )
+		&& aafm_activity_log_has_index( $table, 'event_created' );
+}
+
+/**
+ * Whether the activity-log table exists for the current blog.
+ *
+ * The PHPUnit harness rewrites plugin CREATE TABLE to its TEMPORARY form, which SHOW TABLES does
+ * not list, so existence is probed with a trivial select. The %i placeholder quotes the identifier
+ * (an internal constant).
+ *
+ * This used to read '' === $wpdb->last_error as its success signal.
+ * $wpdb->query() (wp-includes/class-wpdb.php) can return false, leaving last_error untouched at
+ * '', on paths that never actually ran the query - $wpdb->ready is false, the `query` filter
+ * returns an empty query, a failed reconnection after the server has gone away - the exact
+ * last_error pitfall aafm_wpdb_scalar()'s own docblock documents for the option-cache
+ * reads. Under that failure shape this returned true for an ABSENT table, and finalization could
+ * stamp the current schema version despite the table never having been verified. Delegating to
+ * aafm_wpdb_scalar(), which checks $wpdb->query()'s own return value instead, closes the same gap
+ * here.
+ *
+ * @param string $table Fully-prefixed table name.
+ * @return bool
+ */
+function aafm_activity_log_table_present( string $table ): bool {
+	global $wpdb;
+	$suppressed = $wpdb->suppress_errors( true );
+	$result     = aafm_wpdb_scalar( $wpdb->prepare( 'SELECT 1 FROM %i LIMIT 0', $table ) );
+	$wpdb->suppress_errors( $suppressed );
+	return $result['ok'];
+}
+
+/**
+ * Whether a named column exists on the activity-log table. Works on the harness's TEMPORARY table.
+ *
+ * A bare $wpdb->get_var() returns the PREVIOUS query's row when the current
+ * query itself fails, so a failed SHOW COLUMNS could inherit an unrelated non-empty value left
+ * over from an earlier, successful check and report a missing column as present - letting schema
+ * finalization stamp the current version over an incomplete upgrade. Routed through
+ * aafm_wpdb_scalar() so a failed read reports absent, the same fail-closed direction this
+ * function already took for a genuinely missing column.
+ *
+ * @param string $table  Fully-prefixed table name (an internal constant).
+ * @param string $column Column name to look for (no wildcards; matched exactly by SHOW COLUMNS).
+ * @return bool
+ */
+function aafm_activity_log_has_column( string $table, string $column ): bool {
+	global $wpdb;
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$view = aafm_wpdb_scalar( $wpdb->prepare( 'SHOW COLUMNS FROM %i LIKE %s', $table, $column ) );
+	return $view['ok'] && null !== $view['value'] && '' !== $view['value'];
+}
+
+/**
+ * Whether a named index exists on the activity-log table. Works on the harness's TEMPORARY table.
+ *
+ * Same stale-read class as aafm_activity_log_has_column() above: a bare $wpdb->get_results()
+ * hands back the PREVIOUS query's rows when this one fails, so a failed SHOW INDEX could inherit
+ * an unrelated result set and report a missing index as present. Routed through
+ * aafm_wpdb_results() so a failed read reports absent, the same fail-closed direction the column
+ * check already takes.
+ *
+ * @param string $table    Fully-prefixed table name (an internal constant).
+ * @param string $key_name Index name to look for.
+ * @return bool
+ */
+function aafm_activity_log_has_index( string $table, string $key_name ): bool {
+	global $wpdb;
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$view = aafm_wpdb_results( $wpdb->prepare( 'SHOW INDEX FROM %i', $table ) );
+	if ( ! $view['ok'] ) {
+		return false;
+	}
+	foreach ( (array) $view['value'] as $row ) {
+		// Key_name is MySQL's own SHOW INDEX column name, not a plugin property.
+		// phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+		if ( is_array( $row ) && isset( $row['Key_name'] ) && $key_name === $row['Key_name'] ) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Admin notice: the activity-log schema did not finish installing or upgrading.
+ *
+ * Shown only while aafm_activity_log_finalize_schema()'s bounded transient is set (it clears the
+ * moment a verify passes), and only to users who can act on it.
+ *
+ * @return void
+ */
+function aafm_activity_log_schema_admin_notice(): void {
+	if ( ! current_user_can( 'activate_plugins' ) ) {
+		return;
+	}
+	if ( false === get_transient( 'aafm_activity_log_schema_error' ) ) {
+		return;
+	}
+	echo '<div class="notice notice-error"><p>';
+	echo esc_html__( 'Agent Abilities for MCP could not finish updating its tables. New activity may not be recorded until the update completes; the plugin tries again on its own, at most once an hour.', 'agent-abilities-for-mcp' );
+	echo '</p></div>';
+}
+add_action( 'admin_notices', 'aafm_activity_log_schema_admin_notice' );
+
+/**
+ * Run the activity-log installer when the stored schema version is behind the current one.
+ *
+ * Cheap early return when the option already matches, so this is safe to hook on every admin
+ * request. dbDelta() is safe to re-run. Mirrors aafm_maybe_upgrade_oauth_tables().
+ *
+ * Reads the database row directly rather than get_option()'s cache-trusting view:
+ * a stale cached current version over an old/absent database row would skip a genuinely
+ * needed repair, and this function's own docblock identifies missing audit rows as the failure
+ * this guard exists to catch.
+ *
+ * @return void
+ */
+function aafm_maybe_upgrade_activity_log(): void {
+	if ( AAFM_ACTIVITY_LOG_SCHEMA_VERSION === (string) aafm_read_option_views( 'aafm_activity_log_schema_version' )['db_value'] ) {
+		return;
+	}
+
+	// One request upgrades at a time, and a failed upgrade waits an hour before the next try, so a
+	// refused ALTER does not rerun dbDelta() on every admin and REST request. The lock is held for a
+	// minute while the installer runs, released on success, and kept for an hour on failure.
+	// ponytail: a transient is get-then-set, not atomic, so two requests landing in the same instant
+	// can both pass. dbDelta() is idempotent, so that costs a repeat, not damage. Upgrade path is an
+	// add_option() row with its own expiry if it ever shows up. An unreadable lock counts as held.
+	$held = aafm_transient_count( 'aafm_activity_log_upgrade_lock' );
+	if ( null === $held || $held > 0 ) {
+		return;
+	}
+	set_transient( 'aafm_activity_log_upgrade_lock', 1, MINUTE_IN_SECONDS );
+	if ( aafm_install_activity_log() ) {
+		delete_transient( 'aafm_activity_log_upgrade_lock' );
+		return;
+	}
+	set_transient( 'aafm_activity_log_upgrade_lock', 1, HOUR_IN_SECONDS );
+}
+
+// Keep the activity-log schema current on real upgrades. The guard above early-returns once
+// the version matches (one autoloaded option compare), so both hooks are cheap. Registered
+// here at include time (this file is required at plugin load) to mirror the OAuth upgrade
+// wiring without touching the main plugin bootstrap.
+//
+// rest_api_init as well as admin_init, deliberately: a headless site that auto-updates over
+// cron and takes MCP traffic over REST may never see an admin request, and without the REST
+// hook every audit insert after a schema bump silently fails (a missing column rejects the
+// row) while the calls themselves keep succeeding. The audit log is a security control, so it
+// heals on the path that actually carries the traffic it records.
+add_action( 'admin_init', 'aafm_maybe_upgrade_activity_log' );
+add_action( 'rest_api_init', 'aafm_maybe_upgrade_activity_log' );
+
+/**
+ * Resolve the request source IP: REMOTE_ADDR, unless the owner opted into a trusted proxy and the
+ * request came from one; never a header from any other source.
+ *
+ * @return string
+ */
+function aafm_source_ip(): string {
+	$ip = isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '';
+	$ip = trim( $ip );
+	if ( '' === $ip || ! filter_var( $ip, FILTER_VALIDATE_IP ) ) {
+		return '';
+	}
+	// This file loads at plugin-include time; safety.php, which holds the proxy code, loads on
+	// plugins_loaded. An early caller (activation, a log row written before bootstrap) gets the
+	// connection address, exactly as before.
+	return function_exists( 'aafm_trusted_proxy_visitor' ) ? aafm_trusted_proxy_visitor( $ip ) : $ip;
+}
+
+/**
+ * Cap on how many failed Application Password attempts against the MCP endpoint one source IP
+ * can add to the activity log inside AAFM_FAILED_AUTH_LOG_WINDOW. Mirrors the reasoning behind
+ * aafm_oauth_log_event()'s 'bearer' skip (includes/oauth/audit.php): a real signal still gets a
+ * real audit row, but the number of rows one attacker can generate stays bounded, so hammering
+ * the endpoint with bad credentials cannot grow the log without limit.
+ */
+if ( ! defined( 'AAFM_FAILED_AUTH_LOG_MAX_PER_WINDOW' ) ) {
+	define( 'AAFM_FAILED_AUTH_LOG_MAX_PER_WINDOW', 5 );
+}
+
+/**
+ * The rolling window, in seconds, the cap above applies to.
+ */
+if ( ! defined( 'AAFM_FAILED_AUTH_LOG_WINDOW' ) ) {
+	define( 'AAFM_FAILED_AUTH_LOG_WINDOW', 10 * MINUTE_IN_SECONDS );
+}
+
+/**
+ * Whether one more bounded denial row fits inside the per-IP, per-window cap.
+ *
+ * Shared by the failed-Application-Password logger below and the IP-block denial row in
+ * aafm_transport_permission_callback() (includes/server.php), so every transport-level denial
+ * class is bounded the same way: AAFM_FAILED_AUTH_LOG_MAX_PER_WINDOW rows per source IP per
+ * AAFM_FAILED_AUTH_LOG_WINDOW. Consuming a slot and reporting true are one operation - a true
+ * return has already counted the row the caller is about to write.
+ *
+ * The counter is a plain get/set transient, not an atomic increment. Two concurrent requests can
+ * both read the same count and one increment can be lost, so the cap is approximate under
+ * concurrency - it leaks by at most the number of simultaneous requests, and only while the
+ * window is warm. That is a deliberate trade kept from the original failed-auth cap: the row it
+ * bounds is advisory observability, and an atomic counter would need its own table or a
+ * cache-specific add() dance for a bound nobody reads precisely.
+ *
+ * @param string $bucket Short key namespace so each denial class gets its own counter:
+ *                       'fa' (failed Application Password auth), 'ipb' (IP-blocked transport),
+ *                       'br' (an invalid OAuth bearer that still matched a real stored token),
+ *                       'tx' (an MCP-route JSON-RPC error the transport-outcome logger records),
+ *                       'ssl' (an aafm_oat_ bearer presented over http where HTTPS is required),
+ *                       'rv' (a refused Needs review Publish or Discard click),
+ *                       'dsg' (a refused call naming this plugin's tool on the adapter default server),
+ *                       'ud' (a refused Changes tab Revert or Clear history click),
+ *                       or 'ntf' (a notification email that could not be sent).
+ * @return bool True when the caller may write its row (the slot is consumed), false when this
+ *              IP has used up its cap for the current window.
+ */
+function aafm_denial_log_within_cap( string $bucket ): bool {
+	$ip    = aafm_source_ip();
+	$key   = 'aafm_' . $bucket . '_' . ( '' !== $ip ? md5( $ip ) : 'unknown' );
+	$count = (int) get_transient( $key );
+	if ( $count >= AAFM_FAILED_AUTH_LOG_MAX_PER_WINDOW ) {
+		return false; // Bounded: this IP already used its cap for the current window.
+	}
+	set_transient( $key, $count + 1, AAFM_FAILED_AUTH_LOG_WINDOW );
+	return true;
+}
+
+/**
+ * Write one "(transport)" denied row for the current user, inside the per-IP cap of its bucket, at most
+ * once per bucket per request object. The refusal itself is the caller's and happens on every call.
+ *
+ * @param string      $bucket    Cap bucket, as aafm_denial_log_within_cap() takes it: 'ipb', 'pau' or 'org' here.
+ * @param string      $reason    Refusal reason for the detail column, or '' for a row without detail.
+ * @param string      $client_id OAuth client id the call carried, or '' when it was not a bearer call.
+ * @param mixed       $request   The REST request being refused, or null.
+ * @param string|null $base      Detail text before the reason clause, such as the refused origin's host.
+ * @return void
+ */
+function aafm_log_transport_denial( string $bucket, string $reason = '', string $client_id = '', $request = null, ?string $base = null ): void {
+	// Core's Allow header filter calls each handler's permission callback again once per HTTP method, with the
+	// SAME request object, so one refused request reaches here several times. One row per bucket per request
+	// object, or it spends the cap; a separate dispatch in the same process is a different object. The object
+	// itself is kept (not its id, which PHP reuses once it is freed). No request object: nothing to dedupe on.
+	global $aafm_policy_state;
+	if ( is_object( $request ) ) {
+		if ( ( $aafm_policy_state['denied'][ $bucket ] ?? null ) === $request ) {
+			return;
+		}
+		$aafm_policy_state['denied'][ $bucket ] = $request;
+	}
+	if ( ! aafm_denial_log_within_cap( $bucket ) ) {
+		return;
+	}
+	$user   = wp_get_current_user();
+	$record = array(
+		'ability'           => '(transport)',
+		'status'            => 'denied',
+		'principal_user_id' => (int) $user->ID,
+		'principal_login'   => (string) $user->user_login,
+	);
+	if ( '' !== $client_id ) {
+		$record['client_id'] = $client_id;
+	}
+	if ( '' !== $reason ) {
+		$record['detail'] = aafm_compose_denied_detail( $base, $reason );
+	}
+	aafm_log_activity( $record );
+}
+
+/**
+ * Log a failed Application Password authentication attempt against the MCP endpoint.
+ *
+ * Hooked on WordPress core's `application_password_failed_authentication` action. Core fires it
+ * from `wp_authenticate_application_password()` on the `determine_current_user` filter for an
+ * unknown username, application passwords being disabled, or a wrong password - and passes only a
+ * WP_Error, never the presented username or password, so there is nothing credential-shaped to log
+ * even by accident. Before this hook existed, a wrong Application Password against the endpoint
+ * produced no audit row at all: aafm_transport_permission_callback() returns its 401 before
+ * aafm_log_activity() is ever reached, so credential stuffing against the endpoint was invisible in
+ * the plugin's own log.
+ *
+ * Two guards keep this narrow, matching how the OAuth bearer resolver treats the same class of
+ * signal:
+ * - Scoped to the MCP route only, via aafm_oauth_request_targets_mcp_route() - the same
+ *   determine_current_user-safe route check the OAuth bearer resolver uses (validator.php).
+ *   Core fires this action for ANY REST or XML-RPC request presenting Basic Auth, so without this
+ *   guard a failed Application Password attempt against an unrelated route - core's own REST API,
+ *   another plugin's - would land in this plugin's audit log too.
+ * - Bounded per source IP (AAFM_FAILED_AUTH_LOG_MAX_PER_WINDOW), the same anti-flood reasoning
+ *   aafm_oauth_log_event() applies to a fabricated OAuth bearer, via a cap rather than an outright
+ *   skip: unlike a fabricated bearer, this event is already proven real, because WordPress core
+ *   itself just checked a presented credential and rejected it.
+ *
+ * The function_exists() guards mirror aafm_oauth_resolve_current_user()'s own, and for the same
+ * reason: this action can fire during determine_current_user before this plugin's own
+ * plugins_loaded callback has required every file it depends on, if another active plugin
+ * resolves the current user earlier in the load order. aafm_oauth_request_targets_mcp_route()
+ * itself calls aafm_is_mcp_route() (bootstrap.php, which also defines aafm_mcp_rest_route()) with
+ * no internal guard, so that dependency
+ * is checked here too, exactly as aafm_oauth_resolve_current_user() checks it before calling the
+ * same route helper. When either is missing this simply skips logging rather than fatal on an
+ * undefined function.
+ *
+ * @param mixed $error The authentication WP_Error core just raised. Never read or logged - its
+ *                      presence is the whole signal.
+ * @return void
+ */
+function aafm_log_failed_application_password_auth( $error ): void {
+	unset( $error );
+
+	if ( ! function_exists( 'aafm_mcp_rest_route' ) || ! function_exists( 'aafm_oauth_request_targets_mcp_route' ) ) {
+		return;
+	}
+	if ( ! aafm_oauth_request_targets_mcp_route() ) {
+		return;
+	}
+
+	if ( ! aafm_denial_log_within_cap( 'fa' ) ) {
+		return; // Bounded: this IP already used its cap for the current window.
+	}
+
+	aafm_log_activity(
+		array(
+			'ability' => '(transport)',
+			'status'  => 'denied',
+			'detail'  => __( 'Invalid Application Password', 'agent-abilities-for-mcp' ),
+		)
+	);
+}
+add_action( 'application_password_failed_authentication', 'aafm_log_failed_application_password_auth' );
+
+/**
+ * Normalize a detail string before it reaches the column.
+ *
+ * The allowlist in includes/audit/detail.php is the real guarantee that only identifier-safe
+ * values get this far; this is the independent last line, so a caller that builds a detail by
+ * hand (the toggle and setting events do) still cannot write markup, a newline, or an unbounded
+ * string into an audit row that an admin screen later renders.
+ *
+ * @param string $detail Raw detail string.
+ * @return string Sanitized, single-line, at most 255 characters.
+ */
+function aafm_sanitize_activity_detail( string $detail ): string {
+	$clean = aafm_sanitize_plain_text( $detail );
+	$clean = (string) preg_replace( '/\s+/', ' ', $clean );
+	return mb_substr( trim( $clean ), 0, 255 );
+}
+
+/**
+ * Write one activity row. Records argument KEYS, never their free-text content; the detail
+ * column carries identifier-only notes (ids, key names, slugs, enum members, error codes - see
+ * includes/audit/detail.php for the allowlist, and for the one bounded exception: a code a bridged
+ * foreign plugin returned is prefixed `foreign:` and may hold a short key-shaped fragment of that
+ * plugin's own input).
+ *
+ * @param array<string,mixed> $record {
+ *     Activity record.
+ *
+ *     @type string   $ability            Ability name.
+ *     @type int      $principal_user_id  Acting user ID.
+ *     @type string   $principal_login    Acting user login.
+ *     @type string   $status             One of started|success|error|denied.
+ *     @type string[] $arg_keys           Input argument keys (values are never logged).
+ *     @type string   $client_id          OAuth client id the call is attributed to, or '' for a
+ *                                        non-OAuth (Application Password) call. Optional.
+ *     @type string   $event_type         What kind of event the row records, one of
+ *                                        aafm_activity_event_types(). Optional; anything else
+ *                                        (including an omitted key) means 'ability_call'.
+ *     @type string   $detail             Short human-readable note about what the event touched.
+ *                                        Optional; omitted leaves the column NULL, so "no detail
+ *                                        declared" stays distinct from "declared and empty".
+ * }
+ * @return int The inserted row id (0 on failure).
+ */
+function aafm_log_activity( array $record ): int {
+	global $wpdb;
+
+	// ponytail: an argument key of around 100,000 characters was seen rejected with no audit row. The cause
+	// is believed to be the arg_keys TEXT column (about 64 KB) refusing the insert in strict SQL mode;
+	// not confirmed. Truncate each key here if a call that fails to log ever matters.
+	$status   = in_array( $record['status'] ?? '', aafm_activity_statuses(), true ) ? $record['status'] : 'error';
+	$arg_keys = isset( $record['arg_keys'] ) && is_array( $record['arg_keys'] )
+		? implode( ',', array_map( 'sanitize_key', $record['arg_keys'] ) )
+		: '';
+
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$wpdb->insert(
+		aafm_activity_log_table(),
+		array(
+			'ability'           => isset( $record['ability'] ) ? (string) $record['ability'] : '',
+			'principal_user_id' => isset( $record['principal_user_id'] ) ? (int) $record['principal_user_id'] : 0,
+			'principal_login'   => isset( $record['principal_login'] ) ? (string) $record['principal_login'] : '',
+			'status'            => $status,
+			'arg_keys'          => $arg_keys,
+			'source_ip'         => aafm_source_ip(),
+			'client_id'         => isset( $record['client_id'] ) ? (string) $record['client_id'] : '',
+			'event_type'        => in_array( $record['event_type'] ?? '', aafm_activity_event_types(), true )
+				? (string) $record['event_type']
+				: 'ability_call',
+			'detail'            => isset( $record['detail'] )
+				? aafm_sanitize_activity_detail( (string) $record['detail'] )
+				: null,
+			'created_at'        => current_time( 'mysql', true ),
+		),
+		array( '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s' )
+	);
+
+	$row_id = (int) $wpdb->insert_id;
+
+	/**
+	 * Fires after an activity record is written (SIEM/extensibility seam).
+	 *
+	 * @param array $record The normalized record.
+	 */
+	do_action( 'aafm_ability_called', $record );
+
+	return $row_id;
+}
+
+/**
+ * Record that an option write did not actually persist, instead of the usual success-style
+ * ability_enabled/ability_disabled/setting_changed diff a caller would otherwise log.
+ *
+ * Calling a success-style log entry unconditionally, before checking whether
+ * aafm_update_option_verified() (or an equivalent operator-switch persist) actually got the value
+ * into the database, would leave success-style rows on record for a write that a stale
+ * persistent object cache silently swallowed - the exact silent-wrong-answer class
+ * aafm_update_option_verified() exists to catch elsewhere. This is the one row written instead:
+ * status 'error', naming the option so the real cause (option-cache.php's stale-cache class of
+ * bug) is legible straight from the log, without implying any setting actually changed.
+ *
+ * Originally defined in includes/admin/page.php, loaded inside
+ * aafm_bootstrap() at 'plugins_loaded' priority 10. Four failure paths call this function at or
+ * before priority 1 - the OAuth-preservation and DCR-adoption migration callbacks on
+ * 'plugins_loaded' priority 1 (includes/oauth/discovery.php), and the activity-log/OAuth schema
+ * version stamps run directly from aafm_activate() during plugin activation, before bootstrap has
+ * ever run. Moved here because this file is required at the plugin's top level (before
+ * aafm_bootstrap() exists at all), so it is defined before every one of those early callers can
+ * possibly run.
+ *
+ * @param string $option Option name that failed to persist.
+ * @param string $label  Human-readable label for the option, used in the detail message.
+ * @return void
+ */
+function aafm_log_ability_persist_failure( string $option, string $label ): void {
+	$user = wp_get_current_user();
+	aafm_log_activity(
+		array(
+			'ability'           => $option,
+			'principal_user_id' => (int) $user->ID,
+			'principal_login'   => $user->user_login ? (string) $user->user_login : '',
+			'status'            => 'error',
+			'event_type'        => 'setting_changed',
+			/* translators: %s: human-readable label of the option that failed to persist. */
+			'detail'            => sprintf( __( '%s could not be saved: object cache stale', 'agent-abilities-for-mcp' ), $label ),
+		)
+	);
+}
+
+/**
+ * Delete activity rows older than the configured retention window.
+ *
+ * Driven by the daily `aafm_prune_activity_log_daily` cron event, not by the write
+ * path, so an insert never pays for a DELETE. When retention is 0 the log is kept
+ * forever and this is a no-op. Otherwise it removes every row whose created_at is
+ * older than the cutoff in one prepared, index-backed range delete (created_at is
+ * indexed) against this plugin's own table.
+ *
+ * @return void
+ */
+function aafm_prune_activity_log(): void {
+	$days = aafm_log_retention_days();
+	if ( 0 === $days ) {
+		return; // 0 = keep every entry forever.
+	}
+
+	global $wpdb;
+	$table  = aafm_activity_log_table();
+	$cutoff = gmdate( 'Y-m-d H:i:s', time() - $days * DAY_IN_SECONDS );
+
+	// Delete in bounded batches rather than one statement. The usual daily prune removes only a
+	// day of rows, but if the operator kept retention at 0 (keep forever) for a long time and then
+	// shortens it, a single DELETE would be one multi-million-row InnoDB transaction: long lock
+	// waits against the concurrent audit-INSERT path, and if it overruns the cron worker's time
+	// limit it rolls back and makes zero progress every day. Short ORDER BY id LIMIT statements
+	// keep each transaction small and the progress durable, with the same cutoff semantics. Capped
+	// per run so a pathological backlog cannot spin the worker indefinitely; the next daily run
+	// picks up where this one stopped.
+	$total_deleted = 0;
+	$max_batches   = 200; // 200 * 5000 = up to 1,000,000 rows removed per daily run.
+	for ( $batch = 0; $batch < $max_batches; $batch++ ) {
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$deleted        = $wpdb->query( $wpdb->prepare( 'DELETE FROM %i WHERE created_at < %s ORDER BY id ASC LIMIT 5000', $table, $cutoff ) );
+		$affected       = is_int( $deleted ) ? $deleted : 0;
+		$total_deleted += $affected;
+		// Fewer than a full batch (including 0 on a query error) means the expired rows are gone.
+		if ( $affected < 5000 ) {
+			break;
+		}
+	}
+
+	// Same reason the clear path drops it. A prune is usually gradual, so the review notice's
+	// five-minute count memo could be left to expire - but not when the operator shortens the
+	// retention window, which takes most of the log out on the next daily run. The heading would
+	// go on quoting the pre-prune number, and the render guard that exists to stop an ask the log
+	// cannot back reads the same memo, so it would pass on it too.
+	if ( $total_deleted > 0 ) {
+		if ( function_exists( 'aafm_review_request_flush_display_count' ) ) {
+			aafm_review_request_flush_display_count();
+		}
+		aafm_activity_summary_flush();
+	}
+}
+
+/**
+ * Update an existing activity row's status in place (used to resolve a 'started' row).
+ *
+ * $result_count (L5) is written only when the caller supplies one - omitting it leaves the
+ * column at its NULL default rather than overwriting it, so a write call or an unmeasured
+ * result never gets a fabricated magnitude. $detail follows the same rule: a resolve that has
+ * nothing new to say leaves whatever the insert wrote in place rather than blanking it.
+ *
+ * This function does NOT announce the resolve. A crashed call writes this row TWICE - once from
+ * aafm_log_ability_exception(), once from the tail resolve - so a hook fired from in here would
+ * fire twice per crash, and the second fire would carry the null that protects the column. The
+ * announcement is aafm_announce_ability_resolved()'s job and the caller's decision; this function
+ * only reports whether the write landed, so the caller can stay silent when it did not.
+ *
+ * @param int         $row_id       Row id returned by aafm_log_activity().
+ * @param string      $status       One of success|error|denied.
+ * @param int|null    $result_count Optional magnitude of a list/read call's result. Null (default)
+ *                                  leaves the column untouched.
+ * @param string|null $detail       Optional note about what the call touched, known only once it
+ *                                  resolved. Null (default) leaves the column untouched.
+ * @param int|null    $duration_ms  Milliseconds spent inside the ability's execute callback. Null
+ *                                  (default) leaves the column untouched.
+ * @return bool Whether the row was written. False means the query failed, the id was unusable, or
+ *              no such row exists any more; a matched row whose columns did not change counts as
+ *              written.
+ */
+function aafm_update_activity_status( int $row_id, string $status, ?int $result_count = null, ?string $detail = null, ?int $duration_ms = null ): bool {
+	global $wpdb;
+	if ( $row_id <= 0 ) {
+		return false;
+	}
+	$status = in_array( $status, aafm_activity_statuses( false ), true ) ? $status : 'error';
+
+	$data   = array( 'status' => $status );
+	$format = array( '%s' );
+	if ( null !== $result_count ) {
+		$data['result_count'] = $result_count;
+		$format[]             = '%d';
+	}
+	if ( null !== $detail ) {
+		$data['detail'] = aafm_sanitize_activity_detail( $detail );
+		$format[]       = '%s';
+	}
+
+	$table   = aafm_activity_log_table();
+	$updated = false;
+
+	// The duration column exists from schema v6. A call that resolves before the upgrade has run
+	// (cron, WP-CLI, or a stamp that failed to persist) would fail this UPDATE, so it is tried
+	// first with errors suppressed and retried without the column on failure: the status must
+	// always resolve, and only the duration is lost. No per-request memo of "unsupported": a
+	// persistent-worker SAPI would keep it across requests.
+	if ( null !== $duration_ms ) {
+		$with_duration                = $data;
+		$with_duration['duration_ms'] = min( 4294967295, max( 0, $duration_ms ) );
+		$suppressed                   = $wpdb->suppress_errors( true );
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$updated = $wpdb->update( $table, $with_duration, array( 'id' => $row_id ), array_merge( $format, array( '%d' ) ), array( '%d' ) );
+		$wpdb->suppress_errors( $suppressed );
+	}
+	if ( false === $updated ) {
+		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+		$updated = $wpdb->update( $table, $data, array( 'id' => $row_id ), $format, array( '%d' ) );
+	}
+
+	// Only a literal false is a failure. wpdb::update() returns 0 when the row matched and no
+	// column changed, which is a legitimate no-op resolve, and a naive `if ( $updated )` would
+	// report every one of them as a failed write.
+	//
+	// But 0 also comes back when NO row matched, and that is not a resolve at all: the row was
+	// pruned or the log was cleared between the opening insert and this call, so reporting success
+	// makes the caller announce a row_id that joins to nothing - the same defect as announcing a
+	// null detail, dressed differently. The two zeroes are indistinguishable from the return value,
+	// so the rare one costs a SELECT to tell them apart. An ordinary resolve changes the status
+	// column and never lands here; a crashed call does, because aafm_log_ability_exception() has
+	// already set the row to 'error'.
+	if ( 0 === $updated ) {
+		// This confirming read used to be a bare $wpdb->get_var(), which hands back the PREVIOUS
+		// query's value when this one fails - a stale truthy id left over from an earlier,
+		// unrelated lookup could then be misread as proof this row still exists. Routed through
+		// aafm_wpdb_scalar() so a failed confirming read reports failure (the row is treated as
+		// gone), the same direction as a genuinely pruned row - never the opposite mistake of
+		// certifying a resolve this call could not actually confirm.
+		$view = aafm_wpdb_scalar( $wpdb->prepare( 'SELECT id FROM %i WHERE id = %d', $table, $row_id ) );
+		return $view['ok'] && null !== $view['value'];
+	}
+
+	return false !== $updated;
+}
+
+/**
+ * Announce that an ability call has resolved.
+ *
+ * Separate from aafm_update_activity_status() on purpose. The writer runs twice on a crashed call
+ * and only the second run knows the final status, while only the first knows the crash detail; a
+ * hook fired from inside it therefore fires twice and the last fire carries a null detail. The
+ * caller in includes/register.php holds both halves, so it announces, once, after the row is
+ * settled.
+ *
+ * @param int|null    $row_id       The resolved row, or null when the opening insert failed and
+ *                                  there is no row at all (since 1.6.2).
+ * @param string      $status       One of success|error|denied.
+ * @param int|null    $result_count Magnitude of a list/read call's result, or null.
+ * @param string|null $detail       The detail the row now carries, or null when it carries none.
+ * @return void
+ */
+function aafm_announce_ability_resolved( ?int $row_id, string $status, ?int $result_count = null, ?string $detail = null ): void {
+	/**
+	 * Fires once an ability call resolves, whatever the outcome.
+	 *
+	 * This is the only way anything outside wp-admin can see a crash. Before it existed a crashed
+	 * call was visible solely to a human reading the activity log, so an external monitor had no
+	 * signal at all.
+	 *
+	 * Exactly one fire per resolved call. A call that re-throws instead of resolving (the
+	 * aafm_rethrow_ability_exceptions filter) fires nothing at all and leaves its row at 'started' -
+	 * that absence is the development-time signal, and it is deliberate.
+	 *
+	 * A DENIED call announces too, including one whose permission callback crashed. That is the
+	 * failure an operator most wants to hear about and the reason $status can be 'denied' here even
+	 * though a denial writes its own row instead of resolving a 'started' one. What does NOT
+	 * announce is discovery: the tools/list visibility probe in includes/server.php runs the raw
+	 * permission callback over every enabled ability on every REST request that arrives with a
+	 * logged-in user, block editor traffic included, plus MCP tools/list, and a call that was
+	 * never made has not resolved. A crash there is still audited, just not broadcast - read
+	 * the 'denied' rows for it.
+	 *
+	 * The record deliberately carries no ability name or principal. The resolve path receives
+	 * neither, and includes/audit/log.php exposes no read-by-id helper, so including them would mean
+	 * a new helper plus an extra SELECT on every single resolve. Join on row_id against the
+	 * aafm_ability_called record instead, which carries both.
+	 *
+	 * Since 1.6.2, row_id can be NULL: it is null when the call's opening audit insert failed, so
+	 * there is no row to join to at all - the payload's own status and detail are the whole record
+	 * for that call. That state is exactly when an external monitor matters most (the audit table
+	 * itself is failing), which is why it announces instead of staying silent as 1.6.1 had it. The
+	 * aafm_ability_called record for the same call still fired (aafm_log_activity() runs its
+	 * do_action unconditionally), so the ability name and principal are recoverable from it. A
+	 * consumer must treat row_id as int-or-null: a real id joins as before, null means "no row".
+	 *
+	 * $detail is identifier-only and never carries an argument value from any first-party ability:
+	 * it is an ability's allowlisted detail, a WP_Error code, or a crash's exception class and throw
+	 * site. A bridged ability's code comes from a foreign plugin, so it is prefixed with `foreign:` and
+	 * kept only when it is a short key-shaped string; a plugin that builds a code from its input can put a
+	 * fragment of that input there. Its message is never included. It is sanitized exactly as the column sanitizes it. It is NOT always
+	 * the whole of what the column holds, though: it is the detail this resolve contributed. An
+	 * ordinary update or read contributes none and announces null while the row keeps the detail
+	 * its opening insert wrote, so a consumer that treats a null detail as "nothing to correlate"
+	 * will throw away most of the log. Join on row_id and read the row's own detail. A denial and
+	 * a crash both announce the string their row carries, because on those paths the resolve is
+	 * what wrote it. See includes/audit/detail.php.
+	 *
+	 * @since 1.6.1
+	 * @since 1.6.2 row_id can be null (the opening insert failed; nothing to join to).
+	 * @param array{row_id:int|null,status:string,result_count:int|null,detail:string|null} $record The resolve.
+	 */
+	do_action(
+		'aafm_ability_resolved',
+		array(
+			'row_id'       => $row_id,
+			'status'       => $status,
+			'result_count' => $result_count,
+			// The same string the column got. aafm_update_activity_status() sanitizes on the way in,
+			// so announcing the raw argument would hand a consumer a value the log itself refused.
+			'detail'       => null === $detail ? null : aafm_sanitize_activity_detail( $detail ),
+		)
+	);
+}
+
+/**
+ * Record a caught ability exception's class and throw site onto its already-started activity row.
+ *
+ * A crash mid-execute used to leave the row stuck at 'started' forever - that stuck row was
+ * itself the only forensic signal a crash had happened (see the comment in
+ * aafm_register_ability_with_log() in includes/register.php). Once the catch there resolves
+ * every crash to a normal 'error' row like any ordinary validation failure, that signal is gone
+ * unless the exception is written down somewhere - here, in the same row's detail column. This
+ * does not insert a second row: it updates the one aafm_log_activity() already wrote at
+ * 'started', the same "one row per call" contract every other resolve follows.
+ *
+ * The exception's MESSAGE is never stored, in this row or anywhere else. A vendor exception
+ * message routinely interpolates the value that caused it, and the log's promise - stated in the
+ * wp.org listing, not only in this codebase - is that free-text argument content is never stored. The class
+ * plus the throw site identifies the defect at least as precisely and cannot carry a value. The
+ * detail itself is built by aafm_build_activity_detail_from_exception() in includes/audit/detail.php,
+ * so the file that documents this column's contract is also the file that produces every string
+ * written to it.
+ *
+ * The same rule governs the WP_Error the caller returns to the client: build it from a fixed,
+ * translatable string, never from $e->getMessage().
+ *
+ * The detail is returned as well as written, so the caller can announce the resolve carrying the
+ * detail that survived rather than the null it passes to protect this column on its second write.
+ *
+ * @param int        $row_id  The 'started' row id returned by aafm_log_activity() for this call.
+ * @param \Throwable $e       The caught exception or error.
+ * @return string The detail written to the row.
+ */
+function aafm_log_ability_exception( int $row_id, \Throwable $e ): string {
+	$detail = aafm_build_activity_detail_from_exception( $e );
+	aafm_update_activity_status( $row_id, 'error', null, $detail );
+	return $detail;
+}
+
+/**
+ * Query activity rows, most recent first.
+ *
+ * @param array<string,mixed> $args Query arguments: per_page, page, and the filters status, ability
+ *                                  (or tool), user, conn, plugin, from, to, q, row and max_id, which
+ *                                  aafm_activity_filters_normalize() cleans.
+ *                                  max_id (optional) bounds the result to id <= max_id - a
+ *                                  caller paginating across multiple calls (the CSV exporter)
+ *                                  uses it to pin every page to a snapshot taken before the
+ *                                  first page ran, so a row inserted mid-run can never shift the
+ *                                  OFFSET window and appear on two pages.
+ * @return array<int,array<string,mixed>>
+ */
+function aafm_query_activity( array $args ): array {
+	$view = aafm_query_activity_result( $args );
+	return $view['ok'] ? $view['rows'] : array();
+}
+
+/**
+ * Same read as aafm_query_activity(), but honest about a failed query instead of collapsing it
+ * to an empty result.
+ *
+ * The plain wrapper above can never tell its caller "zero rows because the table is
+ * empty/exhausted" apart from "zero rows because the query failed" - both read as `array()`. That
+ * is fine for a caller that only ever renders what it gets back, but the CSV exporter
+ * (aafm_export_activity_csv()) uses "fewer than a full page came back" as its own loop-termination
+ * signal, so a failed read looked exactly like reaching the end of the table and the export
+ * completed - silently missing every row after the failure. This gives that caller the
+ * ok/rows split it needs to tell the two apart, without changing aafm_query_activity()'s existing
+ * contract for its many other callers.
+ *
+ * @param array<string,mixed> $args Same shape as aafm_query_activity().
+ * @return array{ok:bool,rows:array<int,array<string,mixed>>} ok is false when the query itself
+ *              failed - rows is empty either way in that case.
+ */
+function aafm_query_activity_result( array $args ): array {
+	global $wpdb;
+
+	$per_page = isset( $args['per_page'] ) ? min( 200, max( 1, (int) $args['per_page'] ) ) : 50;
+	$page     = isset( $args['page'] ) ? max( 1, (int) $args['page'] ) : 1;
+	$offset   = ( $page - 1 ) * $per_page;
+	// The table name is an internal constant ($wpdb->prefix . 'aafm_activity_log'),
+	// never user input; the leading %i placeholder below quotes/escapes the identifier.
+	$table = aafm_activity_log_table();
+
+	$where    = aafm_activity_filter_where( $args );
+	$params   = $where['params'];
+	$params[] = $per_page;
+	$params[] = $offset;
+	array_unshift( $params, $table );
+
+	// The fragment is fixed text and placeholders from aafm_activity_filter_where(); every value is bound.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.InterpolatedNotPrepared, WordPress.DB.PreparedSQL.NotPrepared
+	$sql = "SELECT * FROM %i WHERE {$where['sql']} ORDER BY created_at DESC, id DESC LIMIT %d OFFSET %d";
+	// Routed through aafm_wpdb_results() rather than a bare get_results() -
+	// a failed query here could otherwise return an EARLIER, unrelated query's rows (see
+	// aafm_oauth_list_clients()'s docblock for the mechanism), silently showing the admin a
+	// different page/filter's log rows instead of an empty result.
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+	$view = aafm_wpdb_results( $wpdb->prepare( $sql, $params ) );
+
+	return array(
+		'ok'   => $view['ok'],
+		'rows' => ( $view['ok'] && is_array( $view['value'] ) ) ? $view['value'] : array(),
+	);
+}
+
+/**
+ * Count rows recording a genuine agent tool call - the "made your first call" signal.
+ *
+ * The event_type = 'ability_call' filter narrows out every event that carries its own type:
+ * the admin-side events schema v5 introduced (ability toggles, blocked enables, setting
+ * changes, the log-cleared marker) and the crashed discovery checks 1.7.0 typed as
+ * 'permission_check_crashed' (aafm_deny_crashed_permission_check() logs a REAL ability name
+ * with status 'denied', and its callers run on every REST request that arrives with a
+ * logged-in user - the adapter builds its server on rest_api_init priority 15 - block editor
+ * traffic included and with no MCP traffic needed at all, so a third-party plugin with a
+ * throwing cap filter used to flip this count with no agent involved. Ordinary page loads and
+ * anonymous REST requests never reach it, since the walk sits behind is_user_logged_in()).
+ * The filter is still not sufficient on its own: three writers land rows under the DEFAULT
+ * 'ability_call' type that are not tool calls, so each is excluded by the synthetic ability
+ * name it carries.
+ *
+ * - 'oauth:%' rows (includes/oauth/audit.php passes no event_type) record the browser-side
+ *   OAuth ceremony (register/authorize/token/...) - that is the connect step's territory,
+ *   not a call.
+ * - '(transport)' rows record refusals at the front door - a wrong Application Password or
+ *   a blocked source IP - before any tool was addressed, so no tool call happened.
+ * - 'aafm/activity-log-cleared' is the log-cleared marker's synthetic name; markers written
+ *   before schema v5 predate event_type and so carry the 'ability_call' default.
+ *
+ * One class of historical row stays counted on purpose: crashed discovery checks recorded
+ * before 'permission_check_crashed' existed carry the column default under a real ability
+ * name, which makes them genuinely indistinguishable by shape from an agent's denied call.
+ * No backfill guesses at them; only rows written since the type shipped are excluded.
+ *
+ * Denied and rate-limited tool calls DO count. Those rows (includes/register.php) mean an
+ * agent authenticated, spoke MCP, and invoked a real tool by name - the refusal is the
+ * governance layer doing its job, and the connection demonstrably works end to end.
+ *
+ * The optional $status arg narrows the same exclusion set to a single row status. It exists
+ * so callers that need a stricter reading - the review-request notice counts success-only,
+ * because a pile of denied calls proves connectivity but not value - share this one WHERE
+ * clause instead of hand-copying it. A second copy of the exclusion list would silently
+ * drift the moment a fourth default-event_type writer appears, which is exactly the bug
+ * class the exclusions above were built to close.
+ *
+ * @param string|null $status One of started|success|error|denied to narrow to that status,
+ *                            or null/empty to count every tool-call row (the default).
+ * @return int Non-negative count of agent tool-call rows.
+ */
+function aafm_agent_call_count( ?string $status = null ): int {
+	global $wpdb;
+	$clause = aafm_agent_call_clause( $status );
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.PreparedSQL.NotPrepared, PluginCheck.Security.DirectDB.UnescapedDBParameter
+	$view = aafm_wpdb_scalar( $wpdb->prepare( 'SELECT COUNT(*) FROM %i WHERE ' . $clause['sql'], array_merge( array( aafm_activity_log_table() ), $clause['params'] ) ) );
+	return $view['ok'] ? max( 0, (int) $view['value'] ) : 0;
+}
+
+/**
+ * The highest activity row id currently in the table, or 0 when empty.
+ *
+ * A caller paginating with aafm_query_activity() across several calls (the CSV exporter) snapshots
+ * this once, before the first page runs, and passes it back as max_id on every page - so a row
+ * inserted mid-run can never shift an OFFSET window and be exported twice.
+ *
+ * Routed through aafm_wpdb_scalar() rather than a bare get_var() - the
+ * exporter treats this as the snapshot bound for every page it fetches, so a failed query
+ * inheriting a stale MAX(id) from an earlier, different-sized snapshot would silently mis-bound
+ * the whole export rather than fail visibly.
+ *
+ * @return int
+ */
+function aafm_activity_max_id(): int {
+	$view = aafm_activity_max_id_result();
+	return $view['ok'] ? $view['value'] : 0;
+}
+
+/**
+ * Same read as aafm_activity_max_id(), but honest about a failed query instead of collapsing it
+ * to 0 - the same value an empty table produces.
+ *
+ * The CSV exporter takes this as its pagination snapshot before its first page runs: if the
+ * read fails, folding that into 0 makes every page's `id <= 0` filter come back empty, and the
+ * export completes looking like a genuinely empty log instead of a failed one. Collapsing failure
+ * into 0 here is exactly the mistake aafm_query_activity_result()'s docblock describes for the row
+ * read; this closes the matching case for the MAX(id) read the exporter pairs it with.
+ *
+ * @return array{ok:bool,value:int} ok is false when the query itself failed - value is 0 either
+ *              way in that case.
+ */
+function aafm_activity_max_id_result(): array {
+	global $wpdb;
+	$table = aafm_activity_log_table();
+	$view  = aafm_wpdb_scalar( $wpdb->prepare( 'SELECT MAX(id) FROM %i', $table ) );
+	return array(
+		'ok'    => $view['ok'],
+		'value' => ( ! $view['ok'] || null === $view['value'] ) ? 0 : max( 0, (int) $view['value'] ),
+	);
+}
+
+/**
+ * Delete every activity row.
+ *
+ * Certifies the table is actually empty afterward rather than trusting the TRUNCATE's own
+ * result: a failed truncate must not let a caller go on to write a
+ * marker row claiming the clear happened, or report success while the original rows survive.
+ *
+ * The confirmation read goes through aafm_wpdb_scalar() rather than a bare get_var():
+ * a get_var() read that itself failed used to cast straight to `(int) null === 0`, the
+ * same "unreadable, so call it empty" mistake as a stale TRUNCATE, letting the memo flush and the
+ * marker row below both run as if the clear had genuinely happened.
+ *
+ * @return bool True when the table is confirmed empty after this call.
+ */
+function aafm_clear_activity_log(): bool {
+	global $wpdb;
+	$table = aafm_activity_log_table();
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$wpdb->query( $wpdb->prepare( 'TRUNCATE TABLE %i', $table ) );
+
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching
+	$remaining = aafm_wpdb_scalar( $wpdb->prepare( 'SELECT COUNT(*) FROM %i', $table ) );
+	if ( ! $remaining['ok'] || 0 !== (int) $remaining['value'] ) {
+		return false;
+	}
+
+	// The review notice quotes a five-minute memo of the success count. A clear has to silence
+	// it now rather than at the expiry, or the ask goes on claiming a total the log can no
+	// longer back, which is the one thing its render guard exists to stop. Through the owner
+	// file's accessor rather than the raw key, so the notice keeps its own cache detail.
+	if ( function_exists( 'aafm_review_request_flush_display_count' ) ) {
+		aafm_review_request_flush_display_count();
+	}
+	aafm_activity_summary_flush();
+
+	return true;
+}
+
+/**
+ * Remove all plugin data for the current blog: every configuration option, the
+ * detected-meta-keys transient, and the activity log table. Called once per site by
+ * uninstall.php (multisite-aware there).
+ *
+ * Loops aafm_config_option_names() (the canonical config list) rather than a single
+ * hardcoded option, so a newly added option is cleaned up automatically and none leaks on
+ * uninstall. uninstall.php requires includes/admin/settings.php so that list is defined here.
+ * Only this plugin's own options, transient, and table are touched - never another plugin's data.
+ * A delete that fails does not stop the rest; its option name is returned so the caller can
+ * report it.
+ *
+ * @return string[] The option names whose delete could not be confirmed.
+ */
+function aafm_uninstall_site(): array {
+	global $wpdb;
+	$forget  = function_exists( 'aafm_delete_option_cache_safe' ) ? 'aafm_delete_option_cache_safe' : 'delete_option';
+	$options = function_exists( 'aafm_config_option_names' ) ? aafm_config_option_names() : array( 'aafm_enabled_abilities' );
+	$failed  = array();
+	foreach ( $options as $option ) {
+		// Only the cache-safe delete certifies the row is gone; delete_option() also answers false
+		// for a row that was never there, so the fallback reports nothing.
+		if ( ! $forget( $option ) && 'delete_option' !== $forget ) {
+			$failed[] = $option;
+		}
+	}
+	// Cosmetic detected-keys cache (option-list sibling of the same data class).
+	delete_transient( 'aafm_detected_meta_keys' );
+	// The review notice's five-minute count memo, same data class.
+	delete_transient( 'aafm_review_request_count' );
+	// The Connection Doctor's header-seen memo, same data class.
+	delete_transient( 'aafm_doctor_header_seen' );
+	// The Activity tab's 7-day summary memo, same data class.
+	delete_transient( 'aafm_activity_summary' );
+	$table = aafm_activity_log_table();
+	// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery, WordPress.DB.DirectDatabaseQuery.NoCaching, WordPress.DB.DirectDatabaseQuery.SchemaChange
+	$wpdb->query( $wpdb->prepare( 'DROP TABLE IF EXISTS %i', $table ) );
+
+	return $failed;
+}

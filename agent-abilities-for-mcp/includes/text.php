@@ -1,0 +1,214 @@
+<?php
+/**
+ * Stored plain-text sanitizing.
+ *
+ * The B-18 pair and the character set they strip. Kept in their own file, and required at the very
+ * top of the plugin rather than inside aafm_bootstrap(), because their callers do not all load at
+ * the same time: includes/audit/log.php and includes/oauth/clients.php are both required before
+ * bootstrap runs, and activating a plugin includes its main file and fires the activation hook in
+ * the SAME request without ever reaching plugins_loaded. A sanitizer that only existed after
+ * bootstrap would be an undefined function on that path, which is a fatal on activation rather than
+ * a bug someone notices later. Nothing here depends on anything else the plugin defines, so loading
+ * it first costs nothing.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * The invisible characters no plain-text field the plugin stores may carry.
+ *
+ * Two groups, both returned as raw UTF-8 byte sequences so the caller can strip
+ * them with str_replace and never depend on a /u regex (which returns null, not
+ * a string, the moment it is handed a byte sequence that is not valid UTF-8):
+ *
+ * 1. C0 controls except tab, LF and CR. This is exactly the set XML 1.0 forbids
+ *    in a document - a single raw one of these anywhere in the site's RSS feed
+ *    makes the WHOLE document not well-formed, and NUL cannot even be escaped
+ *    into validity, so nothing downstream can rescue it. DEL (0x7F) and the C1
+ *    range are legal XML 1.0 characters and are deliberately left alone.
+ * 2. The Trojan Source bidirectional formatting characters (U+202A-U+202E,
+ *    U+2066-U+2069). These reorder how a string renders without changing a byte
+ *    of it, so a human reviewer can approve one title in wp-admin while a
+ *    different one goes live. U+200E/U+200F (LRM/RLM) are NOT stripped: they are
+ *    ordinary punctuation in real mixed-direction text and cannot reverse a run.
+ *
+ * @return string[] Needles for str_replace.
+ */
+function aafm_unsafe_text_characters(): array {
+	static $needles = null;
+	if ( null !== $needles ) {
+		return $needles;
+	}
+
+	$needles = array();
+	for ( $i = 0; $i <= 0x1F; $i++ ) {
+		if ( 0x09 === $i || 0x0A === $i || 0x0D === $i ) {
+			continue;
+		}
+		$needles[] = chr( $i );
+	}
+	// U+202A-U+202E then U+2066-U+2069, spelled out as their UTF-8 bytes.
+	foreach ( range( 0xAA, 0xAE ) as $tail ) {
+		$needles[] = "\xE2\x80" . chr( $tail );
+	}
+	foreach ( range( 0xA6, 0xA9 ) as $tail ) {
+		$needles[] = "\xE2\x81" . chr( $tail );
+	}
+
+	return $needles;
+}
+
+/**
+ * Sanitize a value destined for a stored plain-text field (a post title, a menu
+ * item label, an alt attribute, and so on).
+ *
+ * WordPress's own sanitize_text_field() is not enough for anything the site
+ * later emits. It strips tags and percent-encoded sequences, but a raw NUL is valid UTF-8, so
+ * wp_check_invalid_utf8() passes it and the byte lands in the database intact;
+ * bidi overrides survive the same way. The stripping runs AFTER the WordPress
+ * sanitizer so this function has the last word on what is stored, whatever
+ * sanitize_text_field's own filters return.
+ *
+ * @param string $value Raw value from input.
+ * @return string Sanitized single-line plain text.
+ */
+function aafm_sanitize_plain_text( string $value ): string {
+	return str_replace( aafm_unsafe_text_characters(), '', sanitize_text_field( $value ) );
+}
+
+/**
+ * Accept a URL as written, or refuse it. Never quietly rewrite it.
+ *
+ * Core's esc_url_raw() alone turns a javascript: link into "" and "not a url at all" into
+ * http://not20a20url20at20all, and a writer that stored the result answered ok (and wiped the
+ * value it was replacing). This keeps esc_url_raw() for the cleaning and refuses what it would
+ * have had to rewrite: an empty result, a changed scheme, or a scheme-less value that is neither
+ * a relative path, an anchor, nor a host name. An empty or blank input is a deliberate clear and
+ * comes back as ''.
+ *
+ * @param string $url   The value from the caller.
+ * @param string $field The input field name, used in the error.
+ * @return string|WP_Error The cleaned URL, '' to clear, or aafm_invalid_url.
+ */
+function aafm_checked_url( string $url, string $field ) {
+	$url = aafm_trim_unicode( $url );
+	if ( '' === $url ) {
+		return '';
+	}
+
+	// A scheme is a letter-led token with no dot before the colon, so example.com:8080 is a host and
+	// port, not a scheme named example.com.
+	$has_scheme = 1 === preg_match( '/^[a-z][a-z0-9+\-]*:/i', $url );
+	$is_path    = in_array( $url[0], array( '/', '#', '?' ), true );
+	$host_like  = ! $has_scheme && ! $is_path
+		&& 1 === preg_match( '~^(?:[^\s/?#:@.<>"\'\\\\]+\.)+[^\s/?#:@.<>"\'\\\\]{2,}(?::\d+)?(?:[/?#]\S*)?$~u', $url );
+
+	// A scheme-less host gets its http:// from us, because core skips it when a colon appears later
+	// in the value (example.com/a?t=10:30) and then empties the URL.
+	$candidate = $host_like ? 'http://' . $url : $url;
+	$clean     = esc_url_raw( $candidate );
+
+	// What esc_url_raw() is allowed to hand back: the input with spaces written as %20, square
+	// brackets as %5B and %5D outside the host, and a bare host with http:// in front. Anything else it
+	// did (dropping characters, a different scheme, an empty result) is a rewrite, and a rewrite is a
+	// refusal.
+	$authority = '';
+	if ( 1 === preg_match( '~^(?:[a-z][a-z0-9+.\-]*://)?[^/?#]*~i', $candidate, $found ) ) {
+		$authority = $found[0];
+	}
+	$rest     = substr( $candidate, strlen( $authority ) );
+	$expected = str_replace( ' ', '%20', $authority ) . str_replace( array( ' ', '[', ']' ), array( '%20', '%5B', '%5D' ), $rest );
+
+	$valid = '' !== $clean && ( $has_scheme || $is_path || $host_like );
+	if ( $valid && $has_scheme ) {
+		// Needs something after the scheme: a host for scheme://, an address for mailto: and tel:.
+		$after = substr( $url, strpos( $url, ':' ) + 1 );
+		$valid = '' !== ltrim( $after, '/' ) && 1 !== preg_match( '~^[a-z][a-z0-9+.\-]*://[^/?#]*\s~i', $url )
+			&& ( 0 !== strpos( $after, '//' ) || '' !== (string) wp_parse_url( $url, PHP_URL_HOST ) );
+	}
+	$valid = $valid && $clean === $expected;
+	if ( ! $valid ) {
+		return new WP_Error(
+			'aafm_invalid_url',
+			sprintf(
+				/* translators: %s: the name of the input field that held the URL. */
+				__( 'The %s value is not a valid URL, so nothing was changed. Use an https:// or http:// address, a mailto: or tel: link, a path starting with /, or an anchor starting with #.', 'agent-abilities-for-mcp' ),
+				$field
+			),
+			array( 'status' => 400 )
+		);
+	}
+	return $clean;
+}
+
+/**
+ * The multi-line counterpart, for a field that legitimately keeps its newlines: an order note, a
+ * refund reason, a media caption.
+ *
+ * Same strip, different WordPress sanitizer underneath. sanitize_text_field() would collapse the
+ * newlines out of a multi-line value, which is why these fields use the textarea sanitizer in the
+ * first place, and that one has exactly the same gap: a raw NUL is valid UTF-8, so it passes
+ * wp_check_invalid_utf8() and reaches storage.
+ *
+ * This matters as much as the single-line case, not less. A media caption is stored as
+ * post_excerpt, and post_excerpt is rendered into the site's RSS feed, so a NUL arriving through a
+ * caption breaks the whole feed document exactly the way one in a title does. The needle set
+ * already spares tab, LF and CR, so multi-line text survives intact.
+ *
+ * @param string $value Raw value from input.
+ * @return string Sanitized multi-line plain text.
+ */
+function aafm_sanitize_multiline_text( string $value ): string {
+	return str_replace( aafm_unsafe_text_characters(), '', sanitize_textarea_field( $value ) );
+}
+
+/**
+ * Escape a CDATA terminator on its way into the site's feed.
+ *
+ * The feed wraps each excerpt in `<![CDATA[ … ]]>`, so a raw `]]>` inside one ends the section
+ * early, turns everything after it into markup, and makes the whole document not well-formed. That
+ * is the same harm the invisible-character strip above exists to prevent, arriving through a
+ * character nobody enumerated.
+ *
+ * It is fixed HERE, at output, rather than in the sanitizers above, and the difference matters.
+ * Every character those strip is invalid or deceptive in any context, so removing it loses nothing.
+ * `]]>` is ordinary text - a post explaining XML has every reason to contain it - and only breaks
+ * one serialization. Stripping it at storage would be silent data loss on legitimate content, so
+ * what is stored stays exactly as written and only the feed rendering is escaped.
+ *
+ * WordPress already does precisely this for the sibling field: get_the_content_feed() runs
+ * str_replace( ']]>', ']]&gt;' ) over post_content (wp-includes/feed.php). the_excerpt_rss() has no
+ * equivalent - its only filters are convert_chars and ent2ncr, and neither touches the sequence -
+ * so post_excerpt was unprotected where post_content was protected. This closes that asymmetry the
+ * same way core closed it.
+ *
+ * The filter can only ever repair a feed, never break a working one: any excerpt containing the raw
+ * sequence is already producing a malformed document.
+ *
+ * @param string $text Feed text.
+ * @return string
+ */
+function aafm_escape_feed_cdata( $text ): string {
+	return str_replace( ']]>', ']]&gt;', (string) $text );
+}
+
+add_filter( 'the_excerpt_rss', 'aafm_escape_feed_cdata' );
+
+/**
+ * Trim ASCII whitespace and the invisible or non-ASCII space characters that trim() leaves alone
+ * (NBSP, the Unicode spaces, zero-width characters, the byte-order mark) from both ends. Works on raw
+ * bytes with no /u flag, so invalid UTF-8 comes back unchanged instead of null, and a lone A0 byte
+ * inside a multibyte character (the letter a-grave) is never touched.
+ *
+ * @param string $text Text to trim.
+ * @return string
+ */
+function aafm_trim_unicode( string $text ): string {
+	$space = '(?:[ \t\n\r\0\x0B\f]|\xC2\xA0|\xE1\x9A\x80|\xE2\x80[\x80-\x8D\xAF]|\xE2\x81[\x9F\xA0]|\xE3\x80\x80|\xEF\xBB\xBF)';
+	$out   = preg_replace( '/\A' . $space . '+|' . $space . '+\z/', '', $text );
+	return null === $out ? trim( $text ) : $out;
+}

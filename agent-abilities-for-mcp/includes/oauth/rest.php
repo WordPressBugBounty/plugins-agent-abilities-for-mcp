@@ -1,0 +1,904 @@
+<?php
+/**
+ * OAuth REST endpoints: dynamic client registration, token, and revocation.
+ *
+ * Exposes the three public OAuth HTTP routes under the
+ * `agent-abilities-for-mcp/oauth` namespace. Each route's permission_callback is
+ * `__return_true` - the OAuth grant itself is the authentication, not a WordPress
+ * capability. The handlers gate on the feature toggles, enforce the HTTPS policy,
+ * and rate-limit before doing any work, then delegate the cryptographic and
+ * storage logic to the clients/codes/tokens modules. Every response these
+ * handlers return, except the disabled-route 404, carries `Cache-Control:
+ * no-store` and `Pragma: no-cache` (RFC 6749 §5.1), covering both successes
+ * and protocol errors, so a token or credential is never cached. A request
+ * with the wrong HTTP method never reaches this code at all - WordPress
+ * answers with its own 404 rest_no_route first, without these headers.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+/**
+ * Upper bound (in bytes) for free-form OAuth endpoint string inputs.
+ *
+ * Generous enough for any legitimate authorization code, refresh token, client_id,
+ * or redirect URI we issue (all far shorter), but tight enough that an attacker
+ * cannot push unbounded strings through hashing and DB lookups. Redirect URIs are
+ * already capped at 2048 bytes in aafm_oauth_validate_redirect_uri(); this is the
+ * matching guard for the token endpoint's opaque fields.
+ */
+if ( ! defined( 'AAFM_OAUTH_MAX_FIELD_LEN' ) ) {
+	define( 'AAFM_OAUTH_MAX_FIELD_LEN', 4096 );
+}
+
+/**
+ * Upper bound (in characters) for a registered client_name.
+ *
+ * Matches the storage column, client_name VARCHAR(191): MySQL counts a VARCHAR length in
+ * characters, not bytes, so this guard is measured with mb_strlen() rather than strlen() and
+ * pinned to the same number. A 255-byte guard against a 191-character column let a 192-character
+ * ASCII name pass validation and then fail (or truncate) at insert.
+ */
+if ( ! defined( 'AAFM_OAUTH_MAX_CLIENT_NAME_LEN' ) ) {
+	define( 'AAFM_OAUTH_MAX_CLIENT_NAME_LEN', 191 );
+}
+
+/**
+ * PKCE code-verifier length bounds (RFC 7636 §4.1): the spec fixes the verifier at 43-128
+ * characters, so anything outside that range cannot be a valid verifier and is rejected up front.
+ */
+if ( ! defined( 'AAFM_OAUTH_PKCE_VERIFIER_MIN' ) ) {
+	define( 'AAFM_OAUTH_PKCE_VERIFIER_MIN', 43 );
+}
+if ( ! defined( 'AAFM_OAUTH_PKCE_VERIFIER_MAX' ) ) {
+	define( 'AAFM_OAUTH_PKCE_VERIFIER_MAX', 128 );
+}
+
+/**
+ * Soft cap on the number of ACTIVE registered OAuth clients.
+ *
+ * Dynamic Client Registration is a public route, so without a ceiling a caller could fill the
+ * clients table with registrations. The daily reaper (aafm_oauth_reap_abandoned_clients())
+ * removes never-consented, token-less rows past their TTL, and this cap bounds the live total in
+ * between reaps. The default is generous for real fleets (a site rarely connects hundreds of
+ * distinct clients) while still refusing runaway growth. Filterable via aafm_oauth_max_clients.
+ */
+if ( ! defined( 'AAFM_OAUTH_MAX_ACTIVE_CLIENTS' ) ) {
+	define( 'AAFM_OAUTH_MAX_ACTIVE_CLIENTS', 500 );
+}
+
+/**
+ * Whether a string exceeds the generic OAuth field length cap.
+ *
+ * @param string $value The candidate value.
+ * @return bool True when the value is longer than AAFM_OAUTH_MAX_FIELD_LEN bytes.
+ */
+function aafm_oauth_field_too_long( string $value ): bool {
+	return strlen( $value ) > AAFM_OAUTH_MAX_FIELD_LEN;
+}
+
+/**
+ * The OAuth REST namespace every OAuth route lives under.
+ *
+ * Single-sourced so aafm_oauth_register_rest_routes() and any code that needs to recognise
+ * "an OAuth route" (without hardcoding a namespace string, or a list of the three current
+ * route names, in more than one place) read the same value. Mirrors the pattern
+ * aafm_mcp_rest_route() already uses for the MCP route in includes/bootstrap.php.
+ *
+ * @return non-falsy-string
+ */
+function aafm_oauth_rest_namespace(): string {
+	return 'agent-abilities-for-mcp/oauth';
+}
+
+/**
+ * Register the three public OAuth 2.0 REST routes.
+ *
+ * Hooked on `rest_api_init`. These endpoints are publicly reachable by design - the
+ * OAuth 2.0 framework and its extension RFCs require them to be open before any
+ * client has obtained credentials:
+ *
+ *   /register - Dynamic Client Registration (RFC 7591). The callback inspects the
+ *               supplied client metadata from the JSON request body.
+ *   /token    - Token endpoint (RFC 6749 §3.2). The callback validates the client
+ *               credentials and grant parameters from the request body.
+ *   /revoke   - Token Revocation (RFC 7009). The callback validates the token and
+ *               caller identity from the request body.
+ *
+ * `permission_callback` must be `__return_true` for all three: a gate at the routing
+ * layer would block the request before any callback can read the grant or credentials.
+ * All authentication and authorization happen inside each callback.
+ *
+ * @return void
+ */
+function aafm_oauth_register_rest_routes(): void {
+	$namespace = aafm_oauth_rest_namespace();
+
+	register_rest_route(
+		$namespace,
+		'/register',
+		array(
+			'methods'             => 'POST',
+			'callback'            => 'aafm_oauth_rest_register',
+			// Public OAuth endpoint (RFC 7591 DCR); client metadata validated inside the callback.
+			'permission_callback' => '__return_true',
+		)
+	);
+
+	register_rest_route(
+		$namespace,
+		'/token',
+		array(
+			'methods'             => 'POST',
+			'callback'            => 'aafm_oauth_rest_token',
+			// Public OAuth endpoint (RFC 6749 §3.2); credentials + grant validated inside the callback.
+			'permission_callback' => '__return_true',
+		)
+	);
+
+	register_rest_route(
+		$namespace,
+		'/revoke',
+		array(
+			'methods'             => 'POST',
+			'callback'            => 'aafm_oauth_rest_revoke',
+			// Public OAuth endpoint (RFC 7009); token + caller identity validated inside the callback.
+			'permission_callback' => '__return_true',
+		)
+	);
+}
+
+/**
+ * Attach the RFC 6749 §5.1 no-cache headers to a REST response and return it.
+ *
+ * §5.1 requires both `Cache-Control: no-store` and `Pragma: no-cache` on any response
+ * carrying tokens, credentials, or other sensitive information. This one helper covers
+ * the token response, the DCR 201, the revocation 200, and every protocol error these
+ * handlers return, including a malformed-JSON body: core rejects that before the route
+ * callback runs (via `has_valid_params()`), but aafm_oauth_filter_malformed_json()
+ * catches that case on `rest_post_dispatch` and routes it back through
+ * aafm_oauth_rest_protocol_error(), which calls this helper too.
+ *
+ * @param \WP_REST_Response $response The response to decorate.
+ * @return \WP_REST_Response The same response, with both no-cache headers set.
+ */
+function aafm_oauth_rest_no_store( WP_REST_Response $response ): WP_REST_Response {
+	$response->header( 'Cache-Control', 'no-store' );
+	$response->header( 'Pragma', 'no-cache' );
+	return $response;
+}
+
+/**
+ * Build an RFC 6749 §5.2 error response.
+ *
+ * WordPress serialises a WP_Error as {code, message, data}, which is not the OAuth error
+ * representation any conforming client can read, so protocol errors are built as an explicit
+ * WP_REST_Response instead. RFC 7591 §3.2.2 (registration) and RFC 7009 §2.2.1 (revocation)
+ * use the same two members, so this one helper serves all three endpoints.
+ *
+ * @param string $code        The OAuth error code (e.g. 'invalid_grant').
+ * @param string $description A non-leaky human-readable description.
+ * @param int    $status      The HTTP status code to return.
+ * @return \WP_REST_Response
+ */
+function aafm_oauth_rest_protocol_error( string $code, string $description, int $status ): WP_REST_Response {
+	$response = new WP_REST_Response(
+		array(
+			'error'             => $code,
+			'error_description' => $description,
+		),
+		$status
+	);
+
+	return aafm_oauth_rest_no_store( $response );
+}
+
+/**
+ * Convert core's malformed-JSON rejection into the RFC 6749 §5.2 shape, on the OAuth
+ * routes only.
+ *
+ * `WP_REST_Server::dispatch()` validates the request body via `has_valid_params()` before
+ * any route callback runs. A JSON syntax error there never reaches
+ * aafm_oauth_rest_register() / aafm_oauth_rest_token() / aafm_oauth_rest_revoke(): it
+ * becomes core's own `{code: 'rest_invalid_json', message, data}` WP_Error, already
+ * converted to a `WP_REST_Response` by the time `rest_post_dispatch` fires, carrying no
+ * cache headers. This matters most on `/register`, which RFC 7591 defines as JSON-only,
+ * so a malformed body there has no other path back to our own response shape.
+ *
+ * Gated on aafm_oauth_enabled() first, matching aafm_oauth_filter_rest_challenge()'s own
+ * first check: with OAuth off, `/token` and friends already answer with the disabled-route
+ * 404 on every other path, and this filter staying silent keeps that "OAuth off means
+ * nothing OAuth-shaped comes back" property intact rather than producing an RFC 6749 body
+ * for a switched-off endpoint.
+ *
+ * Scoped narrowly beyond that: `rest_post_dispatch` fires on every REST request the site
+ * serves, not only ours, so this returns the response completely untouched unless status,
+ * error code, and route all match. The route check matches any route under the
+ * aafm_oauth_rest_namespace() namespace (case-insensitively, since core itself matches
+ * REST routes case-insensitively - see `class-wp-rest-server.php`'s route regex, built with
+ * the `i` modifier), rather than a hand-maintained list of the three current route names:
+ * every endpoint that can live in this namespace and accept a JSON body is an OAuth
+ * protocol endpoint (RFC 7591 §3.2.2 and RFC 7009 §2.2.1 both reuse the same §5.2 error
+ * object RFC 6749 §5.2 defines), so a route added here later is covered automatically
+ * instead of silently falling outside a stale list. Route is read from the
+ * `WP_REST_Request` argument the filter receives, never a global, matching the same
+ * discipline aafm_oauth_filter_rest_challenge() already uses for its own narrow
+ * rest_post_dispatch gate.
+ *
+ * @param mixed           $response The dispatch result (WP_REST_Response on the REST path).
+ * @param \WP_REST_Server $server   The REST server (unused).
+ * @param mixed           $request  The originating request (WP_REST_Request on the REST path).
+ * @return mixed The RFC 6749 shaped response when every condition matches, the original
+ *               response untouched otherwise.
+ */
+function aafm_oauth_filter_malformed_json( $response, $server, $request ) {
+	unset( $server );
+
+	if ( ! aafm_oauth_enabled() ) {
+		return $response;
+	}
+
+	if ( ! $response instanceof WP_REST_Response ) {
+		return $response;
+	}
+
+	if ( 400 !== (int) $response->get_status() ) {
+		return $response;
+	}
+
+	$data = $response->get_data();
+	if ( ! is_array( $data ) || ! isset( $data['code'] ) || 'rest_invalid_json' !== $data['code'] ) {
+		return $response;
+	}
+
+	$route        = $request instanceof WP_REST_Request ? $request->get_route() : '';
+	$route_prefix = '/' . aafm_oauth_rest_namespace() . '/';
+
+	if ( 0 !== stripos( $route, $route_prefix ) ) {
+		return $response;
+	}
+
+	return aafm_oauth_rest_protocol_error(
+		'invalid_request',
+		__( 'The request body could not be parsed as valid JSON.', 'agent-abilities-for-mcp' ),
+		400
+	);
+}
+
+/**
+ * Build the 429 served when a rate limit is exceeded.
+ *
+ * Adds `Retry-After` (RFC 9110 §10.2.3) alongside the usual RFC 6749 §5.2 error body, so a
+ * client that hits a limit knows how long to wait rather than hammering the endpoint or giving
+ * up. No OAuth RFC prescribes `Retry-After` for a 429 (the only mention in the family is RFC
+ * 7009 §2.2.1, tied to a 503), but RFC 9110 defines the header generally and it costs nothing
+ * to include here. The value is `AAFM_OAUTH_RATE_WINDOW`, the one fixed window
+ * aafm_oauth_rate_ok() enforces on both its per-IP and global counters.
+ *
+ * @param string $description A non-leaky human-readable description.
+ * @return \WP_REST_Response
+ */
+function aafm_oauth_rest_rate_limited_error( string $description ): WP_REST_Response {
+	$response = aafm_oauth_rest_protocol_error( 'rate_limited', $description, 429 );
+	$response->header( 'Retry-After', (string) AAFM_OAUTH_RATE_WINDOW );
+
+	return $response;
+}
+
+/**
+ * Build the 404 served when an OAuth endpoint is switched off.
+ *
+ * Deliberately NOT the RFC 6749 §5.2 shape. This is not a protocol error: it is the plugin
+ * claiming the route does not exist, so it reproduces WordPress's own rest_no_route body,
+ * message, and status code. No OAuth RFC covers a disabled endpoint, so nothing here is
+ * being violated. Use aafm_oauth_rest_protocol_error() for every actual OAuth error.
+ *
+ * Two things still tell this apart from a genuinely unregistered route, though neither
+ * undermines the purpose above. WordPress calls set_matched_route() on this WP_Error branch
+ * (the route WAS matched, it just answers with a 404), so rest_send_allow_header() fires and
+ * the response carries an Allow: POST header that a truly unregistered path never sends.
+ * The message string also lives in our agent-abilities-for-mcp text domain rather than
+ * core's default domain, so a localized site translates core's own rest_no_route text but
+ * not this copy of it.
+ *
+ * @return \WP_Error
+ */
+function aafm_oauth_rest_disabled_route(): WP_Error {
+	return new WP_Error(
+		'rest_no_route',
+		__( 'No route was found matching the URL and request method.', 'agent-abilities-for-mcp' ),
+		array( 'status' => 404 )
+	);
+}
+
+/**
+ * Read OAuth parameters from a request, merging JSON and form-encoded bodies.
+ *
+ * RFC 6749 §4.1.3 prescribes application/x-www-form-urlencoded for the token
+ * endpoint; RFC 7591 uses JSON for registration. Real agents send both at both
+ * endpoints, so the handlers accept either. WP_REST_Request::get_param() already
+ * merges JSON and form params for most methods, but for a POST it parses the body
+ * only when the web server populated $_POST (see WP_REST_Request::get_parameter_order()).
+ * A directly-dispatched POST whose body was set with set_body() is therefore never
+ * parsed. This helper closes that gap: it reads JSON params and the (force-parsed)
+ * body params and returns a single merged map, JSON winning on a key collision.
+ *
+ * @param \WP_REST_Request $request The incoming request.
+ * @return array<string,mixed> Merged parameter map (form body under JSON).
+ */
+function aafm_oauth_rest_params( WP_REST_Request $request ): array {
+	$body = $request->get_body_params();
+	if ( empty( $body ) ) {
+		$content_type = $request->get_content_type();
+		$subtype      = is_array( $content_type ) && isset( $content_type['value'] ) ? (string) $content_type['value'] : '';
+		$raw          = (string) $request->get_body();
+
+		if ( '' !== $raw && false !== strpos( $subtype, 'application/x-www-form-urlencoded' ) ) {
+			$parsed = array();
+			parse_str( $raw, $parsed );
+			$body = $parsed;
+		}
+	}
+
+	$json = $request->get_json_params();
+	if ( ! is_array( $json ) ) {
+		$json = array();
+	}
+
+	if ( ! is_array( $body ) ) {
+		$body = array();
+	}
+
+	// JSON wins over the form body on a key collision.
+	return array_merge( $body, $json );
+}
+
+/**
+ * Read a single OAuth string parameter from the merged JSON/form body.
+ *
+ * @param \WP_REST_Request $request The incoming request.
+ * @param string           $key     The parameter name.
+ * @return string The parameter value cast to string, or '' when absent or non-scalar.
+ */
+function aafm_oauth_rest_param( WP_REST_Request $request, string $key ): string {
+	$params = aafm_oauth_rest_params( $request );
+
+	if ( ! isset( $params[ $key ] ) || ! is_scalar( $params[ $key ] ) ) {
+		return '';
+	}
+
+	return (string) $params[ $key ];
+}
+
+/**
+ * Enforce the shared transport-security policy for an OAuth endpoint.
+ *
+ * @return \WP_REST_Response|null A 400 error when HTTPS is required but the request is plain HTTP, otherwise null.
+ */
+function aafm_oauth_rest_require_https() {
+	if ( aafm_oauth_https_required() && ! is_ssl() ) {
+		return aafm_oauth_rest_protocol_error(
+			'invalid_request',
+			__( 'This endpoint requires HTTPS.', 'agent-abilities-for-mcp' ),
+			400
+		);
+	}
+
+	return null;
+}
+
+/**
+ * POST /register - dynamic client registration (RFC 7591).
+ *
+ * Gated on both the OAuth and DCR toggles (404 when either is off), HTTPS-only in
+ * production, and rate-limited. Delegates validation and storage to
+ * aafm_oauth_register_client() and echoes back the public-client metadata.
+ *
+ * @param \WP_REST_Request $request The incoming request.
+ * @return \WP_REST_Response|\WP_Error
+ */
+function aafm_oauth_rest_register( WP_REST_Request $request ) {
+	if ( ! aafm_oauth_enabled() || ! aafm_oauth_dcr_enabled() ) {
+		return aafm_oauth_rest_disabled_route();
+	}
+
+	$https = aafm_oauth_rest_require_https();
+	if ( null !== $https ) {
+		return $https;
+	}
+
+	if ( ! aafm_oauth_rate_ok( 'register', 10, 100 ) ) {
+		return aafm_oauth_rest_rate_limited_error(
+			__( 'Too many registration requests. Try again shortly.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	/**
+	 * Soft cap on active clients. Filterable so a large fleet can lift it deliberately.
+	 *
+	 * @param int $max Maximum active clients. Default AAFM_OAUTH_MAX_ACTIVE_CLIENTS.
+	 */
+	$max_clients = (int) apply_filters( 'aafm_oauth_max_clients', AAFM_OAUTH_MAX_ACTIVE_CLIENTS );
+	if ( $max_clients > 0 ) {
+		$active_view = aafm_oauth_count_active_clients_view();
+		// An unreadable count must deny the same as a confirmed cap: casting a failed read to 0
+		// active clients read the cap as spare capacity and let the public registration route
+		// grow unbounded during an outage.
+		if ( ! $active_view['ok'] || $active_view['count'] >= $max_clients ) {
+			return aafm_oauth_rest_protocol_error(
+				'temporarily_unavailable',
+				__( 'Client registration is temporarily unavailable. Please try again later.', 'agent-abilities-for-mcp' ),
+				503
+			);
+		}
+	}
+
+	$params = aafm_oauth_rest_params( $request );
+
+	$redirect_uris = isset( $params['redirect_uris'] ) && is_array( $params['redirect_uris'] ) ? $params['redirect_uris'] : array();
+	$client_name   = isset( $params['client_name'] ) && is_scalar( $params['client_name'] ) ? (string) $params['client_name'] : '';
+
+	// Refuse an abusive client_name outright rather than silently truncating it. Counted with
+	// mb_strlen(), matching the character-length semantics of the VARCHAR(191) storage column
+	// this guard mirrors - a byte count would reject or admit multibyte names inconsistently
+	// with what the column actually holds.
+	if ( mb_strlen( $client_name, 'UTF-8' ) > AAFM_OAUTH_MAX_CLIENT_NAME_LEN ) {
+		return aafm_oauth_rest_protocol_error(
+			'invalid_client_metadata',
+			__( 'The client name is too long.', 'agent-abilities-for-mcp' ),
+			400
+		);
+	}
+
+	$grant_types    = isset( $params['grant_types'] ) && is_array( $params['grant_types'] ) ? $params['grant_types'] : array( 'authorization_code', 'refresh_token' );
+	$response_types = isset( $params['response_types'] ) && is_array( $params['response_types'] ) ? $params['response_types'] : array( 'code' );
+
+	$result = aafm_oauth_register_client(
+		array(
+			'redirect_uris'  => $redirect_uris,
+			'client_name'    => $client_name,
+			'grant_types'    => $grant_types,
+			'response_types' => $response_types,
+		)
+	);
+
+	if ( is_wp_error( $result ) ) {
+		// aafm_oauth_register_client()'s 'registration_failed' code means the
+		// INSERT itself failed - an operational fault, not a problem with what the client sent.
+		// Folding it into invalid_client_metadata told a client with a perfectly valid request that
+		// its metadata was rejected, when the server was the one that failed.
+		if ( 'registration_failed' === $result->get_error_code() ) {
+			return aafm_oauth_rest_protocol_error(
+				'server_error',
+				$result->get_error_message(),
+				500
+			);
+		}
+		return aafm_oauth_rest_protocol_error(
+			'invalid_redirect_uri' === $result->get_error_code() ? 'invalid_redirect_uri' : 'invalid_client_metadata',
+			$result->get_error_message(),
+			400
+		);
+	}
+
+	// Audit the registration: a new client now exists on the public DCR endpoint. Records the
+	// client_id and its first redirect host so an operator can spot attacker self-registration.
+	$first_uri = isset( $result['redirect_uris'][0] ) ? (string) $result['redirect_uris'][0] : '';
+	aafm_oauth_log_event(
+		'register',
+		'success',
+		array(
+			'client_id'     => $result['client_id'],
+			'redirect_host' => aafm_oauth_audit_host_from_uri( $first_uri ),
+		)
+	);
+
+	$response = new WP_REST_Response(
+		array(
+			'client_id'                  => $result['client_id'],
+			'client_name'                => $result['client_name'],
+			'redirect_uris'              => $result['redirect_uris'],
+			// Echo the FILTERED grant/response types the server actually registered (only the
+			// supported set), not the raw client-supplied values.
+			'grant_types'                => $result['grant_types'],
+			'response_types'             => $result['response_types'],
+			'token_endpoint_auth_method' => 'none',
+		),
+		201
+	);
+
+	return aafm_oauth_rest_no_store( $response );
+}
+
+/**
+ * POST /token - the authorization_code and refresh_token grants.
+ *
+ * Gated on the OAuth toggle (404 when off), HTTPS-only in production, and
+ * rate-limited. Dispatches on grant_type: authorization_code redeems the code and
+ * verifies PKCE before minting tokens; refresh_token rotates via the token
+ * manager (which runs its own transaction). Unknown grants are 400.
+ *
+ * @param \WP_REST_Request $request The incoming request.
+ * @return \WP_REST_Response|\WP_Error
+ */
+function aafm_oauth_rest_token( WP_REST_Request $request ) {
+	if ( ! aafm_oauth_enabled() ) {
+		return aafm_oauth_rest_disabled_route();
+	}
+
+	$https = aafm_oauth_rest_require_https();
+	if ( null !== $https ) {
+		return $https;
+	}
+
+	if ( ! aafm_oauth_rate_ok( 'token', 30, 300 ) ) {
+		return aafm_oauth_rest_rate_limited_error(
+			__( 'Too many token requests. Try again shortly.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	$grant_type = aafm_oauth_rest_param( $request, 'grant_type' );
+
+	if ( 'authorization_code' === $grant_type ) {
+		return aafm_oauth_rest_token_authorization_code( $request );
+	}
+
+	if ( 'refresh_token' === $grant_type ) {
+		return aafm_oauth_rest_token_refresh( $request );
+	}
+
+	return aafm_oauth_rest_protocol_error(
+		'unsupported_grant_type',
+		__( 'The grant type is missing or not supported.', 'agent-abilities-for-mcp' ),
+		400
+	);
+}
+
+/**
+ * Handle the authorization_code grant on the token endpoint.
+ *
+ * @param \WP_REST_Request $request The incoming request.
+ * @return \WP_REST_Response
+ */
+function aafm_oauth_rest_token_authorization_code( WP_REST_Request $request ): WP_REST_Response {
+	$code          = aafm_oauth_rest_param( $request, 'code' );
+	$redirect_uri  = aafm_oauth_rest_param( $request, 'redirect_uri' );
+	$client_id     = aafm_oauth_rest_param( $request, 'client_id' );
+	$code_verifier = aafm_oauth_rest_param( $request, 'code_verifier' );
+
+	$invalid_grant = aafm_oauth_rest_protocol_error(
+		'invalid_grant',
+		__( 'The authorization grant is invalid.', 'agent-abilities-for-mcp' ),
+		400
+	);
+
+	if ( '' === $code || '' === $redirect_uri || '' === $client_id || '' === $code_verifier ) {
+		return $invalid_grant;
+	}
+
+	// Length bounds BEFORE redemption: an out-of-range field is rejected up front so
+	// an over-long verifier can never burn an otherwise-valid code, and no oversized
+	// string reaches hashing or the DB. RFC 7636 fixes the verifier at 43-128 chars.
+	$verifier_len = strlen( $code_verifier );
+	if (
+		aafm_oauth_field_too_long( $code )
+		|| aafm_oauth_field_too_long( $redirect_uri )
+		|| aafm_oauth_field_too_long( $client_id )
+		|| $verifier_len < AAFM_OAUTH_PKCE_VERIFIER_MIN
+		|| $verifier_len > AAFM_OAUTH_PKCE_VERIFIER_MAX
+	) {
+		return $invalid_grant;
+	}
+
+	// A deactivated client cannot redeem a code minted before it was disabled - is_active is
+	// only checked at authorize-time otherwise, so re-check it here.
+	$client_view = aafm_oauth_client_deactivation_view( $client_id );
+	if ( $client_view['deactivated'] ) {
+		// A failed read fails closed (denies), but
+		// reporting that to the client as invalid_grant misstates the cause - it is this
+		// pipeline's own fault, not a finding about the client's registration.
+		// aafm_oauth_client_deactivation_view() answers both from the one read, replacing
+		// the query-per-decision pair this site used to run.
+		if ( ! $client_view['ok'] ) {
+			return aafm_oauth_rest_protocol_error(
+				'server_error',
+				__( 'The access token could not be issued.', 'agent-abilities-for-mcp' ),
+				500
+			);
+		}
+		return $invalid_grant;
+	}
+
+	// Consume the code and mint the token pair as one atomic unit. aafm_oauth_redeem_code()'s
+	// single UPDATE still enforces one-time use under concurrency - its row lock blocks a second
+	// redeemer until this transaction resolves - so the transaction only governs whether a LATER
+	// failure keeps or releases the consumption. An invalid presentation (revoked consent, wrong
+	// PKCE verifier) deliberately COMMITs the burn so the code cannot be replayed or brute-forced;
+	// a token-mint failure ROLLBACKs so a transient DB error does not permanently burn an
+	// otherwise-valid, unexpired code and force the user back through the browser. This mirrors
+	// aafm_oauth_rotate_refresh(), including the nesting bound that function's comment now states
+	// in full: START TRANSACTION implicitly commits an already-open transaction rather than
+	// nesting inside it, so the claim that used to sit here about it being a harmless no-op under
+	// the test harness was false. Read that comment before changing either site; both carry the
+	// same shape and the fix, if one is ever worth making, belongs to both at once.
+	// If the transaction itself never started, nothing below is actually wrapped - refuse
+	// the redemption rather than run the consume+mint pair unprotected. Same check tokens.php's
+	// aafm_oauth_rotate_refresh() uses for its own START TRANSACTION.
+	if ( ! aafm_oauth_txn( 'START TRANSACTION' ) ) {
+		return aafm_oauth_rest_protocol_error(
+			'server_error',
+			__( 'The access token could not be issued.', 'agent-abilities-for-mcp' ),
+			500
+		);
+	}
+
+	// Atomic one-time redemption, with the client_id + redirect_uri binding
+	// enforced inside aafm_oauth_redeem_code().
+	$row = aafm_oauth_redeem_code( $code, $client_id, $redirect_uri );
+	if ( is_wp_error( $row ) ) {
+		// Nothing was consumed (0 rows affected) or the consuming UPDATE/readback itself failed -
+		// rolling back is safe either way: a clean no-op in the first case, and in the second it
+		// un-burns a code this pipeline could not confirm was actually redeemed, so an otherwise-
+		// valid code stays usable on retry instead of being lost to an operational fault.
+		// Fire an action rather than discard the outcome outright, matching every other rollback
+		// site in this pipeline.
+		if ( ! aafm_oauth_txn( 'ROLLBACK' ) ) {
+			do_action( 'aafm_oauth_rollback_failed', 'token_redeem_code', $client_id );
+		}
+		// aafm_oauth_redeem_code() used to signal every failure as invalid_grant, so this
+		// site could not tell a genuinely bad code from its own database fault. It now
+		// distinguishes the two through the returned error code, the same way the mint failure
+		// below is already handled.
+		if ( 'invalid_grant' !== $row->get_error_code() ) {
+			return aafm_oauth_rest_protocol_error(
+				'server_error',
+				__( 'The access token could not be issued.', 'agent-abilities-for-mcp' ),
+				500
+			);
+		}
+		return $invalid_grant;
+	}
+
+	// Re-check that the user still consents to this client at REDEMPTION, not only at authorize
+	// time. An admin can revoke the grant in the window between the authorize GET (which minted
+	// this code after passing the consent check) and this token call, and the revoke handler can
+	// only delete codes that already exist - a code minted just after its aafm_oauth_delete_consent()
+	// step slips through. Without this, that orphaned code would redeem into a usable token after
+	// the UI reported the revoke landed. The code is already consumed above (a legitimate one-time
+	// use), so COMMIT the burn and yield invalid_grant.
+	// A grant past its end date is refused the same way (the code burns); one whose state cannot be
+	// read rolls back like a failed consent read.
+	$consent = aafm_oauth_consent_view( (int) $row['wp_user_id'], (string) $row['client_id'] );
+	$gate    = $consent['ok'] && $consent['value'] ? aafm_oauth_grant_gate( (int) $row['wp_user_id'], (string) $row['client_id'] ) : 'ok';
+	if ( ! $consent['ok'] || ! $consent['value'] || 'ok' !== $gate ) {
+		// A failed read must fail closed (report no consent) but must not be told
+		// to the client as "your grant is invalid" - that permanently burns an otherwise-valid,
+		// unexpired code over a transient read failure that says nothing real about consent. Roll
+		// back instead so the code survives, and report the fault honestly. aafm_oauth_consent_view()
+		// answers both "is there a consent row" and "could this even be checked" from the one read,
+		// replacing the query-per-decision pair this site used to run.
+		if ( ! $consent['ok'] || 'unknown' === $gate ) {
+			if ( ! aafm_oauth_txn( 'ROLLBACK' ) ) {
+				do_action( 'aafm_oauth_rollback_failed', 'token_check_consent', $client_id );
+			}
+			return aafm_oauth_rest_protocol_error(
+				'server_error',
+				__( 'The access token could not be issued.', 'agent-abilities-for-mcp' ),
+				500
+			);
+		}
+
+		// A failed COMMIT here means the burn is not actually confirmed - the code could still be
+		// replayable - but this request is denied either way, so audit it distinctly rather than
+		// silently proceeding as if the burn landed.
+		if ( ! aafm_oauth_txn( 'COMMIT' ) && function_exists( 'aafm_oauth_log_event' ) ) {
+			aafm_oauth_log_event( 'token', 'error', array( 'client_id' => $client_id ) );
+		}
+		return $invalid_grant;
+	}
+
+	// PKCE: a failed verifier burns the (already-consumed) code, which is safe and stops a verifier
+	// brute-force, so COMMIT the consumption before rejecting.
+	if ( ! aafm_pkce_verify( $code_verifier, (string) $row['code_challenge'] ) ) {
+		// Same unconfirmed-burn note as the consent-revoked branch above.
+		if ( ! aafm_oauth_txn( 'COMMIT' ) && function_exists( 'aafm_oauth_log_event' ) ) {
+			aafm_oauth_log_event( 'token', 'error', array( 'client_id' => $client_id ) );
+		}
+		return $invalid_grant;
+	}
+
+	$tokens = aafm_oauth_mint_tokens(
+		array(
+			'client_id'  => (string) $row['client_id'],
+			'wp_user_id' => (int) $row['wp_user_id'],
+			'resource'   => (string) $row['resource'],
+			// Persist the scope the code was minted with so the token records it too (auditable;
+			// applied by the aafm_oauth_token_capabilities seam, which defaults to no restriction).
+			'scope'      => isset( $row['scope'] ) ? (string) $row['scope'] : '',
+		)
+	);
+
+	// A mint failure (the row never persisted) is a server_error, not a fake token response. Roll
+	// back so the consumption is undone and an unexpired code stays redeemable on a retry rather
+	// than being permanently burned by a transient error.
+	if ( is_wp_error( $tokens ) ) {
+		// A failed ROLLBACK does not change this response - it is already a server_error - but it
+		// does mean the stated recovery (the code stays redeemable) is not established. Fire
+		// an action rather than discard that outcome, matching every other rollback site here.
+		if ( ! aafm_oauth_txn( 'ROLLBACK' ) ) {
+			do_action( 'aafm_oauth_rollback_failed', 'token_mint', $client_id );
+		}
+		return aafm_oauth_rest_protocol_error(
+			'server_error',
+			__( 'The access token could not be issued.', 'agent-abilities-for-mcp' ),
+			500
+		);
+	}
+
+	// The token pair persisted: commit the consumption + mint together.
+	//
+	// A failed COMMIT means this pipeline cannot confirm the consumption and the new tokens
+	// actually landed together. Reporting the minted tokens anyway would hand the caller
+	// credentials this function cannot confirm persisted - refuse instead of claiming success for
+	// a write that was never confirmed committed.
+	if ( ! aafm_oauth_txn( 'COMMIT' ) ) {
+		return aafm_oauth_rest_protocol_error(
+			'server_error',
+			__( 'The access token could not be issued.', 'agent-abilities-for-mcp' ),
+			500
+		);
+	}
+
+	// Audit the mint: an access token now exists for this user + client. The raw token is never
+	// logged - only the actor and client, so the token's life is traceable from here.
+	$actor = aafm_exact_object( 'user', (int) $row['wp_user_id'] );
+	aafm_oauth_log_event(
+		'token',
+		'success',
+		array(
+			'client_id'  => (string) $row['client_id'],
+			'user_id'    => (int) $row['wp_user_id'],
+			'user_login' => $actor instanceof WP_User ? (string) $actor->user_login : '',
+		)
+	);
+
+	return aafm_oauth_rest_token_response( $tokens );
+}
+
+/**
+ * Handle the refresh_token grant on the token endpoint.
+ *
+ * @param \WP_REST_Request $request The incoming request.
+ * @return \WP_REST_Response
+ */
+function aafm_oauth_rest_token_refresh( WP_REST_Request $request ): WP_REST_Response {
+	$refresh_token = aafm_oauth_rest_param( $request, 'refresh_token' );
+	$client_id     = aafm_oauth_rest_param( $request, 'client_id' );
+
+	if (
+		'' === $refresh_token || '' === $client_id
+		|| aafm_oauth_field_too_long( $refresh_token )
+		|| aafm_oauth_field_too_long( $client_id )
+	) {
+		return aafm_oauth_rest_protocol_error(
+			'invalid_grant',
+			__( 'The refresh token grant is invalid.', 'agent-abilities-for-mcp' ),
+			400
+		);
+	}
+
+	// aafm_oauth_rotate_refresh() manages its own transaction - never wrap it.
+	$tokens = aafm_oauth_rotate_refresh( $refresh_token, $client_id );
+	if ( is_wp_error( $tokens ) ) {
+		// Audit the failed rotation. A rejected refresh includes the reuse-detection path (a
+		// replayed, already-consumed token), which is a compromise signal worth a trace row.
+		aafm_oauth_log_event( 'refresh', 'denied', array( 'client_id' => $client_id ) );
+
+		// aafm_oauth_rotate_refresh() returns 'invalid_grant' for every
+		// genuine grant-validity reason (unknown/expired/wrong-client/replayed token), but also
+		// returns an operational error - a failed START TRANSACTION, a failed successor mint, or a
+		// failed COMMIT - through the exact same is_wp_error() branch. Collapsing both into
+		// invalid_grant/400 told a client presenting a perfectly usable refresh token that its
+		// grant was rejected, when the server itself failed to process it. Only the genuine
+		// grant-validity code gets the client-facing message; anything else is this pipeline's own
+		// fault.
+		if ( 'invalid_grant' !== $tokens->get_error_code() ) {
+			return aafm_oauth_rest_protocol_error(
+				'server_error',
+				__( 'The access token could not be issued.', 'agent-abilities-for-mcp' ),
+				500
+			);
+		}
+
+		return aafm_oauth_rest_protocol_error(
+			'invalid_grant',
+			__( 'The refresh token grant is invalid.', 'agent-abilities-for-mcp' ),
+			400
+		);
+	}
+
+	// Audit the successful rotation: a fresh token pair replaced the presented refresh token.
+	aafm_oauth_log_event( 'refresh', 'success', array( 'client_id' => $client_id ) );
+
+	return aafm_oauth_rest_token_response( $tokens );
+}
+
+/**
+ * Build the 200 token response from a minted/rotated token set.
+ *
+ * @param array{access_token:string,refresh_token:string,expires_in:int} $tokens The token set.
+ * @return \WP_REST_Response
+ */
+function aafm_oauth_rest_token_response( array $tokens ): WP_REST_Response {
+	$response = new WP_REST_Response(
+		array(
+			'access_token'  => $tokens['access_token'],
+			'token_type'    => 'Bearer',
+			'expires_in'    => $tokens['expires_in'],
+			'refresh_token' => $tokens['refresh_token'],
+		),
+		200
+	);
+
+	return aafm_oauth_rest_no_store( $response );
+}
+
+/**
+ * POST /revoke - token revocation (RFC 7009).
+ *
+ * Gated on the OAuth toggle (404 when off), HTTPS-only in production, and
+ * rate-limited. Always returns 200 with an empty body regardless of whether the
+ * token existed, so token validity is never leaked.
+ *
+ * @param \WP_REST_Request $request The incoming request.
+ * @return \WP_REST_Response|\WP_Error
+ */
+function aafm_oauth_rest_revoke( WP_REST_Request $request ) {
+	if ( ! aafm_oauth_enabled() ) {
+		return aafm_oauth_rest_disabled_route();
+	}
+
+	$https = aafm_oauth_rest_require_https();
+	if ( null !== $https ) {
+		return $https;
+	}
+
+	if ( ! aafm_oauth_rate_ok( 'revoke', 30, 300 ) ) {
+		return aafm_oauth_rest_rate_limited_error(
+			__( 'Too many revocation requests. Try again shortly.', 'agent-abilities-for-mcp' )
+		);
+	}
+
+	$token = aafm_oauth_rest_param( $request, 'token' );
+	if ( '' !== $token ) {
+		$revoked = aafm_oauth_revoke_token( $token );
+
+		// Null means the query itself failed, not "no matching token" - RFC 7009 protects
+		// TOKEN VALIDITY from disclosure, never server operational state, so a genuine failure is
+		// reported distinctly rather than folded into the same 200 an unknown/already-revoked
+		// token gets. The raw token is never logged either way.
+		if ( null === $revoked ) {
+			aafm_oauth_log_event( 'revoke', 'error' );
+			return aafm_oauth_rest_protocol_error(
+				'server_error',
+				__( 'The token could not be revoked.', 'agent-abilities-for-mcp' ),
+				500
+			);
+		}
+
+		// Audit only an actual revocation (a matched, still-active token), so a probe with a
+		// bogus token does not create noise.
+		if ( $revoked && function_exists( 'aafm_oauth_log_event' ) ) {
+			aafm_oauth_log_event( 'revoke', 'success' );
+		}
+	}
+
+	// RFC 7009: a successful revocation (or a no-op for an unknown token) is 200
+	// with an empty body. Never signal whether the token existed.
+	$response = new WP_REST_Response( null, 200 );
+
+	return aafm_oauth_rest_no_store( $response );
+}

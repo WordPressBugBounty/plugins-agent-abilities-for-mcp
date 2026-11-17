@@ -1,0 +1,802 @@
+<?php
+/**
+ * WooCommerce integration abilities - customer reads and writes (sub-slice W4-WC3).
+ *
+ * Registers ONLY when WooCommerce is active (aafm_integration_active('woocommerce')); a host-inactive
+ * site contributes zero entries to the registry. Every ability gates on the flat, object-independent
+ * manage_woocommerce capability and falls through to its real permission_callback at discovery (no
+ * server.php case); wc-create-customer adds create_users on top, because it creates a real
+ * WordPress user account, and wc-list-customers / wc-get-customer add list_users on top, because
+ * manage_woocommerce alone lets a caller read PII for any WordPress user, not just customers. Shared
+ * helpers live in _shared.php, loaded before this file.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter( 'aafm_abilities_registry', 'aafm_register_wc_customers_definitions' );
+add_filter( 'aafm_abilities_registry_integrations', 'aafm_register_wc_customers_full_definitions' );
+
+/**
+ * Contribute the WooCommerce customers definitions to the registry, but only when WooCommerce is
+ * active. Host inactive: the registry is returned unchanged.
+ *
+ * @param array<string,array<string,mixed>> $registry Registry.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_wc_customers_definitions( array $registry ): array {
+	if ( ! aafm_integration_active( 'woocommerce' ) ) {
+		return $registry; // Host inactive: contribute nothing.
+	}
+
+	return array_merge( $registry, aafm_wc_customers_registry_definitions() );
+}
+
+/**
+ * Contribute the WooCommerce customer definitions to the guard-independent full registry view.
+ *
+ * Unguarded by design: the full view (aafm_get_abilities_registry_full()) enumerates every
+ * WooCommerce ability even when WooCommerce is inactive, for the Integrations tab and the manifest.
+ * The live registration path never reads this filter, so an inactive host still exposes zero tools.
+ *
+ * @param array<string,array<string,mixed>> $registry Integration rows accumulator.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_wc_customers_full_definitions( array $registry ): array {
+	return array_merge( $registry, aafm_wc_customers_registry_definitions() );
+}
+
+/**
+ * The WooCommerce customer registry rows, keyed by ability name. The single source of truth for
+ * these abilities' label, description, group, risk, and args builder - consumed by both the
+ * host-guarded live registration callback and the unguarded full-view callback.
+ *
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_wc_customers_registry_definitions(): array {
+	return array(
+		// Customers (sub-slice W4-WC3) - PII-exposing abilities gated on manage_woocommerce.
+		'aafm/wc-list-customers'  => array(
+			'label'        => __( 'List WooCommerce customers', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Lists WooCommerce customers with their id, email, name, username, order count, and total spent. Customer email is returned in full under the Integrations security disclaimer. Requires the manage-WooCommerce and list-users capabilities: this reads PII for the WordPress users matched by the role filter, not only genuine customers.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_list_customers',
+		),
+
+		'aafm/wc-get-customer'    => array(
+			'label'        => __( 'Get WooCommerce customer', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Reads one WooCommerce customer by id, including email, name, username, order count, total spent, date created, and the full billing address (including phone) and shipping address. Customer PII is returned in full under the Integrations security disclaimer. Requires the manage-WooCommerce and list-users capabilities: the id is any WordPress user id, not only genuine customers.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_get_customer',
+		),
+
+		'aafm/wc-create-customer' => array(
+			'label'        => __( 'Create WooCommerce customer', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Creates a WooCommerce customer from an email and username, with optional first name, last name, and billing/shipping address. Returns the full customer shape including PII under the Integrations security disclaimer. Creates a real WordPress user account, so it requires the create-users capability as well as the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'writes',
+			'risk'         => 'write',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_create_customer',
+		),
+
+		'aafm/wc-update-customer' => array(
+			'label'        => __( 'Update WooCommerce customer', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Updates a WooCommerce customer by id, changing only the fields you send. An empty request body is a no-op success. Returns the full customer shape. Requires the manage-WooCommerce capability, the edit-users capability, and permission to edit that user. It stays locked until High-risk abilities is turned on under Settings.', 'agent-abilities-for-mcp' ),
+			'group'        => 'writes',
+			'risk'         => 'write',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_update_customer',
+		),
+
+	);
+}
+
+// =============================================================================
+// WC3 -- Customers: list, get, create, update
+// All abilities gate on the flat, object-independent manage_woocommerce cap
+// (aafm_wc_perm); create additionally requires create_users, since it creates a
+// real WordPress account (aafm_perm_wc_create_customer).
+// None needs a server.php case - they fall through at discovery.
+// Customer PII (email, billing phone, billing/shipping addresses) is returned in
+// full under the Integrations security disclaimer (aafm_woocommerce_disclaimer).
+// =============================================================================
+
+// -------------------------------------------------------------------------
+// Shared helpers
+// -------------------------------------------------------------------------
+
+/**
+ * Resolve a customer id to a WC_Customer object, or null when the id is unknown or WooCommerce
+ * is unavailable.
+ *
+ * @param int $id Customer id.
+ * @return \WC_Customer|null
+ */
+function aafm_wc_get_customer_object( int $id ): ?\WC_Customer {
+	if ( ! class_exists( 'WC_Customer' ) ) {
+		return null;
+	}
+	// The core customer store reads the user by id, so load that user exactly first.
+	if ( false !== aafm_wc_store_is_core( 'customer' ) && ! aafm_exact_object( 'user', $id ) instanceof WP_User ) {
+		return null;
+	}
+	// WooCommerce exposes no wc_get_customer() helper; instantiate WC_Customer directly. A
+	// non-existent id leaves the object empty, so get_id() returns 0 - treat that as "not found".
+	// WC_Customer's constructor already catches the data-store "Invalid customer" exception and
+	// zeroes the id, but guard the call so any other WC version/edge case returns not-found rather
+	// than surfacing a raw exception.
+	try {
+		$customer = new \WC_Customer( $id );
+	} catch ( \Exception $e ) {
+		return null;
+	}
+	if ( $customer->get_id() !== $id ) {
+		return null;
+	}
+	return $customer;
+}
+
+
+/**
+ * The shared writable customer properties (create + update input schemas).
+ *
+ * Both billing{} and shipping{} carry additionalProperties:false (MEDIUM-4 closed-schema
+ * security control): any key outside the declared set - e.g. billing.role - is rejected by
+ * the Abilities API before the executor runs, so a nested-smuggle attack cannot bypass the
+ * field-level sanitise layer.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_wc_customer_write_properties(): array {
+	return array(
+		'first_name' => array(
+			'type'        => 'string',
+			'description' => __( "Customer's first name.", 'agent-abilities-for-mcp' ),
+		),
+		'last_name'  => array(
+			'type'        => 'string',
+			'description' => __( "Customer's last name.", 'agent-abilities-for-mcp' ),
+		),
+		'billing'    => array(
+			'type'                 => 'object',
+			'description'          => __( 'Billing address fields to set on the customer account. Only the sub-fields included in the request are applied; other billing fields are left unchanged (on update) or blank (on create).', 'agent-abilities-for-mcp' ),
+			'properties'           => aafm_wc_address_schema_props( 'billing' ),
+			'additionalProperties' => false,
+		),
+		'shipping'   => array(
+			'type'                 => 'object',
+			'description'          => __( 'Shipping address fields to set on the customer account (no email or phone; those are billing-only). Only the sub-fields included in the request are applied; other shipping fields are left unchanged (on update) or blank (on create).', 'agent-abilities-for-mcp' ),
+			'properties'           => aafm_wc_address_schema_props( 'shipping' ),
+			'additionalProperties' => false,
+		),
+	);
+}
+
+/**
+ * The full customer output shape (list row is a lean subset of this).
+ *
+ * @return array<string,mixed>
+ */
+function aafm_wc_customer_output_properties(): array {
+	return array(
+		'id'           => array( 'type' => 'integer' ),
+		'email'        => array( 'type' => 'string' ),
+		'first_name'   => array( 'type' => 'string' ),
+		'last_name'    => array( 'type' => 'string' ),
+		'username'     => array( 'type' => 'string' ),
+		'orders_count' => array( 'type' => 'integer' ),
+		'total_spent'  => array( 'type' => 'string' ),
+		'date_created' => array( 'type' => array( 'string', 'null' ) ),
+		'billing'      => array(
+			'type'                 => 'object',
+			'properties'           => aafm_wc_address_schema_props( 'billing' ),
+			'additionalProperties' => false,
+		),
+		'shipping'     => array(
+			'type'                 => 'object',
+			'properties'           => aafm_wc_address_schema_props( 'shipping' ),
+			'additionalProperties' => false,
+		),
+	);
+}
+
+/**
+ * Assemble the lean list-row shape for one customer (no address details).
+ *
+ * @param \WC_Customer $customer Customer object.
+ * @return array<string,mixed>
+ */
+function aafm_redact_wc_customer( \WC_Customer $customer ): array {
+	return array(
+		'id'           => $customer->get_id(),
+		'email'        => $customer->get_email(),
+		'first_name'   => $customer->get_first_name(),
+		'last_name'    => $customer->get_last_name(),
+		'username'     => $customer->get_username(),
+		'orders_count' => $customer->get_order_count(),
+		'total_spent'  => $customer->get_total_spent(),
+	);
+}
+
+/**
+ * Assemble the full rich customer shape including billing/shipping addresses.
+ *
+ * Billing and shipping objects always return as objects ({}) even when all fields are empty,
+ * matching the empty-map contract: (object) array() prevents JSON serialisation as [].
+ *
+ * @param \WC_Customer $customer Customer object.
+ * @return array<string,mixed>
+ */
+function aafm_rich_wc_customer( \WC_Customer $customer ): array {
+	$billing          = array(
+		'first_name' => $customer->get_billing_first_name(),
+		'last_name'  => $customer->get_billing_last_name(),
+		'company'    => $customer->get_billing_company(),
+		'address_1'  => $customer->get_billing_address_1(),
+		'address_2'  => $customer->get_billing_address_2(),
+		'city'       => $customer->get_billing_city(),
+		'state'      => $customer->get_billing_state(),
+		'postcode'   => $customer->get_billing_postcode(),
+		'country'    => $customer->get_billing_country(),
+		'email'      => $customer->get_billing_email(),
+		'phone'      => $customer->get_billing_phone(),
+	);
+	$is_billing_empty = '' === implode( '', $billing );
+
+	$shipping          = array(
+		'first_name' => $customer->get_shipping_first_name(),
+		'last_name'  => $customer->get_shipping_last_name(),
+		'company'    => $customer->get_shipping_company(),
+		'address_1'  => $customer->get_shipping_address_1(),
+		'address_2'  => $customer->get_shipping_address_2(),
+		'city'       => $customer->get_shipping_city(),
+		'state'      => $customer->get_shipping_state(),
+		'postcode'   => $customer->get_shipping_postcode(),
+		'country'    => $customer->get_shipping_country(),
+	);
+	$is_shipping_empty = '' === implode( '', $shipping );
+
+	return array(
+		'id'           => $customer->get_id(),
+		'email'        => $customer->get_email(),
+		'first_name'   => $customer->get_first_name(),
+		'last_name'    => $customer->get_last_name(),
+		'username'     => $customer->get_username(),
+		'orders_count' => $customer->get_order_count(),
+		'total_spent'  => $customer->get_total_spent(),
+		'date_created' => aafm_wc_date_string( $customer->get_date_created() ),
+		'billing'      => $is_billing_empty ? (object) array() : $billing,
+		'shipping'     => $is_shipping_empty ? (object) array() : $shipping,
+	);
+}
+
+/**
+ * Apply validated write-input fields to a WC_Customer instance (shared by create + update).
+ *
+ * Only keys present in $input are applied - missing keys are not zeroed - so update is a true
+ * partial PATCH and create only sets what was provided.
+ *
+ * @param \WC_Customer        $customer Customer object to mutate.
+ * @param array<string,mixed> $input    Validated input.
+ * @return void
+ */
+function aafm_wc_apply_customer_input( \WC_Customer $customer, array $input ): void {
+	if ( array_key_exists( 'first_name', $input ) ) {
+		$customer->set_first_name( aafm_sanitize_plain_text( (string) $input['first_name'] ) );
+	}
+	if ( array_key_exists( 'last_name', $input ) ) {
+		$customer->set_last_name( aafm_sanitize_plain_text( (string) $input['last_name'] ) );
+	}
+
+	if ( isset( $input['billing'] ) && is_array( $input['billing'] ) ) {
+		$b = $input['billing'];
+		if ( array_key_exists( 'first_name', $b ) ) {
+			$customer->set_billing_first_name( aafm_sanitize_plain_text( (string) $b['first_name'] ) ); }
+		if ( array_key_exists( 'last_name', $b ) ) {
+			$customer->set_billing_last_name( aafm_sanitize_plain_text( (string) $b['last_name'] ) ); }
+		if ( array_key_exists( 'company', $b ) ) {
+			$customer->set_billing_company( aafm_sanitize_plain_text( (string) $b['company'] ) ); }
+		if ( array_key_exists( 'address_1', $b ) ) {
+			$customer->set_billing_address_1( aafm_sanitize_plain_text( (string) $b['address_1'] ) ); }
+		if ( array_key_exists( 'address_2', $b ) ) {
+			$customer->set_billing_address_2( aafm_sanitize_plain_text( (string) $b['address_2'] ) ); }
+		if ( array_key_exists( 'city', $b ) ) {
+			$customer->set_billing_city( aafm_sanitize_plain_text( (string) $b['city'] ) ); }
+		if ( array_key_exists( 'state', $b ) ) {
+			$customer->set_billing_state( aafm_sanitize_plain_text( (string) $b['state'] ) ); }
+		if ( array_key_exists( 'postcode', $b ) ) {
+			$customer->set_billing_postcode( aafm_sanitize_plain_text( (string) $b['postcode'] ) ); }
+		if ( array_key_exists( 'country', $b ) ) {
+			$customer->set_billing_country( aafm_sanitize_plain_text( (string) $b['country'] ) ); }
+		if ( array_key_exists( 'email', $b ) ) {
+			$customer->set_billing_email( sanitize_email( (string) $b['email'] ) ); }
+		if ( array_key_exists( 'phone', $b ) ) {
+			$customer->set_billing_phone( aafm_sanitize_plain_text( (string) $b['phone'] ) ); }
+	}
+
+	if ( isset( $input['shipping'] ) && is_array( $input['shipping'] ) ) {
+		$s = $input['shipping'];
+		if ( array_key_exists( 'first_name', $s ) ) {
+			$customer->set_shipping_first_name( aafm_sanitize_plain_text( (string) $s['first_name'] ) ); }
+		if ( array_key_exists( 'last_name', $s ) ) {
+			$customer->set_shipping_last_name( aafm_sanitize_plain_text( (string) $s['last_name'] ) ); }
+		if ( array_key_exists( 'company', $s ) ) {
+			$customer->set_shipping_company( aafm_sanitize_plain_text( (string) $s['company'] ) ); }
+		if ( array_key_exists( 'address_1', $s ) ) {
+			$customer->set_shipping_address_1( aafm_sanitize_plain_text( (string) $s['address_1'] ) ); }
+		if ( array_key_exists( 'address_2', $s ) ) {
+			$customer->set_shipping_address_2( aafm_sanitize_plain_text( (string) $s['address_2'] ) ); }
+		if ( array_key_exists( 'city', $s ) ) {
+			$customer->set_shipping_city( aafm_sanitize_plain_text( (string) $s['city'] ) ); }
+		if ( array_key_exists( 'state', $s ) ) {
+			$customer->set_shipping_state( aafm_sanitize_plain_text( (string) $s['state'] ) ); }
+		if ( array_key_exists( 'postcode', $s ) ) {
+			$customer->set_shipping_postcode( aafm_sanitize_plain_text( (string) $s['postcode'] ) ); }
+		if ( array_key_exists( 'country', $s ) ) {
+			$customer->set_shipping_country( aafm_sanitize_plain_text( (string) $s['country'] ) ); }
+	}
+}
+
+/**
+ * Permission floor for aafm/wc-list-customers and aafm/wc-get-customer: manage_woocommerce plus
+ * list_users.
+ *
+ * The manage_woocommerce capability alone lets a caller read PII for any WordPress user, not just
+ * customers. wc-list-customers' role input carries no enum and is passed straight into
+ * WP_User_Query, so role=administrator returns every admin's id, email, username, order count, and
+ * total spent. wc-get-customer constructs a WC_Customer for any WordPress user id with no role
+ * check at all, returning that user's full profile including billing/shipping address and phone.
+ * WordPress core deliberately withholds list_users from the stock Shop Manager role - a Shop
+ * Manager cannot open wp-admin -> Users - so manage_woocommerce was never meant to grant "read
+ * any account's PII."
+ * Requiring list_users on top closes that gap the same way aafm_perm_wc_create_customer() (below)
+ * requires create_users on top for the write side.
+ *
+ * Compatibility note: an existing install whose agent-facing user or role holds manage_woocommerce
+ * but not list_users will see these two reads start failing (permission denied) after this change. A
+ * stock WordPress administrator is unaffected, since administrators hold list_users by default. A
+ * stock WooCommerce Shop Manager does NOT hold list_users and is now denied here, matching what that
+ * role already can't do in wp-admin. Only a custom role built specifically to hold manage_woocommerce
+ * without list_users loses access - which is exactly the gap this closes.
+ *
+ * Deliberately NOT folded into aafm_wc_perm() (_shared.php): that floor is shared by every
+ * WooCommerce ability, and adding list_users there would gate reading an order list on a
+ * user-management capability it has nothing to do with.
+ *
+ * Takes no object id, so both abilities stay object-independent and still fall through to this
+ * callback at discovery with empty input, exactly as aafm_wc_perm() documents. No server.php case is
+ * needed.
+ *
+ * @return bool
+ */
+function aafm_perm_wc_customer_pii_read(): bool {
+	return aafm_wc_perm() && current_user_can( 'list_users' );
+}
+
+/**
+ * Write gate for aafm/wc-update-customer: the WooCommerce floor PLUS a real user-management
+ * capability on the target account.
+ *
+ * The read siblings require list_users on top of aafm_wc_perm(); the update path both reads and
+ * writes a user's billing/shipping PII, so it must be gated at least as strongly. Mirrors
+ * aafm_perm_update_user(): the object-independent edit_users floor comes first (edit_user($id) alone
+ * is true for every user against their own id via map_meta_cap's self short-circuit, so without the
+ * floor a manage_woocommerce holder could reach this on any account and read or overwrite its PII),
+ * then the per-object edit_user check gates the specific target. A stock WooCommerce Shop Manager
+ * holds edit_users and is unaffected; only a custom role built with manage_woocommerce but no
+ * user-editing capability loses access, which is exactly the gap this closes.
+ *
+ * Returns false with empty input (no customer_id), so discovery falls back to the object-independent
+ * floor in server.php; this per-object check still runs at execute time.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return bool
+ */
+function aafm_perm_wc_update_customer( array $input ): bool {
+	$id = isset( $input['customer_id'] ) ? absint( $input['customer_id'] ) : 0;
+	return $id > 0
+		&& aafm_wc_perm()
+		&& current_user_can( 'edit_users' )
+		&& aafm_user_can_checked( 'edit_user', $id, 'user' );
+}
+
+// aafm/wc-list-customers (R).
+
+/**
+ * Args builder for aafm/wc-list-customers.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_list_customers(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-list-customers' ),
+		'description'         => aafm_ability_description( 'aafm/wc-list-customers' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				array(
+					'role' => array(
+						'type'        => 'string',
+						'description' => __( 'WordPress role slug to filter by (e.g. "customer", "subscriber"). Defaults to "customer". Pass "all" to return users of every role instead of filtering.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_pagination_schema_props(
+					100,
+					__( 'Number of customers to return per page, from 1 to 100. Defaults to 10.', 'agent-abilities-for-mcp' ),
+					__( 'Page number of results to return, starting at 1. Defaults to 1.', 'agent-abilities-for-mcp' )
+				)
+			),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'customers' => array(
+					'type'  => 'array',
+					'items' => array(
+						'type'                 => 'object',
+						'properties'           => array(
+							'id'           => array( 'type' => 'integer' ),
+							'email'        => array( 'type' => 'string' ),
+							'first_name'   => array( 'type' => 'string' ),
+							'last_name'    => array( 'type' => 'string' ),
+							'username'     => array( 'type' => 'string' ),
+							'orders_count' => array( 'type' => 'integer' ),
+							'total_spent'  => array( 'type' => 'string' ),
+						),
+						'additionalProperties' => false,
+					),
+				),
+				'total'     => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_wc_list_customers',
+		'permission_callback' => 'aafm_perm_wc_customer_pii_read',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-list-customers.
+ *
+ * WooCommerce ships no list-customers helper, so query the role directly with WP_User_Query - the
+ * same way WooCommerce's own REST customers controller does (it defaults its role param to
+ * 'customer' and treats 'all' as "no role filter"). Hardcoding role=customer went blind on an
+ * LMS/membership store where buyers hold a different role (e.g. subscriber), so the role is now an
+ * input, still defaulting to 'customer' to preserve today's behaviour. Each customer is mapped
+ * through the lean aafm_redact_wc_customer() shape - no addresses.
+ *
+ * total is the grand count of matching customers (WP_User_Query::get_total()), not the length of
+ * the returned page.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>
+ */
+function aafm_exec_wc_list_customers( array $input ): array {
+	if ( ! class_exists( 'WC_Customer' ) ) {
+		return array(
+			'customers' => array(),
+			'total'     => 0,
+		);
+	}
+
+	$paging   = aafm_paginate_args( $input + array( 'per_page' => 10 ), AAFM_TERMS_PER_PAGE_MAX );
+	$per_page = $paging['per_page'];
+	$page     = $paging['page'];
+	$role     = isset( $input['role'] ) ? sanitize_key( (string) $input['role'] ) : 'customer';
+
+	$query_args = array(
+		'fields'      => 'ID',
+		'orderby'     => 'ID',
+		'order'       => 'ASC',
+		'number'      => $per_page,
+		'offset'      => ( $page - 1 ) * $per_page,
+		'count_total' => true,
+	);
+	// 'all' mirrors the REST controller's convention: every role, so omit the filter entirely
+	// rather than pass the literal string through to WP_User_Query.
+	if ( 'all' !== $role ) {
+		$query_args['role'] = $role;
+	}
+
+	$query = new \WP_User_Query( $query_args );
+
+	$customers = array();
+	foreach ( (array) $query->get_results() as $user_id ) {
+		$customer = aafm_wc_get_customer_object( (int) $user_id );
+		if ( $customer instanceof \WC_Customer ) {
+			$customers[] = aafm_redact_wc_customer( $customer );
+		}
+	}
+
+	return array(
+		'customers' => $customers,
+		'total'     => (int) $query->get_total(),
+	);
+}
+
+// aafm/wc-get-customer (R).
+
+/**
+ * Args builder for aafm/wc-get-customer.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_get_customer(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-get-customer' ),
+		'description'         => aafm_ability_description( 'aafm/wc-get-customer' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'customer_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( 'WordPress user ID of the customer to read.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'customer_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_customer_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_get_customer',
+		'permission_callback' => 'aafm_perm_wc_customer_pii_read',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-get-customer.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_get_customer( array $input ) {
+	$customer = aafm_wc_get_customer_object( (int) ( $input['customer_id'] ?? 0 ) );
+	if ( null === $customer ) {
+		return aafm_generic_error();
+	}
+	return aafm_rich_wc_customer( $customer );
+}
+
+// aafm/wc-create-customer (W).
+
+/**
+ * Permission floor for aafm/wc-create-customer.
+ *
+ * This ability calls wc_create_new_customer(), which creates a real WordPress user account, so
+ * manage_woocommerce alone is the wrong gate: it would turn a shop-manager grant into
+ * account-creation authority. Requires create_users on top, matching aafm/create-user
+ * (aafm_perm_create_user() in users.php), which is the same operation reached through a different door.
+ *
+ * Deliberately NOT folded into aafm_wc_perm() (_shared.php:27-29): that callback is shared by every
+ * WooCommerce ability, and adding create_users there would gate reading an order list on a
+ * user-management capability. Follows the aafm_perm_wc_delete_product() precedent in products.php,
+ * a per-ability callback where the flat cap is not the right floor.
+ *
+ * No default_role floor is needed here, unlike aafm/create-user (the default_role clamp in
+ * aafm_exec_create_user() in users.php): the new account's role is hardcoded to 'customer' by WooCommerce itself
+ * (woocommerce/includes/wc-user-functions.php:146), never read from the site's default_role option.
+ *
+ * Takes no object id, so the ability stays object-independent and still falls through to this
+ * callback at discovery with empty input, exactly as aafm_wc_perm() documents. No server.php case
+ * is needed.
+ *
+ * @return bool
+ */
+function aafm_perm_wc_create_customer(): bool {
+	return aafm_wc_perm() && current_user_can( 'create_users' );
+}
+
+/**
+ * Args builder for aafm/wc-create-customer.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_create_customer(): array {
+	$properties             = aafm_wc_customer_write_properties();
+	$properties['email']    = array(
+		'type'        => 'string',
+		'description' => __( "Customer's email address. Required; becomes both the account email and, when username is omitted, the basis for the generated username.", 'agent-abilities-for-mcp' ),
+	);
+	$properties['username'] = array(
+		'type'        => 'string',
+		'description' => __( 'WordPress login username. Defaults to the email address when omitted. The account password is generated automatically and is not returned or settable through this ability.', 'agent-abilities-for-mcp' ),
+	);
+
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-create-customer' ),
+		'description'         => aafm_ability_description( 'aafm/wc-create-customer' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => $properties,
+			'required'             => array( 'email' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_customer_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_create_customer',
+		'permission_callback' => 'aafm_perm_wc_create_customer',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-create-customer.
+ *
+ * Creates via wc_create_new_customer(), then applies optional address fields and saves.
+ * Returns WP_Error on any failure.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_create_customer( array $input ) {
+	if ( ! function_exists( 'wc_create_new_customer' ) ) {
+		return aafm_generic_error();
+	}
+
+	// Refuse an invalid billing email before minting the account, so a bad address neither erases
+	// nothing-yet nor leaves an orphaned user behind.
+	$email_error = aafm_wc_billing_email_error( $input );
+	if ( $email_error instanceof \WP_Error ) {
+		return $email_error;
+	}
+
+	$email    = sanitize_email( (string) ( $input['email'] ?? '' ) );
+	$username = sanitize_user( (string) ( $input['username'] ?? $email ) );
+
+	// wc_create_new_customer() returns the new user id as an int, or a WP_Error - never a
+	// WC_Customer object. Treat any non-positive / WP_Error result as a failure so a real
+	// create error can't be misread as success (and a real success can't be misread as a
+	// failure after the account is already persisted).
+	$created = aafm_wc_write(
+		'create_customer',
+		array(
+			'email'    => $email,
+			'username' => $username,
+			'password' => wp_generate_password(),
+		)
+	)['returned'];
+	if ( $created instanceof \WP_Error ) {
+		return aafm_generic_error();
+	}
+	$id = (int) $created;
+	if ( $id < 1 ) {
+		return aafm_generic_error();
+	}
+
+	// Hydrate the persisted customer, layer on the optional address fields, and save once.
+	$customer = aafm_wc_get_customer_object( $id );
+	if ( null === $customer ) {
+		return aafm_generic_error();
+	}
+	aafm_wc_apply_customer_input( $customer, $input );
+	$saved_id = (int) aafm_wc_write(
+		'save',
+		array(
+			'object' => $customer,
+			'entity' => 'customer',
+		)
+	)['returned'];
+	if ( $saved_id < 1 ) {
+		return aafm_generic_error();
+	}
+
+	$saved = aafm_wc_get_customer_object( $id );
+	if ( null === $saved ) {
+		return aafm_generic_error();
+	}
+	return aafm_rich_wc_customer( $saved );
+}
+
+// aafm/wc-update-customer (W).
+
+/**
+ * Args builder for aafm/wc-update-customer.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_update_customer(): array {
+	$properties                = aafm_wc_customer_write_properties();
+	$properties['customer_id'] = array(
+		'type'        => 'integer',
+		'minimum'     => 1,
+		'description' => __( 'WordPress user ID of the customer to update. Must reference an existing customer or the request fails.', 'agent-abilities-for-mcp' ),
+	);
+
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-update-customer' ),
+		'description'         => aafm_ability_description( 'aafm/wc-update-customer' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => $properties,
+			'required'             => array( 'customer_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_customer_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_update_customer',
+		'permission_callback' => 'aafm_perm_wc_update_customer',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-update-customer.
+ *
+ * Loads the existing customer, applies only the keys present in $input, saves, then
+ * returns the fresh rich shape. An input carrying only customer_id is a no-op success.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_update_customer( array $input ) {
+	$id       = (int) ( $input['customer_id'] ?? 0 );
+	$customer = aafm_wc_get_customer_object( $id );
+	if ( null === $customer ) {
+		return aafm_generic_error();
+	}
+
+	$email_error = aafm_wc_billing_email_error( $input );
+	if ( $email_error instanceof \WP_Error ) {
+		return $email_error;
+	}
+
+	aafm_wc_apply_customer_input( $customer, $input );
+	$saved_id = (int) aafm_wc_write(
+		'save',
+		array(
+			'object' => $customer,
+			'entity' => 'customer',
+		)
+	)['returned'];
+	if ( $saved_id < 1 ) {
+		return aafm_generic_error();
+	}
+
+	$saved = aafm_wc_get_customer_object( $id );
+	if ( null === $saved ) {
+		return aafm_generic_error();
+	}
+	return aafm_rich_wc_customer( $saved );
+}

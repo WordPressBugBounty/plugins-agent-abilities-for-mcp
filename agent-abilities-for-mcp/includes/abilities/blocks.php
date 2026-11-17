@@ -1,0 +1,817 @@
+<?php
+/**
+ * Reusable-block (wp_block) read + write abilities.
+ *
+ * The wp_block post type is behind the Reusable Blocks / synced patterns. It is NOT in the
+ * content post-type allowlist, so the shared content-write helpers (which gate on that
+ * allowlist) refuse it. These abilities gate per-object directly on the wp_block edit/delete
+ * meta caps (edit_block/delete_block) instead, with edit_posts/delete_posts as the
+ * object-independent discovery floor. Block markup is hardened with wp_kses_post() before
+ * insert - verified to PRESERVE Gutenberg block delimiters and their JSON attributes.
+ *
+ * delete-block uses the Trash (wp_trash_post), guarded against trash-disabled sites, so no
+ * force-delete primitive is added.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter( 'aafm_abilities_registry', 'aafm_register_blocks_definitions' );
+
+/**
+ * Register the reusable-block ability definitions.
+ *
+ * @param array<string,array<string,mixed>> $registry Registry.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_blocks_definitions( array $registry ): array {
+	$registry['aafm/list-blocks']      = array(
+		'label'        => __( 'List blocks', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Lists saved reusable blocks (synced patterns), not block types; aafm-list-block-types lists those, if it is enabled. Returns id, title, slug, status, and modified date. No block markup in the list. Response includes total (the query-wide count of matching blocks; each page omits blocks you lack edit access to, so total can exceed the rows returned). Requires the edit-posts capability.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'site',
+		'args_builder' => 'aafm_args_list_blocks',
+	);
+	$registry['aafm/list-block-types'] = array(
+		'label'        => __( 'List block types', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Lists the block types registered on this site (core, theme and plugin blocks, including ACF blocks), not saved reusable blocks; if aafm-get-block-type is enabled, use it for one block\'s attributes, supports, styles and, for ACF blocks, its field names and an example payload. Requires the edit-posts capability.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_list_block_types',
+	);
+	$registry['aafm/get-block-type']   = array(
+		'label'        => __( 'Get block type', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Reads one registered block type by name (for example core/group): its attributes, supports, style variations, parent and context rules, and whether it renders on the server. For an ACF block it also lists the field names, types, choices and sub-fields, plus an example block comment that uses field names as data keys (image fields take attachment IDs). Requires the edit-posts capability.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'content',
+		'args_builder' => 'aafm_args_get_block_type',
+	);
+	$registry['aafm/get-block']        = array(
+		'label'        => __( 'Get block', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Reads one reusable block by id, including its raw block markup. Requires edit access to that block.', 'agent-abilities-for-mcp' ),
+		'group'        => 'reads',
+		'risk'         => 'read',
+		'subject'      => 'site',
+		'args_builder' => 'aafm_args_get_block',
+	);
+	$registry['aafm/create-block']     = array(
+		'label'        => __( 'Create block', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Creates a reusable block (published immediately, unless the operator\'s force-draft setting holds it as a draft). Its markup is sanitized, and the author is always the agent. Requires the publish-posts capability. Put any block styling in the block delimiter attributes, not inline style, or the editor marks the content invalid.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'site',
+		'args_builder' => 'aafm_args_create_block',
+	);
+	$registry['aafm/update-block']     = array(
+		'label'        => __( 'Update block', 'agent-abilities-for-mcp' ),
+		'description'  => __( "Updates a reusable block's title or markup by id. The markup is sanitized. Requires edit access to that block. Put any block styling in the block delimiter attributes, not inline style, or the editor marks the content invalid.", 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'write',
+		'subject'      => 'site',
+		'args_builder' => 'aafm_args_update_block',
+	);
+	$registry['aafm/delete-block']     = array(
+		'label'        => __( 'Delete block', 'agent-abilities-for-mcp' ),
+		'description'  => __( 'Moves a reusable block to the Trash, where you can restore it. Never a permanent delete. Requires delete access to that block.', 'agent-abilities-for-mcp' ),
+		'group'        => 'writes',
+		'risk'         => 'destructive',
+		'subject'      => 'site',
+		'args_builder' => 'aafm_args_delete_block',
+	);
+	return $registry;
+}
+
+/**
+ * Object-independent floor for block reads/creates: the Block editor authoring cap.
+ *
+ * @return bool
+ */
+function aafm_perm_blocks_floor(): bool {
+	return current_user_can( 'edit_posts' );
+}
+
+/**
+ * Object-independent floor for CREATING a block: the caller can publish posts.
+ *
+ * The create-block write forces post_status=publish, and wp_insert_post() does no capability check
+ * of its own - so gating only on edit_posts would let a Contributor (edit_posts WITHOUT
+ * publish_posts) mint a published synced wp_block they could never create in wp-admin. Require
+ * publish_posts so the ability matches the editor capability the published-block write needs.
+ *
+ * @return bool
+ */
+function aafm_perm_blocks_create(): bool {
+	return current_user_can( 'publish_posts' );
+}
+
+/**
+ * Per-object permission: the caller may edit THIS wp_block (edit_block meta cap).
+ *
+ * @param array<string,mixed> $input Input carrying block_id.
+ * @return bool
+ */
+function aafm_perm_block_object( array $input ): bool {
+	$id    = absint( $input['block_id'] ?? 0 );
+	$block = aafm_get_block_object( $id );
+	return null !== $block && aafm_user_can_checked( 'edit_post', $id );
+}
+
+/**
+ * Per-object permission: the caller may delete THIS wp_block (delete_block meta cap).
+ *
+ * @param array<string,mixed> $input Input carrying block_id.
+ * @return bool
+ */
+function aafm_perm_block_delete_object( array $input ): bool {
+	$id    = absint( $input['block_id'] ?? 0 );
+	$block = aafm_get_block_object( $id );
+	return null !== $block && aafm_user_can_checked( 'delete_post', $id );
+}
+
+/**
+ * Args for list-blocks.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_list_blocks(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/list-blocks' ),
+		'description'         => aafm_ability_description( 'aafm/list-blocks' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				aafm_pagination_schema_props(
+					100,
+					__( 'Number of blocks per page, clamped to the 1-100 range regardless of the value requested. Defaults to 20 when omitted.', 'agent-abilities-for-mcp' ),
+					__( '1-based page number for pagination. Defaults to 1.', 'agent-abilities-for-mcp' )
+				),
+				array(
+					'search' => array(
+						'type'        => 'string',
+						'description' => __( 'Free-text search using WordPress\'s normal post search, matched against the block\'s title and content. Omit to list every block you can edit.', 'agent-abilities-for-mcp' ),
+					),
+				)
+			),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'blocks' => array( 'type' => 'array' ),
+				'total'  => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_list_blocks',
+		'permission_callback' => 'aafm_perm_blocks_floor',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute list-blocks: lean rows, paginated, no markup.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>
+ */
+function aafm_exec_list_blocks( array $input ): array {
+	$paging   = aafm_paginate_args( $input + array( 'per_page' => 20 ), AAFM_TERMS_PER_PAGE_MAX );
+	$per_page = $paging['per_page'];
+	$page     = $paging['page'];
+
+	$query_args = array(
+		'post_type'              => 'wp_block',
+		'post_status'            => array( 'publish', 'draft' ),
+		'posts_per_page'         => $per_page,
+		'paged'                  => $page,
+		'no_found_rows'          => false,
+		'update_post_meta_cache' => false,
+	);
+	// Only pass a search term when one was actually given: an empty 's' makes WP_Query run a
+	// pointless LIKE on every row, so omit it entirely when no search is requested.
+	$search = isset( $input['search'] ) ? sanitize_text_field( (string) $input['search'] ) : '';
+	if ( '' !== $search ) {
+		$query_args['s'] = $search;
+	}
+
+	$query = new WP_Query( $query_args );
+	aafm_prime_post_meta_checked( wp_list_pluck( $query->posts, 'ID' ) );
+	$blocks = array();
+	foreach ( $query->posts as $block ) {
+		// Scope to blocks the caller can actually edit: the discovery floor (edit_posts) lets a
+		// contributor reach this list, but they must not enumerate id/title/slug of OTHER
+		// authors' blocks they lack edit_post on. Filtering here keeps the lean rows aligned
+		// with the per-object get/update gates.
+		if ( $block instanceof WP_Post && aafm_user_can_checked( 'edit_post', $block->ID ) ) {
+			$blocks[] = aafm_redact_block( $block );
+		}
+	}
+	return array(
+		'blocks' => $blocks,
+		// total is the query-wide found_posts, as the description promises - the page-slice
+		// count made total <= per_page always, so an agent paginating by ceil(total/per_page)
+		// never fetched past page 1. The per-object edit_post row filter above still
+		// applies per page, so on a role that cannot edit every block (e.g. a contributor)
+		// total can exceed the rows returned; the description discloses that.
+		'total'  => (int) $query->found_posts,
+	);
+}
+
+/**
+ * Args for list-block-types.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_list_block_types(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/list-block-types' ),
+		'description'         => aafm_ability_description( 'aafm/list-block-types' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array_merge(
+				array(
+					'namespace' => array(
+						'type'        => 'string',
+						'description' => __( 'Only block types in this namespace, the part before the slash (for example core, or a theme or plugin prefix).', 'agent-abilities-for-mcp' ),
+					),
+					'search'    => array(
+						'type'        => 'string',
+						'description' => __( 'Case-insensitive text matched against the block name and title.', 'agent-abilities-for-mcp' ),
+					),
+				),
+				aafm_pagination_schema_props(
+					100,
+					__( 'Number of block types per page, clamped to the 1-100 range. Defaults to 50 when omitted.', 'agent-abilities-for-mcp' ),
+					__( '1-based page number for pagination. Defaults to 1.', 'agent-abilities-for-mcp' )
+				)
+			),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'block_types' => array(
+					'type'  => 'array',
+					'items' => array(
+						'type'       => 'object',
+						'properties' => array(
+							'name'        => array( 'type' => 'string' ),
+							'title'       => array( 'type' => 'string' ),
+							'category'    => array( 'type' => 'string' ),
+							'description' => array( 'type' => 'string' ),
+							'parent'      => array( 'type' => array( 'array', 'null' ) ),
+							'is_acf'      => array( 'type' => 'boolean' ),
+							'is_dynamic'  => array( 'type' => 'boolean' ),
+						),
+					),
+				),
+				'total'       => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_list_block_types',
+		'permission_callback' => 'aafm_perm_blocks_floor',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute list-block-types: registered block types sorted by name, filtered, then paginated.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array{block_types:list<array<string,mixed>>,total:int}
+ */
+function aafm_exec_list_block_types( array $input ): array {
+	$paging    = aafm_paginate_args( $input + array( 'per_page' => 50 ), 100 );
+	$namespace = isset( $input['namespace'] ) ? sanitize_text_field( (string) $input['namespace'] ) : '';
+	$search    = isset( $input['search'] ) ? sanitize_text_field( (string) $input['search'] ) : '';
+
+	$types = WP_Block_Type_Registry::get_instance()->get_all_registered();
+	ksort( $types, SORT_STRING );
+	$matches = array();
+	foreach ( $types as $name => $type ) {
+		$name = (string) $name;
+		if ( '' !== $namespace && 0 !== strpos( $name, $namespace . '/' ) ) {
+			continue;
+		}
+		if ( '' !== $search && false === stripos( $name, $search ) && false === stripos( (string) $type->title, $search ) ) {
+			continue;
+		}
+		$matches[] = $type;
+	}
+
+	$rows = array();
+	foreach ( array_slice( $matches, ( $paging['page'] - 1 ) * $paging['per_page'], $paging['per_page'] ) as $type ) {
+		$rows[] = array(
+			'name'        => (string) $type->name,
+			'title'       => (string) $type->title,
+			'category'    => (string) $type->category,
+			'description' => (string) $type->description,
+			'parent'      => is_array( $type->parent ) ? array_values( $type->parent ) : null,
+			'is_acf'      => null !== aafm_acf_block_fields( (string) $type->name ),
+			'is_dynamic'  => $type->is_dynamic(),
+		);
+	}
+
+	return array(
+		'block_types' => $rows,
+		'total'       => count( $matches ),
+	);
+}
+
+/**
+ * Args for get-block-type.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_block_type(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-block-type' ),
+		'description'         => aafm_ability_description( 'aafm/get-block-type' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'name' => array(
+					'type'        => 'string',
+					'pattern'     => '^[a-z0-9-]+/[a-z0-9-]+$',
+					'description' => __( 'Block type name, namespace/name, for example core/group. If aafm-list-block-types is enabled, it lists the names.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'name' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'name'             => array( 'type' => 'string' ),
+				'title'            => array( 'type' => 'string' ),
+				'description'      => array( 'type' => 'string' ),
+				'category'         => array( 'type' => 'string' ),
+				'parent'           => array( 'type' => array( 'array', 'null' ) ),
+				'ancestor'         => array( 'type' => array( 'array', 'null' ) ),
+				'allowed_blocks'   => array( 'type' => array( 'array', 'null' ) ),
+				'attributes'       => array( 'type' => array( 'object', 'array' ) ),
+				'supports'         => array( 'type' => array( 'object', 'array' ) ),
+				'styles'           => array( 'type' => 'array' ),
+				'uses_context'     => array( 'type' => 'array' ),
+				'provides_context' => array( 'type' => array( 'object', 'array' ) ),
+				'example'          => array( 'type' => array( 'object', 'array', 'null' ) ),
+				'is_dynamic'       => array( 'type' => 'boolean' ),
+				'acf'              => array( 'type' => array( 'object', 'null' ) ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_get_block_type',
+		'permission_callback' => 'aafm_perm_blocks_floor',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute get-block-type: one registered block type's editor-facing definition.
+ *
+ * Only what the block editor already shows an edit_posts user: no render callback, no script or
+ * style handles, no file paths. Values go through a JSON round trip, so a callable anywhere in
+ * the registered attributes or example drops out.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_get_block_type( array $input ) {
+	$name = (string) ( $input['name'] ?? '' );
+	$type = WP_Block_Type_Registry::get_instance()->get_registered( $name );
+	if ( ! $type instanceof WP_Block_Type ) {
+		return new WP_Error(
+			'aafm_unknown_block_type',
+			sprintf(
+				/* translators: %s: block type name. */
+				__( 'No block type named "%s" is registered on this site. If aafm-list-block-types is enabled, call it for the registered names.', 'agent-abilities-for-mcp' ),
+				$name
+			)
+		);
+	}
+
+	$styles = array();
+	foreach ( array_merge( (array) $type->styles, WP_Block_Styles_Registry::get_instance()->get_registered_styles_for_block( $name ) ) as $style ) {
+		$style                             = (array) $style;
+		$styles[ (string) $style['name'] ] = array(
+			'name'  => (string) $style['name'],
+			'label' => (string) ( $style['label'] ?? '' ),
+		);
+	}
+
+	$fields = aafm_acf_block_fields( $name );
+
+	return array(
+		'name'             => $name,
+		'title'            => (string) $type->title,
+		'description'      => (string) $type->description,
+		'category'         => (string) $type->category,
+		'parent'           => is_array( $type->parent ) ? array_values( $type->parent ) : null,
+		'ancestor'         => is_array( $type->ancestor ) ? array_values( $type->ancestor ) : null,
+		'allowed_blocks'   => is_array( $type->allowed_blocks ) ? array_values( $type->allowed_blocks ) : null,
+		'attributes'       => aafm_json_safe( $type->get_attributes() ) ?? array(),
+		'supports'         => aafm_json_safe( $type->supports ) ?? array(),
+		'styles'           => array_values( $styles ),
+		'uses_context'     => array_values( $type->get_uses_context() ),
+		'provides_context' => aafm_json_safe( $type->provides_context ) ?? array(),
+		'example'          => aafm_json_safe( $type->example ),
+		'is_dynamic'       => $type->is_dynamic(),
+		'acf'              => null === $fields ? null : array(
+			'fields'           => $fields,
+			'envelope_example' => aafm_acf_block_envelope_example( $name, $fields ),
+		),
+	);
+}
+
+/**
+ * A value as it survives a JSON round trip: callables and objects without public data drop out.
+ *
+ * @param mixed $value Value.
+ * @return array<int|string,mixed>|null The decoded array, or null when the value is not an array or object.
+ */
+function aafm_json_safe( $value ): ?array {
+	$decoded = json_decode( (string) wp_json_encode( $value ), true );
+	return is_array( $decoded ) ? $decoded : null;
+}
+
+/**
+ * Args for get-block.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_get_block(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/get-block' ),
+		'description'         => aafm_ability_description( 'aafm/get-block' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'block_id' => array(
+					'type'        => 'integer',
+					'description' => __( 'ID of the reusable block to read. The caller must have edit access to this specific block.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'block_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_rich_block_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_get_block',
+		'permission_callback' => 'aafm_perm_block_object',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute get-block: the rich single-block shape (markup included).
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_get_block( array $input ) {
+	$block = aafm_get_block_object( absint( $input['block_id'] ?? 0 ) );
+	if ( null === $block ) {
+		return aafm_generic_error();
+	}
+	return aafm_rich_block( $block );
+}
+
+/**
+ * Args for create-block.
+ *
+ * The schema is closed (additionalProperties:false) and declares only title + content, so a
+ * smuggled post_type/post_author/post_status is rejected before execute ever runs.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_create_block(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/create-block' ),
+		'description'         => aafm_ability_description( 'aafm/create-block' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'title'   => array(
+					'type'        => 'string',
+					'description' => __( 'Title for the new reusable block. Sanitized as plain text.', 'agent-abilities-for-mcp' ),
+				),
+				'content' => array(
+					'type'        => 'string',
+					'description' => aafm_write_content_description(),
+				),
+			),
+			'required'             => array( 'title' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_rich_block_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_create_block',
+		'permission_callback' => 'aafm_perm_blocks_create',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute create-block: kses-harden the markup, force the type, let the author default.
+ *
+ * The type is forced to wp_block from our own args; post_author is omitted so wp_insert_post
+ * defaults it to the current (agent) user - neither can be spoofed through input. The markup
+ * is sanitized with aafm_kses_block_markup() (wp_kses_post(), which preserves Gutenberg block
+ * delimiters; for unfiltered_html users, tag-free attribute text that kses would only entity-encode
+ * is kept as sent, and any other change keeps the kses value), then the
+ * whole array is wp_slash()'d once because the insert functions expect slashed data.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_create_block( array $input ) {
+	$title     = isset( $input['title'] ) ? aafm_sanitize_plain_text( (string) $input['title'] ) : '';
+	$sanitized = aafm_kses_block_markup( isset( $input['content'] ) ? (string) $input['content'] : '' );
+	$content   = $sanitized['content'];
+
+	// Guard the final markup: strict mode blocks the write, warn mode rides on the response.
+	$guard = aafm_block_guard_evaluate( $content );
+	if ( $guard['error'] instanceof WP_Error ) {
+		return $guard['error'];
+	}
+	$guard['warnings'] = array_merge( $guard['warnings'], $sanitized['warnings'] );
+
+	$id = wp_insert_post(
+		wp_slash(
+			array(
+				'post_type'    => 'wp_block',
+				// The operator's force-draft setting covers every content object an agent
+				// creates: with it on, the block lands as a draft for a human to publish.
+				'post_status'  => aafm_force_draft() ? 'draft' : 'publish',
+				'post_title'   => $title,
+				'post_content' => $content,
+			)
+		),
+		true
+	);
+	if ( is_wp_error( $id ) || 0 === (int) $id ) {
+		return aafm_generic_error();
+	}
+	// Re-read the saved block to return the canonical rich shape. If the re-fetch comes back
+	// null (a hook deleted it, or a cache race), aafm_rich_block() would fall back to array(),
+	// which encodes as [] against the seven-property object the output schema declares - so
+	// surface a generic error instead of redacting null into a schema-violating empty shape
+	// (same guard as the menu-item writes, menus.php:669).
+	$saved = aafm_exact_object( 'post', (int) $id );
+	if ( ! $saved instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+	// The reread above only proved the row exists, never that what came
+	// back matches what this create actually asked for - a wp_insert_post_data filter silently
+	// vetoing or normalizing a field would still report success on the caller's stale intent.
+	// $sanitize_context_id is 0, not (int) $id: core's own sanitize_post( $postarr, 'db' ) inside
+	// wp_insert_post() ran BEFORE this row existed, with ID defaulted to 0.
+	if ( ! aafm_post_field_confirm_logged( (int) $id, 'post_title', $title, '', 0 )
+		|| ! aafm_post_field_confirm_logged( (int) $id, 'post_content', $content, '', 0 )
+	) {
+		return aafm_generic_error();
+	}
+	return aafm_block_with_warnings( aafm_rich_block( $saved ), $guard['warnings'] );
+}
+
+/**
+ * Attach content warnings to a rich-block response when the guard found any.
+ *
+ * Keeps the key off the response entirely when the markup was clean, so a well-formed block write
+ * looks exactly as it did before the guard existed.
+ *
+ * @param array<string,mixed>|WP_Error                         $response The rich-block response.
+ * @param list<array{block:string,code:string,message:string}> $warnings Guard warnings.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_block_with_warnings( $response, array $warnings ) {
+	if ( is_array( $response ) && ! empty( $warnings ) ) {
+		$response['content_warnings'] = $warnings;
+	}
+	return $response;
+}
+
+/**
+ * Args for update-block.
+ *
+ * Closed schema: block_id (required) plus optional title/content. No post_type/post_author/
+ * post_status field exists, so none can be smuggled in.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_update_block(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/update-block' ),
+		'description'         => aafm_ability_description( 'aafm/update-block' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'block_id' => array(
+					'type'        => 'integer',
+					'description' => __( 'ID of the reusable block to update. The caller must have edit access to this specific block.', 'agent-abilities-for-mcp' ),
+				),
+				'title'    => array(
+					'type'        => 'string',
+					'description' => __( 'New title for the block. Sanitized as plain text. Omit to leave the current title unchanged.', 'agent-abilities-for-mcp' ),
+				),
+				'content'  => array(
+					'type'        => 'string',
+					'description' => aafm_write_content_description(),
+				),
+			),
+			'required'             => array( 'block_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_rich_block_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_update_block',
+		'permission_callback' => 'aafm_perm_block_object',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute update-block: resolve per-object, then apply a kses-hardened markup edit.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_update_block( array $input ) {
+	$id    = absint( $input['block_id'] ?? 0 );
+	$block = aafm_get_block_object( $id );
+	if ( null === $block ) {
+		return aafm_generic_error();
+	}
+	if ( ! aafm_exact_object_chain( 'post', $id ) instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+	$guard  = array(
+		'warnings' => array(),
+		'error'    => null,
+	);
+	$update = array( 'ID' => $id );
+	if ( isset( $input['title'] ) ) {
+		$update['post_title'] = aafm_sanitize_plain_text( (string) $input['title'] );
+	}
+	if ( isset( $input['content'] ) ) {
+		$sanitized              = aafm_kses_block_markup( (string) $input['content'] );
+		$update['post_content'] = $sanitized['content'];
+		$guard                  = aafm_block_guard_evaluate( (string) $update['post_content'] );
+		if ( $guard['error'] instanceof WP_Error ) {
+			return $guard['error'];
+		}
+		$guard['warnings'] = array_merge( $guard['warnings'], $sanitized['warnings'] );
+	}
+	$result = wp_update_post( wp_slash( $update ), true );
+	if ( is_wp_error( $result ) || 0 === (int) $result ) {
+		return aafm_generic_error();
+	}
+	// Same null-reread guard as create-block above: aafm_rich_block() falls back to array()
+	// for a non-WP_Post, which would violate the object output schema.
+	$saved = aafm_exact_object( 'post', (int) $result );
+	if ( ! $saved instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+	// Only the fields THIS update actually set are checked, each against
+	// its CANONICAL sanitize_post_field() form - same shape as create-block above, but the
+	// default $sanitize_context_id (the existing $id: this is an update, the row already
+	// existed at sanitize time).
+	// $block was read before wp_update_post() ran, so its fields are each field's genuine
+	// pre-write value.
+	foreach ( array( 'post_title', 'post_content' ) as $field ) {
+		if ( ! isset( $update[ $field ] ) ) {
+			continue;
+		}
+		if ( ! aafm_post_field_confirm_logged( $id, $field, (string) $update[ $field ], (string) $block->$field ) ) {
+			return aafm_generic_error();
+		}
+	}
+	return aafm_block_with_warnings( aafm_rich_block( $saved ), $guard['warnings'] );
+}
+
+/**
+ * Args for delete-block.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_delete_block(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/delete-block' ),
+		'description'         => aafm_ability_description( 'aafm/delete-block' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'properties'           => array(
+				'block_id' => array(
+					'type'        => 'integer',
+					'description' => __( 'ID of the reusable block to move to the Trash. The caller must have delete access to this specific block. This is a Trash move, not a permanent delete, so it can be restored.', 'agent-abilities-for-mcp' ),
+				),
+			),
+			'required'             => array( 'block_id' ),
+			'additionalProperties' => false,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'id'     => array( 'type' => 'integer' ),
+				'status' => array( 'type' => 'string' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_delete_block',
+		'permission_callback' => 'aafm_perm_block_delete_object',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute delete-block: move the block to the Trash (recoverable), never a force-delete.
+ *
+ * Core's wp_trash_post() short-circuits to a permanent delete when the Trash is disabled
+ * (EMPTY_TRASH_DAYS falsy), so refuse there rather than silently destroy the block. No
+ * force-delete primitive (the trash-bypassing permanent delete) is added anywhere in this file.
+ *
+ * @param array<string,mixed> $input Input.
+ * @return array<string,mixed>|WP_Error
+ */
+function aafm_exec_delete_block( array $input ) {
+	$id    = absint( $input['block_id'] ?? 0 );
+	$block = aafm_get_block_object( $id );
+	if ( null === $block ) {
+		return aafm_generic_error();
+	}
+	if ( ! aafm_trash_is_enabled() ) {
+		// The same actionable refusal trash-post/trash-page return, so the agent learns WHY
+		// the delete was refused instead of getting the generic error.
+		return aafm_trash_disabled_error();
+	}
+	$post = aafm_exact_object_chain( 'post', $id );
+	if ( ! $post instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+	if ( 'trash' === $post->post_status ) {
+		return aafm_already_trashed_error( $post, true );
+	}
+	$result = wp_trash_post( $id );
+	if ( ! $result instanceof WP_Post ) {
+		return aafm_generic_error();
+	}
+	return array(
+		'id'     => $id,
+		'status' => 'trash',
+	);
+}

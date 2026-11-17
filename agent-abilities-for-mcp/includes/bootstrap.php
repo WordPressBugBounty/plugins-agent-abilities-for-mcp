@@ -1,0 +1,453 @@
+<?php
+/**
+ * MCP adapter bootstrap + coexistence guard.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+use WP\MCP\Core\McpAdapter;
+
+/**
+ * The longest client name or version this plugin will persist from an initialize handshake.
+ *
+ * Real values are short - "claude-code", "1.2.3" - and the field exists so an operator can tell
+ * one connection from another on the Connections screen, where anything past a hundred characters
+ * is unreadable anyway. 128 leaves generous room for a descriptive name while making the field
+ * useless as storage.
+ */
+if ( ! defined( 'AAFM_MCP_CLIENT_FIELD_MAX' ) ) {
+	define( 'AAFM_MCP_CLIENT_FIELD_MAX', 128 );
+}
+
+/**
+ * The largest initialize params object this plugin will hand to the adapter, in bytes.
+ *
+ * SessionManager::create_session() stores the WHOLE params array in user meta, not just the parts
+ * it understands, so a bound on clientInfo alone would leave any other key just as unbounded. A
+ * real handshake is a few hundred bytes; 64 KB is far beyond anything a client legitimately sends
+ * and still far below a payload that can bloat a meta row. Refused rather than trimmed, because
+ * silently dropping half of a client's capabilities object would break negotiation in a way that
+ * is very hard to debug from the client side.
+ */
+if ( ! defined( 'AAFM_MCP_INITIALIZE_PARAMS_MAX' ) ) {
+	define( 'AAFM_MCP_INITIALIZE_PARAMS_MAX', 65536 );
+}
+
+/**
+ * The MCP server's REST namespace. Single source for the four sites that need the route
+ * literal (discovery, validator, connection, server). Splitting namespace from route keeps
+ * the value byte-identical to what create_server() registers and what aafm_endpoint_url()
+ * builds - the OAuth audience binding (hash_equals on the endpoint URL) is byte-sensitive.
+ */
+if ( ! defined( 'AAFM_MCP_NAMESPACE' ) ) {
+	define( 'AAFM_MCP_NAMESPACE', 'agent-abilities-for-mcp' );
+}
+
+/**
+ * The MCP server's route segment under its namespace.
+ */
+if ( ! defined( 'AAFM_MCP_ROUTE_SEGMENT' ) ) {
+	define( 'AAFM_MCP_ROUTE_SEGMENT', 'mcp' );
+}
+
+/**
+ * The MCP REST route WITHOUT a leading slash: "agent-abilities-for-mcp/mcp".
+ *
+ * This is the exact string passed to rest_url() (in aafm_endpoint_url()) and the
+ * namespace/route create_server() registers. Keep callers that need rest_url() input
+ * on this form.
+ *
+ * @return string
+ */
+function aafm_mcp_rest_namespace_route(): string {
+	return AAFM_MCP_NAMESPACE . '/' . AAFM_MCP_ROUTE_SEGMENT;
+}
+
+/**
+ * The MCP REST route WITH a leading slash: "/agent-abilities-for-mcp/mcp".
+ *
+ * The form WP_REST_Request::get_route() returns and the routing predicates compare against.
+ *
+ * @return string
+ */
+function aafm_mcp_rest_route(): string {
+	return '/' . aafm_mcp_rest_namespace_route();
+}
+
+/**
+ * Whether a REST route is the MCP route, decided the way core's router decides it.
+ *
+ * WP_REST_Server::match_request_to_handler() tests `preg_match( '@^' . $route . '$@i', $path )`
+ * against the raw WP_REST_Request::get_route(), so this does the same: case-insensitive, no
+ * trimming, and `$` also matches before one final newline. Every "is this the MCP route" check
+ * in the plugin goes through here so none of them can disagree with where core dispatches.
+ *
+ * @param mixed $route A route as WP_REST_Request::get_route() returns it.
+ * @return bool
+ */
+function aafm_is_mcp_route( $route ): bool {
+	return is_string( $route ) && 1 === preg_match( '@^' . preg_quote( aafm_mcp_rest_route(), '@' ) . '$@i', $route );
+}
+
+/**
+ * Upper bound (exclusive) for a compatible MCP adapter version.
+ *
+ * The plugin runs on the adapter's 0.6.1 and 0.7.x lines (create_server() signature,
+ * initialize-response shape, tools-list filter), so it gates the loaded copy to the tested range
+ * [floor, next-minor) and warns the operator otherwise. Code that touches an adapter detail that
+ * differs between the two lines (the initialize response, the deprecation notice, the standalone
+ * plugin's autoloader) handles both shapes.
+ *
+ * Our bundled copy is the one in use whenever it is declared first - see adapter-loader.php. A
+ * later-loading sibling's copy of ANY version is overridden by ours; the trade is that a sibling
+ * bundling a newer adapter is forced onto our version, which is acceptable because the adapter's
+ * public API is additive and stable across the versions we support. When another copy is declared
+ * before ours instead (the standalone plugin loading first), that copy is the one judged here.
+ *
+ * Consequently this floor/upper-bound check and the "too old" / "too new" notices below fire only
+ * when an incompatible copy is declared by a plugin that loads BEFORE us, so its copy wins the
+ * class declaration. Bump the bound deliberately after verifying against a new adapter line.
+ */
+if ( ! defined( 'AAFM_MAX_ADAPTER_VERSION' ) ) {
+	define( 'AAFM_MAX_ADAPTER_VERSION', '0.8.0' );
+}
+
+/**
+ * Whether the loaded adapter version is within the tested compatibility range.
+ *
+ * Requires the version to be at or above the floor AND strictly below the upper bound, so a
+ * too-old adapter (below the floor) and a too-new one (at or above the next breaking line)
+ * are both rejected.
+ *
+ * @param string $loaded_version Version reported by the active adapter copy.
+ * @return bool
+ */
+function aafm_adapter_is_compatible( string $loaded_version ): bool {
+	return version_compare( $loaded_version, AAFM_MIN_ADAPTER_VERSION, '>=' )
+		&& version_compare( $loaded_version, AAFM_MAX_ADAPTER_VERSION, '<' );
+}
+
+/**
+ * Whether the loaded adapter is newer than the tested upper bound.
+ *
+ * Lets aafm_init_mcp() pick the "too new" notice apart from the "too old" one.
+ *
+ * @param string $loaded_version Version reported by the active adapter copy.
+ * @return bool
+ */
+function aafm_adapter_is_too_new( string $loaded_version ): bool {
+	return version_compare( $loaded_version, AAFM_MAX_ADAPTER_VERSION, '>=' );
+}
+
+/**
+ * The version of the adapter actually loaded - whichever copy our eager load committed PHP to, or
+ * a sibling's copy that was declared before us.
+ *
+ * @return string|null
+ */
+function aafm_loaded_adapter_version(): ?string {
+	if ( ! class_exists( McpAdapter::class ) ) {
+		return null;
+	}
+	return defined( McpAdapter::class . '::VERSION' ) ? (string) McpAdapter::VERSION : '0.0.0';
+}
+
+/**
+ * Initialize the MCP layer if a compatible adapter is present; otherwise show a notice.
+ *
+ * @return bool True when initialization proceeded.
+ */
+function aafm_init_mcp(): bool {
+	// The guards need no adapter classes, so they go in before any compatibility return: whichever
+	// adapter copy loads first, our tools are refused on every server but our own.
+	aafm_register_default_server_guards();
+
+	$version = aafm_loaded_adapter_version();
+
+	if ( null === $version ) {
+		add_action( 'admin_notices', 'aafm_notice_adapter_missing' );
+		return false;
+	}
+	if ( ! aafm_adapter_is_compatible( $version ) ) {
+		if ( aafm_adapter_is_too_new( $version ) ) {
+			add_action( 'admin_notices', 'aafm_notice_adapter_too_new' );
+		} else {
+			add_action( 'admin_notices', 'aafm_notice_adapter_outdated' );
+		}
+		return false;
+	}
+
+	// The adapter's default server follows the owner's setting (Settings, "Allow the MCP Adapter's
+	// default server"), resolved late so no other plugin's filter overrides it. Our own tools never
+	// appear on it in any mode (guards registered at the top of this function).
+	add_filter( 'mcp_adapter_create_default_server', 'aafm_filter_default_server_enabled', AAFM_DEFAULT_SERVER_FILTER_PRIORITY );
+	add_action( 'mcp_adapter_init', 'aafm_veto_default_server_without_publisher', 9 );
+	add_action( 'mcp_adapter_init', 'aafm_note_automatic_default_server', 20 );
+
+	// The adapter initialises on init (WP-CLI) or rest_api_init; mark our copy loaded just before it does.
+	if ( defined( 'WP_CLI' ) && WP_CLI ) {
+		add_action( 'init', 'aafm_mark_bundled_adapter_loaded', 19 );
+	} else {
+		add_action( 'rest_api_init', 'aafm_mark_bundled_adapter_loaded', 14 );
+	}
+
+	McpAdapter::instance();
+	add_action( 'mcp_adapter_init', 'aafm_register_mcp_server' );
+
+	return true;
+}
+
+/**
+ * Admin notice: no adapter available.
+ *
+ * @return void
+ */
+function aafm_notice_adapter_missing(): void {
+	if ( ! current_user_can( 'activate_plugins' ) ) {
+		return;
+	}
+	echo '<div class="notice notice-error"><p>';
+	echo esc_html__( 'Agent Abilities for MCP could not load the MCP adapter. Please reinstall the plugin.', 'agent-abilities-for-mcp' );
+	echo '</p></div>';
+}
+
+/**
+ * Admin notice: another plugin loaded an adapter older than our floor.
+ *
+ * Names the offending plugin when it can be resolved (reflect the loaded McpAdapter class file,
+ * map it to its plugin folder under WP_PLUGIN_DIR, read its header name), and reports the loaded
+ * vs required versions, so the operator knows exactly which plugin to update or deactivate. Falls
+ * back to the generic wording when the plugin cannot be resolved. All output is escaped.
+ *
+ * @return void
+ */
+function aafm_notice_adapter_outdated(): void {
+	aafm_render_adapter_version_notice(
+		/* translators: 1: offending plugin name, 2: loaded adapter version, 3: minimum required adapter version. */
+		esc_html__( 'Agent Abilities for MCP is disabled: the plugin %1$s is loading MCP Adapter %2$s, but Agent Abilities for MCP requires %3$s or newer. Update or deactivate %1$s to enable agent tools.', 'agent-abilities-for-mcp' ),
+		/* translators: 1: loaded adapter version, 2: minimum required adapter version. */
+		esc_html__( 'Agent Abilities for MCP is disabled: another active plugin is loading MCP Adapter %1$s, but %2$s or newer is required. Update or deactivate that plugin to enable agent tools.', 'agent-abilities-for-mcp' ),
+		AAFM_MIN_ADAPTER_VERSION
+	);
+}
+
+/**
+ * Admin notice: another plugin loaded an adapter NEWER than our tested upper bound.
+ *
+ * A 0.8+ adapter may have changed the create_server() signature or response shape the plugin is
+ * built against, so it is disabled rather than risking a runtime break. Names the offending plugin
+ * when it can be resolved, and reports the loaded vs maximum-supported versions. All output escaped.
+ *
+ * @return void
+ */
+function aafm_notice_adapter_too_new(): void {
+	aafm_render_adapter_version_notice(
+		/* translators: 1: offending plugin name, 2: loaded adapter version, 3: maximum supported adapter version (exclusive). */
+		esc_html__( 'Agent Abilities for MCP is disabled: the plugin %1$s is loading MCP Adapter %2$s, which is newer than this plugin supports (below %3$s). Update Agent Abilities for MCP, or deactivate %1$s, to enable agent tools.', 'agent-abilities-for-mcp' ),
+		/* translators: 1: loaded adapter version, 2: maximum supported adapter version (exclusive). */
+		esc_html__( 'Agent Abilities for MCP is disabled: another active plugin is loading MCP Adapter %1$s, which is newer than this plugin supports (below %2$s). Update Agent Abilities for MCP, or deactivate that plugin, to enable agent tools.', 'agent-abilities-for-mcp' ),
+		AAFM_MAX_ADAPTER_VERSION
+	);
+}
+
+/**
+ * Shared renderer for the two adapter-version compatibility notices. Only the wording and which
+ * version bound gets cited differ between "too old" and "too new"; the capability gate, the
+ * loaded-version/offending-plugin resolution, and the markup are identical either way.
+ *
+ * @param string $with_plugin_message    Pre-escaped printf() template used when the offending
+ *                                        plugin is known, taking %1$s (plugin), %2$s (loaded
+ *                                        version), %3$s (the version bound).
+ * @param string $without_plugin_message Pre-escaped printf() template used when the offending
+ *                                        plugin cannot be resolved, taking %1$s (loaded version),
+ *                                        %2$s (the version bound).
+ * @param string $bound_version          The adapter version bound this message cites
+ *                                        (AAFM_MIN_ADAPTER_VERSION or AAFM_MAX_ADAPTER_VERSION).
+ * @return void
+ */
+function aafm_render_adapter_version_notice( string $with_plugin_message, string $without_plugin_message, string $bound_version ): void {
+	if ( ! current_user_can( 'activate_plugins' ) ) {
+		return;
+	}
+
+	$loaded = aafm_loaded_adapter_version() ?? __( 'unknown', 'agent-abilities-for-mcp' );
+	$plugin = aafm_resolve_adapter_owner_plugin();
+
+	echo '<div class="notice notice-warning"><p>';
+	if ( '' !== $plugin ) {
+		printf( $with_plugin_message, esc_html( $plugin ), esc_html( $loaded ), esc_html( $bound_version ) ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- $with_plugin_message is the caller's own esc_html__() return value; every interpolated arg is escaped here.
+	} else {
+		printf( $without_plugin_message, esc_html( $loaded ), esc_html( $bound_version ) ); // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped -- $without_plugin_message is the caller's own esc_html__() return value; every interpolated arg is escaped here.
+	}
+	echo '</p></div>';
+}
+
+/**
+ * Resolve the display name of the plugin whose copy of the MCP adapter won the autoload.
+ *
+ * Reflects the loaded WP\MCP\Core\McpAdapter class file path, finds which plugin folder under
+ * WP_PLUGIN_DIR contains it, then reads that plugin's header name via get_plugins(). Returns an
+ * empty string when the class is absent, the file is outside the plugins directory, or no plugin
+ * header can be matched - the caller then uses the generic wording.
+ *
+ * @return string Plugin display name, or '' when it cannot be resolved.
+ */
+function aafm_resolve_adapter_owner_plugin(): string {
+	if ( ! class_exists( McpAdapter::class ) ) {
+		return '';
+	}
+
+	try {
+		$file = ( new ReflectionClass( McpAdapter::class ) )->getFileName();
+	} catch ( \ReflectionException $e ) {
+		return '';
+	}
+	if ( ! is_string( $file ) || '' === $file ) {
+		return '';
+	}
+
+	$plugins_dir = wp_normalize_path( WP_PLUGIN_DIR );
+	$class_file  = wp_normalize_path( $file );
+
+	// The class must live under the plugins directory for us to name a plugin.
+	if ( 0 !== strpos( $class_file, trailingslashit( $plugins_dir ) ) ) {
+		return '';
+	}
+
+	// The first path segment after the plugins dir is the owning plugin's folder.
+	$relative = ltrim( substr( $class_file, strlen( $plugins_dir ) ), '/' );
+	$segments = explode( '/', $relative );
+	$folder   = $segments[0] ?? '';
+	if ( '' === $folder ) {
+		return '';
+	}
+
+	if ( ! function_exists( 'get_plugins' ) ) {
+		require_once ABSPATH . 'wp-admin/includes/plugin.php';
+	}
+	$all_plugins = get_plugins();
+	foreach ( $all_plugins as $plugin_file => $data ) {
+		// $plugin_file is "folder/entry.php"; match on the folder segment.
+		if ( 0 === strpos( $plugin_file, $folder . '/' ) && ! empty( $data['Name'] ) ) {
+			return (string) $data['Name'];
+		}
+	}
+
+	return '';
+}
+
+/**
+ * Bound the initialize params before the MCP adapter turns them into a session row.
+ *
+ * SessionManager::create_session() writes the entire params array into the calling user's
+ * `mcp_adapter_sessions` meta, verbatim and unvalidated, up to the per-user session cap. A
+ * subscriber - sixteen read-only tools, no write ability anywhere - sent a two-million-character
+ * clientInfo.name, repeated it to the cap, and grew their own usermeta row from 288 bytes to 64 MB.
+ * Every call answered 200, and their next ordinary handshake took nearly four times as long,
+ * because that row is unserialised on every request that primes their meta.
+ *
+ * The storage belongs to the vendored adapter, but the gate belongs here: this plugin is the
+ * governance layer in front of it, and "the library wrote it" is not a defence a governance layer
+ * gets to use. Bounding at the request is also the only place the fix can live without patching
+ * vendor code that composer will replace.
+ *
+ * Two different treatments, deliberately:
+ *
+ * - clientInfo is REWRITTEN. It is descriptive metadata, the protocol defines exactly two fields
+ *   for it, and truncating an absurd name still leaves a usable label. Unknown fields are dropped
+ *   rather than shortened, since nothing downstream reads them. The name goes through the same
+ *   plain-text helper every other stored, operator-visible name does.
+ * - Everything else is REFUSED when the whole params object is oversized. Trimming an unknown key
+ *   risks silently mangling a capabilities negotiation, and a client that sends 64 KB of handshake
+ *   deserves a clear error rather than a quiet, partial success.
+ *
+ * @param mixed $result  Existing short-circuit result, or null.
+ * @param mixed $server  The REST server (unused).
+ * @param mixed $request The request being dispatched.
+ * @return mixed A 400 WP_Error for an oversized params object, otherwise $result unchanged.
+ */
+function aafm_bound_mcp_initialize_params( $result, $server = null, $request = null ) {
+	unset( $server );
+
+	if ( null !== $result || ! $request instanceof \WP_REST_Request || 'POST' !== $request->get_method() ) {
+		return $result;
+	}
+	// aafm_is_mcp_route(), core's matcher, so this bound applies wherever core dispatches MCP.
+	if ( ! aafm_is_mcp_route( $request->get_route() ) ) {
+		return $result;
+	}
+
+	$body = $request->get_json_params();
+	if ( ! is_array( $body ) || array() === $body ) {
+		return $result;
+	}
+
+	// A JSON-RPC batch is a list of call objects. Handling only the single-object form let the same
+	// oversized handshake through simply by wrapping it in brackets, so both shapes walk the
+	// same path and every element is bounded on its own.
+	$is_batch = array_keys( $body ) === range( 0, count( $body ) - 1 );
+	$calls    = $is_batch ? $body : array( $body );
+	$changed  = false;
+
+	foreach ( $calls as $index => $call ) {
+		if ( ! is_array( $call ) || 'initialize' !== ( $call['method'] ?? '' ) || ! isset( $call['params'] ) || ! is_array( $call['params'] ) ) {
+			continue;
+		}
+
+		$bounded = aafm_bound_initialize_params_array( $call['params'] );
+		if ( null === $bounded ) {
+			return new WP_Error(
+				'aafm_initialize_params_too_large',
+				__( 'The initialize parameters are too large. Send a normal handshake: a protocol version, your capabilities, and a short client name and version.', 'agent-abilities-for-mcp' ),
+				array( 'status' => 400 )
+			);
+		}
+
+		if ( $bounded !== $call['params'] ) {
+			$calls[ $index ]['params'] = $bounded;
+			$changed                   = true;
+		}
+	}
+
+	if ( $changed ) {
+		// set_body() clears the parsed-JSON cache, so the adapter reads the bounded version.
+		$request->set_body( (string) wp_json_encode( $is_batch ? $calls : $calls[0] ) );
+	}
+
+	return $result;
+}
+
+/**
+ * Bound one initialize params object, or report that it is too large to accept at all.
+ *
+ * @param array<string,mixed> $params Params from a single initialize call.
+ * @return array<string,mixed>|null The bounded params, or null when the object exceeds the cap.
+ */
+function aafm_bound_initialize_params_array( array $params ): ?array {
+	if ( isset( $params['clientInfo'] ) && is_array( $params['clientInfo'] ) ) {
+		$client = array();
+		foreach ( array( 'name', 'version' ) as $field ) {
+			if ( ! isset( $params['clientInfo'][ $field ] ) || ! is_scalar( $params['clientInfo'][ $field ] ) ) {
+				continue;
+			}
+			$value = aafm_sanitize_plain_text( (string) $params['clientInfo'][ $field ] );
+			if ( strlen( $value ) > AAFM_MCP_CLIENT_FIELD_MAX ) {
+				$value = substr( $value, 0, AAFM_MCP_CLIENT_FIELD_MAX );
+			}
+			$client[ $field ] = $value;
+		}
+		$params['clientInfo'] = $client;
+	}
+
+	if ( strlen( (string) wp_json_encode( $params ) ) > AAFM_MCP_INITIALIZE_PARAMS_MAX ) {
+		return null;
+	}
+
+	return $params;
+}
+
+add_filter( 'rest_pre_dispatch', 'aafm_bound_mcp_initialize_params', 10, 3 );

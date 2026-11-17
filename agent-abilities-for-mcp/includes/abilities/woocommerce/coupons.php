@@ -1,0 +1,889 @@
+<?php
+/**
+ * WooCommerce integration abilities - coupon reads and writes (sub-slice W4-WC4).
+ *
+ * Registers ONLY when WooCommerce is active (aafm_integration_active('woocommerce')); a host-inactive
+ * site contributes zero entries to the registry. Every ability gates on the flat, object-independent
+ * manage_woocommerce capability and falls through to its real permission_callback at discovery (no
+ * server.php case). Shared helpers live in _shared.php, loaded before this file.
+ *
+ * @package AgentAbilitiesForMCP
+ */
+
+declare( strict_types=1 );
+
+defined( 'ABSPATH' ) || exit;
+
+add_filter( 'aafm_abilities_registry', 'aafm_register_wc_coupons_definitions' );
+add_filter( 'aafm_abilities_registry_integrations', 'aafm_register_wc_coupons_full_definitions' );
+
+/**
+ * Contribute the WooCommerce coupons definitions to the registry, but only when WooCommerce is
+ * active. Host inactive: the registry is returned unchanged.
+ *
+ * @param array<string,array<string,mixed>> $registry Registry.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_wc_coupons_definitions( array $registry ): array {
+	if ( ! aafm_integration_active( 'woocommerce' ) ) {
+		return $registry; // Host inactive: contribute nothing.
+	}
+
+	return array_merge( $registry, aafm_wc_coupons_registry_definitions() );
+}
+
+/**
+ * Contribute the WooCommerce coupon definitions to the guard-independent full registry view.
+ *
+ * Unguarded by design: the full view (aafm_get_abilities_registry_full()) enumerates every
+ * WooCommerce ability even when WooCommerce is inactive, for the Integrations tab and the manifest.
+ * The live registration path never reads this filter, so an inactive host still exposes zero tools.
+ *
+ * @param array<string,array<string,mixed>> $registry Integration rows accumulator.
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_register_wc_coupons_full_definitions( array $registry ): array {
+	return array_merge( $registry, aafm_wc_coupons_registry_definitions() );
+}
+
+/**
+ * The WooCommerce coupon registry rows, keyed by ability name. The single source of truth for
+ * these abilities' label, description, group, risk, and args builder - consumed by both the
+ * host-guarded live registration callback and the unguarded full-view callback.
+ *
+ * @return array<string,array<string,mixed>>
+ */
+function aafm_wc_coupons_registry_definitions(): array {
+	return array(
+		// Coupons (sub-slice W4-WC4) - discount/promotion management gated on manage_woocommerce.
+		'aafm/wc-list-coupons'  => array(
+			'label'        => __( 'List WooCommerce coupons', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Lists WooCommerce coupons with their id, code, amount, discount type, expiry date, and usage count, plus a total. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_list_coupons',
+		),
+
+		'aafm/wc-get-coupon'    => array(
+			'label'        => __( 'Get WooCommerce coupon', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Reads one WooCommerce coupon by id: code, amount, discount type, expiry, usage limits, spend limits, product and email restrictions, and other config. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'reads',
+			'risk'         => 'read',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_get_coupon',
+		),
+
+		'aafm/wc-create-coupon' => array(
+			'label'        => __( 'Create WooCommerce coupon', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Creates a WooCommerce coupon from a code and discount type, with optional amount, usage limits, spend limits, product restrictions, and email restrictions. Returns the full coupon shape. The coupon is published and usable immediately. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'writes',
+			'risk'         => 'write',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_create_coupon',
+		),
+
+		'aafm/wc-update-coupon' => array(
+			'label'        => __( 'Update WooCommerce coupon', 'agent-abilities-for-mcp' ),
+			'description'  => __( 'Updates a WooCommerce coupon by id, changing only the fields you send. An empty request body is a no-op success. Returns the full coupon shape. Requires the manage-WooCommerce capability.', 'agent-abilities-for-mcp' ),
+			'group'        => 'writes',
+			'risk'         => 'write',
+			'subject'      => 'woocommerce',
+			'args_builder' => 'aafm_args_wc_update_coupon',
+		),
+
+	);
+}
+
+// =============================================================================
+// WC4 -- Coupons: list, get, create, update
+// =============================================================================
+
+/**
+ * Resolve a coupon id to a WC_Coupon object, or null when the id is unknown or WooCommerce
+ * is unavailable.
+ *
+ * @param int $id Coupon id.
+ * @return \WC_Coupon|null
+ */
+function aafm_wc_get_coupon_object( int $id ): ?\WC_Coupon {
+	if ( $id <= 0 || ! class_exists( 'WC_Coupon' ) ) {
+		return null;
+	}
+	// The core coupon store reads the coupon's post by id, so load that post exactly first.
+	if ( false !== aafm_wc_store_is_core( 'coupon' ) && ! aafm_exact_object( 'post', $id ) instanceof WP_Post ) {
+		return null;
+	}
+	$coupon = new \WC_Coupon( $id );
+	return ( $coupon->get_id() > 0 ) ? $coupon : null;
+}
+
+/**
+ * Build the lean coupon shape used in list rows: id, code, amount, discount_type,
+ * date_expires, usage_count only.
+ *
+ * @param \WC_Coupon $coupon Coupon object.
+ * @return array<string,mixed>
+ */
+function aafm_redact_wc_coupon( \WC_Coupon $coupon ): array {
+	return array(
+		'id'            => $coupon->get_id(),
+		'code'          => $coupon->get_code(),
+		'amount'        => $coupon->get_amount(),
+		'discount_type' => $coupon->get_discount_type(),
+		'date_expires'  => aafm_wc_date_string( $coupon->get_date_expires() ),
+		'usage_count'   => $coupon->get_usage_count(),
+	);
+}
+
+/**
+ * Build the full coupon shape: all config fields including product/email restrictions.
+ *
+ * @param \WC_Coupon $coupon Coupon object.
+ * @return array<string,mixed>
+ */
+function aafm_rich_wc_coupon( \WC_Coupon $coupon ): array {
+	return array(
+		'id'                   => $coupon->get_id(),
+		'code'                 => $coupon->get_code(),
+		'amount'               => $coupon->get_amount(),
+		'discount_type'        => $coupon->get_discount_type(),
+		'description'          => $coupon->get_description(),
+		'date_expires'         => aafm_wc_date_string( $coupon->get_date_expires() ),
+		'usage_count'          => $coupon->get_usage_count(),
+		'usage_limit'          => $coupon->get_usage_limit(),
+		'usage_limit_per_user' => $coupon->get_usage_limit_per_user(),
+		'minimum_amount'       => $coupon->get_minimum_amount(),
+		'maximum_amount'       => $coupon->get_maximum_amount(),
+		'individual_use'       => $coupon->get_individual_use(),
+		'exclude_sale_items'   => $coupon->get_exclude_sale_items(),
+		'product_ids'          => array_values( array_map( 'intval', $coupon->get_product_ids() ) ),
+		'excluded_product_ids' => array_values( array_map( 'intval', $coupon->get_excluded_product_ids() ) ),
+		'email_restrictions'   => array_values( $coupon->get_email_restrictions() ),
+	);
+}
+
+/**
+ * Shared output properties for the coupon full shape (used in create and update response schemas).
+ *
+ * @return array<string,mixed>
+ */
+function aafm_wc_coupon_output_properties(): array {
+	return array(
+		'id'                   => array( 'type' => 'integer' ),
+		'code'                 => array( 'type' => 'string' ),
+		'amount'               => array( 'type' => 'string' ),
+		'discount_type'        => array( 'type' => 'string' ),
+		'description'          => array( 'type' => 'string' ),
+		'date_expires'         => array( 'type' => array( 'string', 'null' ) ),
+		'usage_count'          => array( 'type' => 'integer' ),
+		'usage_limit'          => array( 'type' => array( 'integer', 'null' ) ),
+		'usage_limit_per_user' => array( 'type' => array( 'integer', 'null' ) ),
+		'minimum_amount'       => array( 'type' => 'string' ),
+		'maximum_amount'       => array( 'type' => 'string' ),
+		'individual_use'       => array( 'type' => 'boolean' ),
+		'exclude_sale_items'   => array( 'type' => 'boolean' ),
+		'product_ids'          => array(
+			'type'  => 'array',
+			'items' => array( 'type' => 'integer' ),
+		),
+		'excluded_product_ids' => array(
+			'type'  => 'array',
+			'items' => array( 'type' => 'integer' ),
+		),
+		'email_restrictions'   => array(
+			'type'  => 'array',
+			'items' => array( 'type' => 'string' ),
+		),
+	);
+}
+
+/**
+ * Shared write-input properties for create and update (everything except coupon_id).
+ *
+ * @return array<string,mixed>
+ */
+function aafm_wc_coupon_write_properties(): array {
+	return array(
+		'code'                 => array(
+			'type'        => 'string',
+			'description' => __( 'The coupon code customers enter at checkout. WooCommerce requires codes to be unique.', 'agent-abilities-for-mcp' ),
+		),
+		'amount'               => array(
+			'type'        => 'string',
+			'description' => __( 'The discount amount as a decimal string, e.g. "10" for a 10% discount when discount_type is percent, or a currency amount for fixed_cart / fixed_product.', 'agent-abilities-for-mcp' ),
+		),
+		'discount_type'        => array(
+			'type'        => 'string',
+			'enum'        => array( 'percent', 'fixed_cart', 'fixed_product' ),
+			'description' => 'How the coupon discounts: percent (a percentage of the cart), fixed_cart (a fixed amount off the whole cart), or fixed_product (a fixed amount off each matching product).',
+		),
+		'description'          => array(
+			'type'        => 'string',
+			'description' => __( 'A description of the coupon, for admin reference.', 'agent-abilities-for-mcp' ),
+		),
+		'date_expires'         => array(
+			'type'        => array( 'string', 'null' ),
+			'description' => 'Expiry date as a YYYY-MM-DD string (the coupon expires at the start of that day, site timezone). Pass null or an empty string for no expiry.',
+		),
+		'usage_limit'          => array(
+			'type'        => array( 'integer', 'null' ),
+			'minimum'     => 0,
+			'description' => __( 'Maximum number of times this coupon can be used in total, across all customers. Pass null for unlimited.', 'agent-abilities-for-mcp' ),
+		),
+		'usage_limit_per_user' => array(
+			'type'        => array( 'integer', 'null' ),
+			'minimum'     => 0,
+			'description' => __( 'Maximum number of times a single customer can use this coupon. Pass null for unlimited.', 'agent-abilities-for-mcp' ),
+		),
+		'minimum_amount'       => array(
+			'type'        => 'string',
+			'description' => __( 'Minimum cart subtotal required for the coupon to apply, as a decimal string, e.g. "50.00".', 'agent-abilities-for-mcp' ),
+		),
+		'maximum_amount'       => array(
+			'type'        => 'string',
+			'description' => __( 'Maximum cart subtotal allowed for the coupon to apply, as a decimal string.', 'agent-abilities-for-mcp' ),
+		),
+		'individual_use'       => array(
+			'type'        => 'boolean',
+			'description' => __( 'When true, this coupon cannot be combined with other coupons in the same order.', 'agent-abilities-for-mcp' ),
+		),
+		'exclude_sale_items'   => array(
+			'type'        => 'boolean',
+			'description' => __( "When true, products already on sale are excluded from this coupon's discount.", 'agent-abilities-for-mcp' ),
+		),
+		'product_ids'          => array(
+			'type'        => 'array',
+			'items'       => array( 'type' => 'integer' ),
+			'description' => __( 'Product ids this coupon is restricted to. Leave empty for no product restriction.', 'agent-abilities-for-mcp' ),
+		),
+		'excluded_product_ids' => array(
+			'type'        => 'array',
+			'items'       => array( 'type' => 'integer' ),
+			'description' => __( "Product ids excluded from this coupon's discount.", 'agent-abilities-for-mcp' ),
+		),
+		'email_restrictions'   => array(
+			'type'        => 'array',
+			'items'       => array( 'type' => 'string' ),
+			'description' => __( 'Email addresses allowed to use this coupon. Leave empty for no restriction.', 'agent-abilities-for-mcp' ),
+		),
+	);
+}
+
+/**
+ * Apply validated write-input fields to a WC_Coupon instance (shared by create and update).
+ *
+ * Only the keys present in $input are applied; absent keys leave the coupon unchanged, which is
+ * what makes an empty PATCH a no-op.
+ *
+ * WC_Coupon::set_code() does NOT throw on a duplicate code - verified directly against this
+ * WooCommerce version: it only calls set_prop(). The duplicate-code guard core itself uses lives
+ * solely in WC_REST_Coupons_V1/V2_Controller, never in the WC_Coupon object this ability calls
+ * directly, so two coupon posts with the identical code both save without error today. This
+ * ports that REST-controller check (wc_get_coupon_id_by_code(), excluding the coupon's own id so
+ * an update that keeps its own code is not a false collision) rather than catching an exception
+ * that does not exist here.
+ *
+ * @param \WC_Coupon          $coupon Coupon object to mutate.
+ * @param array<string,mixed> $input  Validated input fields (coupon_id already extracted).
+ * @return \WP_Error|null Null on success, or a WP_Error naming the conflicting code.
+ */
+function aafm_wc_apply_coupon_input( \WC_Coupon $coupon, array $input ): ?\WP_Error {
+	if ( array_key_exists( 'code', $input ) ) {
+		$code = wc_format_coupon_code( aafm_sanitize_plain_text( (string) $input['code'] ) );
+		if ( '' === $code ) {
+			return new \WP_Error(
+				'aafm_wc_invalid_coupon_code',
+				__( 'A coupon needs a code, so nothing was saved.', 'agent-abilities-for-mcp' ),
+				array( 'status' => 400 )
+			);
+		}
+		$conflicting_id = wc_get_coupon_id_by_code( $code, $coupon->get_id() );
+		if ( $conflicting_id ) {
+			return new \WP_Error(
+				'aafm_wc_duplicate_coupon_code',
+				sprintf(
+					/* translators: %s: the conflicting coupon code. */
+					__( 'The coupon code "%s" is already in use by another coupon.', 'agent-abilities-for-mcp' ),
+					$code
+				)
+			);
+		}
+		/**
+		 * Fires once the duplicate-code check has passed for a coupon create/update, right
+		 * before the code is applied to the in-memory object. Test-only hook: production code
+		 * never listens here. Used by tests/abilities/WooCouponsTest.php to simulate a
+		 * concurrent request's write landing in the check-then-act window this ability cannot
+		 * otherwise close without a real lock.
+		 *
+		 * @param string     $code   The coupon code that just cleared the check.
+		 * @param \WC_Coupon $coupon The coupon object being built.
+		 */
+		do_action( 'aafm_wc_coupon_code_check_passed', $code, $coupon );
+		$coupon->set_code( $code );
+	}
+	if ( array_key_exists( 'discount_type', $input ) ) {
+		// Applied BEFORE amount, deliberately. WC_Coupon::set_amount() (class-wc-coupon.php:
+		// 617-632) rejects an amount over 100 only once get_discount_type() ALREADY reads
+		// 'percent' - it reads the coupon's own current state, not the incoming input. A fresh
+		// WC_Coupon defaults to discount_type 'fixed_cart', so with amount applied first, a single
+		// create call carrying {discount_type:'percent', amount:'150'} used to sail straight
+		// through: set_amount() saw a still-fixed_cart coupon, accepted 150 without complaint, and
+		// only afterwards did set_discount_type() flip the type to 'percent' with nothing left to
+		// re-check it. The result was a coupon persisted at 150% off - a state WooCommerce's own
+		// setter exists to prevent - on a high-risk, money-moving ability, and WC_Coupon::save()
+		// does not re-validate afterwards. Setting discount_type first means set_amount() below
+		// always sees this call's real, final discount_type, so the same-request combination is
+		// now caught by the existing try/catch instead of persisting silently.
+		$coupon->set_discount_type( sanitize_text_field( (string) $input['discount_type'] ) );
+	}
+	if ( array_key_exists( 'amount', $input ) ) {
+		$amount = sanitize_text_field( (string) $input['amount'] );
+		// A non-numeric amount sails through set_amount() - WC casts it toward 0 on the way
+		// to storage - where the tax sibling (aafm_wc_normalize_tax_rate) refuses. Refuse it here
+		// with the same is_numeric gate; an empty string keeps its long-standing clear-to-zero
+		// meaning.
+		if ( '' !== $amount && ! is_numeric( trim( $amount ) ) ) {
+			return new \WP_Error(
+				'aafm_wc_invalid_coupon_amount',
+				sprintf(
+					/* translators: %s: the rejected amount value. */
+					__( 'The discount amount "%s" is not numeric. Send a decimal string like "10" or "12.50".', 'agent-abilities-for-mcp' ),
+					$amount
+				)
+			);
+		}
+		try {
+			// WooCommerce's own set_amount() (class-wc-coupon.php:617-632) uses a throw as
+			// ordinary input validation: it rejects a negative amount outright, and separately
+			// rejects an amount over 100 once the coupon's discount_type is 'percent'. The
+			// amount input schema is a bare string with no pattern/minimum/maximum, so both
+			// conditions can reach this setter unfiltered. Catch here and return a WP_Error
+			// instead of letting WC_Data_Exception escape - the same pattern already used for
+			// set_sku() in aafm_wc_apply_variation_input() (variations.php) and for the
+			// duplicate-code guard a few lines above in this same function.
+			$coupon->set_amount( $amount );
+		} catch ( \WC_Data_Exception $e ) {
+			return new \WP_Error(
+				'aafm_wc_invalid_coupon_amount',
+				sprintf(
+					/* translators: %s: the rejected amount value. */
+					__( 'The discount amount "%s" is not valid. It must not be negative, and a percentage coupon cannot exceed 100.', 'agent-abilities-for-mcp' ),
+					$amount
+				)
+			);
+		}
+	}
+	if ( array_key_exists( 'description', $input ) ) {
+		// The coupon description is free-form admin text; the textarea sanitizer keeps
+		// its line breaks where sanitize_text_field() would flatten them.
+		$coupon->set_description( aafm_sanitize_multiline_text( (string) $input['description'] ) );
+	}
+	if ( array_key_exists( 'date_expires', $input ) ) {
+		$val = null === $input['date_expires'] ? null : sanitize_text_field( (string) $input['date_expires'] );
+		// WC_Data::set_date_prop() swallows its own parse exception, so an unparseable date
+		// used to be silently stored as null - the caller believed an expiry was set on a coupon
+		// that would never expire. Refuse anything strtotime() cannot parse; null and '' keep
+		// their documented no-expiry meaning.
+		if ( null !== $val && '' !== $val && false === strtotime( $val ) ) {
+			return new \WP_Error(
+				'aafm_wc_invalid_coupon_expiry',
+				sprintf(
+					/* translators: %s: the rejected expiry value. */
+					__( 'The expiry date "%s" could not be parsed. Send a YYYY-MM-DD date, or null/empty for no expiry.', 'agent-abilities-for-mcp' ),
+					$val
+				)
+			);
+		}
+		$coupon->set_date_expires( $val );
+	}
+	if ( array_key_exists( 'usage_limit', $input ) ) {
+		$val = $input['usage_limit'];
+		$coupon->set_usage_limit( null === $val ? null : absint( $val ) );
+	}
+	if ( array_key_exists( 'usage_limit_per_user', $input ) ) {
+		$val = $input['usage_limit_per_user'];
+		$coupon->set_usage_limit_per_user( null === $val ? null : absint( $val ) );
+	}
+	if ( array_key_exists( 'minimum_amount', $input ) ) {
+		$coupon->set_minimum_amount( sanitize_text_field( (string) $input['minimum_amount'] ) );
+	}
+	if ( array_key_exists( 'maximum_amount', $input ) ) {
+		$maximum_amount = sanitize_text_field( (string) $input['maximum_amount'] );
+		try {
+			// WooCommerce's own set_maximum_amount() (class-wc-coupon.php:807-813) throws when
+			// the new maximum is non-zero and below the coupon's CURRENT minimum_amount - the
+			// same "throw as input validation" pattern set_amount() guards above. Reachable
+			// directly: minimum_amount is applied a few lines above this block, so a single
+			// create/update carrying minimum_amount=100 and maximum_amount=50 hits this
+			// unguarded. The maximum_amount input schema has no relationship constraint against
+			// minimum_amount (it can't - the two are independent optional fields), so nothing
+			// upstream stops the combination from reaching this setter. Catch here so the
+			// exception cannot escape into the adapter, mirroring the set_amount() guard above
+			// and set_sku()'s guard in aafm_wc_apply_variation_input() (variations.php).
+			$coupon->set_maximum_amount( $maximum_amount );
+		} catch ( \WC_Data_Exception $e ) {
+			return new \WP_Error(
+				'aafm_wc_invalid_coupon_maximum',
+				sprintf(
+					/* translators: 1: the rejected maximum amount, 2: the coupon's current minimum amount. */
+					__( 'The maximum spend "%1$s" is not valid: it cannot be less than the coupon\'s minimum amount of "%2$s".', 'agent-abilities-for-mcp' ),
+					$maximum_amount,
+					$coupon->get_minimum_amount()
+				)
+			);
+		}
+	}
+	if ( array_key_exists( 'individual_use', $input ) ) {
+		$coupon->set_individual_use( (bool) $input['individual_use'] );
+	}
+	if ( array_key_exists( 'exclude_sale_items', $input ) ) {
+		$coupon->set_exclude_sale_items( (bool) $input['exclude_sale_items'] );
+	}
+	foreach ( array( 'product_ids', 'excluded_product_ids' ) as $list_field ) {
+		if ( ! array_key_exists( $list_field, $input ) ) {
+			continue;
+		}
+		// An id that is not a product used to be stored, giving a coupon restriction that matches
+		// nothing. Refuse the whole request so a typo does not read as a working restriction.
+		$ids = array_map( 'absint', (array) $input[ $list_field ] );
+		foreach ( $ids as $product_id ) {
+			if ( ! aafm_wc_get_product( $product_id ) instanceof \WC_Product ) {
+				return new \WP_Error(
+					'aafm_wc_unknown_coupon_product',
+					sprintf(
+						/* translators: 1: the input field name, 2: the product id that does not exist. */
+						__( '%1$s names product %2$d, which does not exist, so nothing was saved.', 'agent-abilities-for-mcp' ),
+						$list_field,
+						$product_id
+					),
+					array( 'status' => 400 )
+				);
+			}
+		}
+		if ( 'product_ids' === $list_field ) {
+			$coupon->set_product_ids( $ids );
+		} else {
+			$coupon->set_excluded_product_ids( $ids );
+		}
+	}
+	if ( array_key_exists( 'email_restrictions', $input ) ) {
+		$coupon->set_email_restrictions(
+			array_map(
+				static fn( $v ): string => sanitize_email( (string) $v ),
+				(array) $input['email_restrictions']
+			)
+		);
+	}
+
+	// Post-conditions on the RESULTING coupon, not on the incoming keys.
+	//
+	// Every guard above only fires when its own key is present in $input, and that is precisely
+	// what leaves these two invariants reachable by a different door. WooCommerce validates each
+	// pair from ONE side only: set_amount() (class-wc-coupon.php:617-632) rejects an amount over
+	// 100 by reading the coupon's CURRENT discount_type, while set_discount_type() (:588-608)
+	// validates the type and never re-reads amount; set_maximum_amount() (:807-813) rejects a
+	// maximum below the CURRENT minimum, while set_minimum_amount() (:796-798) is a bare set_prop.
+	// So `wc-update-coupon { coupon_id: N, discount_type: 'percent' }` against a coupon whose
+	// stored amount is already 150 entered no guard at all and persisted a 150% coupon, and
+	// `{ minimum_amount: '500' }` against a stored maximum of 50 persisted an unusable coupon.
+	// Both returned success. WC_Coupon::save() re-validates nothing.
+	//
+	// Each invariant is a relationship between two INDEPENDENTLY OPTIONAL fields, so no per-field
+	// guard can see both halves - only a check on the final object can, and being order-independent
+	// it also cannot be reopened by a future key ordering.
+	//
+	// Each check runs only when the input could have moved its own pair. That keeps an operator
+	// able to edit an unrelated field on - or remediate - a coupon another plugin already left
+	// invalid, instead of being locked out of their own data by a guard with nothing to prevent.
+	if ( array_key_exists( 'amount', $input ) || array_key_exists( 'discount_type', $input ) ) {
+		if ( 'percent' === $coupon->get_discount_type() && (float) $coupon->get_amount() > 100 ) {
+			return new \WP_Error(
+				'aafm_wc_invalid_coupon_amount',
+				sprintf(
+					/* translators: %s: the resulting discount amount. */
+					__( 'A percentage coupon cannot discount more than 100 percent, and this change would leave it at "%s". Lower the amount to 100 or below, or use the fixed_cart or fixed_product discount type.', 'agent-abilities-for-mcp' ),
+					$coupon->get_amount()
+				)
+			);
+		}
+	}
+
+	if ( array_key_exists( 'minimum_amount', $input ) || array_key_exists( 'maximum_amount', $input ) ) {
+		// A zero/empty maximum means "no maximum" - WooCommerce's own set_maximum_amount()
+		// (class-wc-coupon.php:808) short-circuits on `(float) $amount` for exactly that reason, and
+		// an unset maximum reads back as '' which casts to 0.0. Without the > 0 guard this
+		// post-condition would reject every ordinary minimum-only coupon.
+		$maximum = (float) $coupon->get_maximum_amount();
+		if ( $maximum > 0 && (float) $coupon->get_minimum_amount() > $maximum ) {
+			return new \WP_Error(
+				'aafm_wc_invalid_coupon_maximum',
+				sprintf(
+					/* translators: 1: the resulting minimum amount, 2: the resulting maximum amount. */
+					__( 'A coupon\'s minimum spend cannot exceed its maximum spend, and this change would leave it at %1$s minimum against %2$s maximum.', 'agent-abilities-for-mcp' ),
+					$coupon->get_minimum_amount(),
+					$coupon->get_maximum_amount()
+				)
+			);
+		}
+	}
+
+	return null;
+}
+
+/**
+ * Final race guard: a concurrent request could have claimed this exact code in the window
+ * between the check inside aafm_wc_apply_coupon_input() and the caller's own save() call (every
+ * other field application in between widens that window). Re-checking immediately before the
+ * write shrinks it to the minimum this single PHP-FPM worker can control - WooCommerce's
+ * WC_Coupon/wc_get_coupon_id_by_code() gives us no locking primitive to close it further. This
+ * does NOT close the whole race: WooCommerce fires woocommerce_before_coupon_object_save() from
+ * inside WC_Data::save(), after this re-check runs, and a coupon carries no unique DB constraint
+ * on its code - a request landing in that specific gap still slips through (documented, not
+ * hidden, by test_a_race_landing_inside_save_itself_is_a_known_uncloseable_gap()).
+ *
+ * @param \WC_Coupon $coupon Coupon object about to be saved.
+ * @return \WP_Error|null Null on success, or a WP_Error naming the conflicting code.
+ */
+function aafm_wc_coupon_code_race_error( \WC_Coupon $coupon ): ?\WP_Error {
+	$conflicting_id = wc_get_coupon_id_by_code( $coupon->get_code(), $coupon->get_id() );
+	if ( ! $conflicting_id ) {
+		return null;
+	}
+	return new \WP_Error(
+		'aafm_wc_duplicate_coupon_code',
+		sprintf(
+			/* translators: %s: the conflicting coupon code. */
+			__( 'The coupon code "%s" was just claimed by another request. Try a different code.', 'agent-abilities-for-mcp' ),
+			$coupon->get_code()
+		)
+	);
+}
+
+// =============================================================================
+// wc-list-coupons
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-list-coupons.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_list_coupons(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-list-coupons' ),
+		'description'         => aafm_ability_description( 'aafm/wc-list-coupons' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'properties'           => aafm_pagination_schema_props(
+				100,
+				__( 'Number of coupons per page, 1 to 100. Defaults to 10.', 'agent-abilities-for-mcp' ),
+				__( 'Page number of coupons to return, 1-indexed. Defaults to 1.', 'agent-abilities-for-mcp' ),
+				true
+			),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => array(
+				'coupons' => array(
+					'type'  => 'array',
+					'items' => array(
+						'type'                 => 'object',
+						'properties'           => array(
+							'id'            => array( 'type' => 'integer' ),
+							'code'          => array( 'type' => 'string' ),
+							'amount'        => array( 'type' => 'string' ),
+							'discount_type' => array( 'type' => 'string' ),
+							'date_expires'  => array( 'type' => array( 'string', 'null' ) ),
+							'usage_count'   => array( 'type' => 'integer' ),
+						),
+						'additionalProperties' => false,
+					),
+				),
+				'total'   => array( 'type' => 'integer' ),
+			),
+		),
+		'execute_callback'    => 'aafm_exec_wc_list_coupons',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-list-coupons.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_list_coupons( array $input ) {
+	if ( ! class_exists( 'WC_Coupon' ) ) {
+		return aafm_generic_error();
+	}
+
+	$per_page = isset( $input['per_page'] ) ? absint( $input['per_page'] ) : 10;
+	$page     = isset( $input['page'] ) ? absint( $input['page'] ) : 1;
+
+	// WooCommerce has no wc_get_coupons(): coupons are the 'shop_coupon' post type. Query the ids,
+	// then hydrate each through WC_Coupon to read fields via the public getter API.
+	$query = new \WP_Query(
+		array(
+			'post_type'      => 'shop_coupon',
+			'post_status'    => 'publish',
+			'posts_per_page' => $per_page,
+			'paged'          => $page,
+			'orderby'        => 'ID',
+			'order'          => 'ASC',
+			'fields'         => 'ids',
+			'no_found_rows'  => false,
+		)
+	);
+
+	$rows = array();
+	foreach ( $query->posts as $coupon_id ) {
+		// fields => 'ids' yields post ids; absint() also normalises the int|WP_Post union safely.
+		$coupon = aafm_wc_get_coupon_object( is_object( $coupon_id ) ? (int) $coupon_id->ID : absint( $coupon_id ) );
+		if ( null !== $coupon ) {
+			$rows[] = aafm_redact_wc_coupon( $coupon );
+		}
+	}
+
+	return array(
+		'coupons' => $rows,
+		'total'   => (int) $query->found_posts,
+	);
+}
+
+// =============================================================================
+// wc-get-coupon
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-get-coupon.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_get_coupon(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-get-coupon' ),
+		'description'         => aafm_ability_description( 'aafm/wc-get-coupon' ),
+		'category'            => 'aafm-reads',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'required'             => array( 'coupon_id' ),
+			'properties'           => array(
+				'coupon_id' => array(
+					'type'        => 'integer',
+					'minimum'     => 1,
+					'description' => __( "The WooCommerce coupon's post id.", 'agent-abilities-for-mcp' ),
+				),
+			),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_coupon_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_get_coupon',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => true,
+				'destructive' => false,
+				'idempotent'  => true,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-get-coupon.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_get_coupon( array $input ) {
+	$coupon = aafm_wc_get_coupon_object( absint( $input['coupon_id'] ?? 0 ) );
+	if ( null === $coupon ) {
+		return aafm_generic_error();
+	}
+	return aafm_rich_wc_coupon( $coupon );
+}
+
+// =============================================================================
+// wc-create-coupon
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-create-coupon.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_create_coupon(): array {
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-create-coupon' ),
+		'description'         => aafm_ability_description( 'aafm/wc-create-coupon' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'required'             => array( 'code' ),
+			'properties'           => aafm_wc_coupon_write_properties(),
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_coupon_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_create_coupon',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-create-coupon.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_create_coupon( array $input ) {
+	if ( ! class_exists( 'WC_Coupon' ) ) {
+		return aafm_generic_error();
+	}
+
+	$coupon = new \WC_Coupon();
+	$error  = aafm_wc_apply_coupon_input( $coupon, $input );
+	if ( null !== $error ) {
+		return $error;
+	}
+
+	$race_error = aafm_wc_coupon_code_race_error( $coupon );
+	if ( null !== $race_error ) {
+		return $race_error;
+	}
+
+	$id = aafm_wc_write(
+		'save',
+		array(
+			'object' => $coupon,
+			'entity' => 'coupon',
+		)
+	)['returned'];
+	if ( ! $id ) {
+		return aafm_generic_error();
+	}
+
+	$saved = aafm_wc_get_coupon_object( $id );
+	if ( null === $saved ) {
+		return aafm_generic_error();
+	}
+
+	return aafm_rich_wc_coupon( $saved );
+}
+
+// =============================================================================
+// wc-update-coupon
+// =============================================================================
+
+/**
+ * Args builder for aafm/wc-update-coupon.
+ *
+ * @return array<string,mixed>
+ */
+function aafm_args_wc_update_coupon(): array {
+	$write_props              = aafm_wc_coupon_write_properties();
+	$write_props['coupon_id'] = array(
+		'type'        => 'integer',
+		'minimum'     => 1,
+		'description' => __( 'The coupon to update. An empty request body besides this id is a no-op success.', 'agent-abilities-for-mcp' ),
+	);
+
+	return array(
+		'label'               => aafm_ability_label( 'aafm/wc-update-coupon' ),
+		'description'         => aafm_ability_description( 'aafm/wc-update-coupon' ),
+		'category'            => 'aafm-writes',
+		'input_schema'        => array(
+			'type'                 => 'object',
+			'additionalProperties' => false,
+			'required'             => array( 'coupon_id' ),
+			'properties'           => $write_props,
+		),
+		'output_schema'       => array(
+			'type'       => 'object',
+			'properties' => aafm_wc_coupon_output_properties(),
+		),
+		'execute_callback'    => 'aafm_exec_wc_update_coupon',
+		'permission_callback' => 'aafm_wc_perm',
+		'meta'                => array(
+			'annotations' => array(
+				'readonly'    => false,
+				'destructive' => false,
+			),
+		),
+	);
+}
+
+/**
+ * Execute aafm/wc-update-coupon.
+ *
+ * @param array<string,mixed> $input Validated input.
+ * @return array<string,mixed>|\WP_Error
+ */
+function aafm_exec_wc_update_coupon( array $input ) {
+	$id     = absint( $input['coupon_id'] ?? 0 );
+	$coupon = aafm_wc_get_coupon_object( $id );
+	if ( null === $coupon ) {
+		return aafm_generic_error();
+	}
+
+	// Strip the routing key before diffing so an id-only PATCH is a genuine no-op.
+	$fields = $input;
+	unset( $fields['coupon_id'] );
+	$error = aafm_wc_apply_coupon_input( $coupon, $fields );
+	if ( null !== $error ) {
+		return $error;
+	}
+
+	// Only re-check when this request actually touches the code: aafm_wc_apply_coupon_input()
+	// never opens a check-then-act window on the code field unless 'code' is in $fields, so an
+	// id-only no-op or an update to an unrelated field (amount, description, ...) has nothing to
+	// re-verify here - running the guard unconditionally would refuse such an update whenever the
+	// coupon's UNCHANGED existing code happens to collide with an unrelated coupon for reasons
+	// that predate this request entirely.
+	if ( array_key_exists( 'code', $fields ) ) {
+		$race_error = aafm_wc_coupon_code_race_error( $coupon );
+		if ( null !== $race_error ) {
+			return $race_error;
+		}
+	}
+
+	$saved_id = (int) aafm_wc_write(
+		'save',
+		array(
+			'object' => $coupon,
+			'entity' => 'coupon',
+		)
+	)['returned'];
+	if ( $saved_id < 1 ) {
+		return aafm_generic_error();
+	}
+
+	$saved = aafm_wc_get_coupon_object( $id );
+	if ( null === $saved ) {
+		return aafm_generic_error();
+	}
+
+	return aafm_rich_wc_coupon( $saved );
+}
