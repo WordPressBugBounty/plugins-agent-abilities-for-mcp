@@ -1,0 +1,1 @@
+# plugins-agent-abilities-for-mcp
